@@ -681,7 +681,7 @@ func TestElTextoVacioDelEditText(t *testing.T) {
 		t.Fatalf("el zip del layout: %v", err)
 	}
 	m := nuevaMaquina(&programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}, tabla)
-	preparaVistasDelLayout(m, zr, tabla, "")
+	preparaVistasDelLayout(m, zr, tabla, "", "")
 	if len(m.textosDeLayout) != 1 || m.textosDeLayout[idEnviarVacio] != "Enviar" {
 		t.Errorf("la siembra dejó %v y solo debía dejar el texto del Button", m.textosDeLayout)
 	}

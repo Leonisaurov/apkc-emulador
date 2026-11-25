@@ -37,7 +37,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -737,6 +736,7 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 		nombreActividad = ctxManifiesto.textoDeAtributo(actividad, uriDeRecursos, "name")
 		modelo.Actividad = nombreActividad
 	}
+	etiquetaApp := etiquetaDeLaApp(arbolManifiesto, ctxManifiesto)
 
 	// Fase 2: la actividad se ejecuta antes de elegir el layout, porque el `setContentView` dice cuál
 	// es. Si no hay classes.dex o el dex no se deja ejecutar, el modelo de la Fase 1 sigue saliendo.
@@ -748,7 +748,7 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 				preferida := descriptorDeActividad(modelo.Paquete, nombreActividad)
 				var errEventos error
 				modelo.Ejecucion, layoutID, errEventos = ejecutaOnCreateConEventos(d, tabla, preferida, eventos,
-					func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, layout) }, declaradas)
+					func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, layout, nombreActividad) }, declaradas)
 				if errEventos != nil {
 					return nil, errEventos
 				}
@@ -775,9 +775,27 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 		}
 	}
 
-	rutaLayout, err := rutaDelLayoutDeLaActividad(tabla, zr, layout, layoutID)
+	activa := modelo.Actividad
+	if activa == "" {
+		activa = nombreActividad
+	}
+	rutaLayout, err := rutaDelLayoutDeLaActividad(tabla, zr, layout, layoutID, activa)
 	if err != nil {
 		return nil, err
+	}
+	if rutaLayout == "" {
+		// La actividad no declaró layout: se publica el centinela y un marco con la etiqueta de la
+		// app. Inventar `res/A1.xml` sería pintar una pantalla que el apk nunca pidió.
+		if modelo.Ejecucion == nil {
+			modelo.Ejecucion = &resultadoEjecucion{}
+		}
+		modelo.Ejecucion.Avisos = avisoSinLayoutDevuelve(modelo.Ejecucion.Avisos, activa)
+		raiz := raizSinLayout(etiquetaApp)
+		coloca(raiz, 0, 0, dpPantallaAncho, dpPantallaAlto)
+		modelo.Layout = ""
+		modelo.Raiz = raiz
+		modelo.Nodos = contarNodos(raiz)
+		return modelo, nil
 	}
 	layoutBytes, err := entradaDeZip(zr, rutaLayout)
 	if err != nil {
@@ -839,12 +857,12 @@ func descriptorDeActividad(paquete, nombre string) string {
 // contra el contexto de la vista (la actividad); sin esto, una app que declara el clic en el XML —el
 // patrón de los contadores de tutorial— se ejecutaba con `oyentes` vacío y el emulador no tenía a
 // quién pulsar, aunque la app funcionara en el aparato.
-func preparaVistasDelLayout(m *maquinaDalvik, zr *zip.Reader, tabla *tablaRecursos, layout string) {
+func preparaVistasDelLayout(m *maquinaDalvik, zr *zip.Reader, tabla *tablaRecursos, layout, actividad string) {
 	if m == nil {
 		return
 	}
-	ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, layout, m.layoutID)
-	if err != nil {
+	ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, layout, m.layoutID, actividad)
+	if err != nil || ruta == "" {
 		return
 	}
 	datos, err := entradaDeZip(zr, ruta)
@@ -1118,16 +1136,64 @@ func aplicaTextosDeFila(n *nodoVista, textos map[uint32]string) {
 	}
 }
 
-// rutaDelLayoutDeLaActividad elige el layout: `--layout` manda si se pidió uno, y si no, el id que
-// el intérprete vio pasar por `setContentView`. Cuando ese id no se puede resolver (sin tabla, o una
-// entrada compleja) se cae al criterio de la Fase 1, por nombre, en vez de fallar el comando.
-func rutaDelLayoutDeLaActividad(tabla *tablaRecursos, zr *zip.Reader, pedido string, layoutID uint32) (string, error) {
-	if pedido == "" && layoutID != 0 && tabla != nil {
+// avisoSinLayout es el prefijo del aviso que publica el modelo cuando la actividad no tiene layout
+// XML. Fase D cuenta estos avisos por familia, no por `len(avisos)`: el centinela no es una regresión.
+const avisoSinLayout = "sin-layout-xml:"
+
+// rutaDelLayoutDeLaActividad elige el layout en este orden: lo que pidió `--layout`, el id que el
+// intérprete vio pasar por `setContentView` y, por último, el nombre de la actividad
+// (`activity_<Nombre>`). No cae al primero por orden alfabético: si ningún nombre existe devuelve
+// cadena vacía sin error para que el llamador publique el aviso y el marco de la app.
+func rutaDelLayoutDeLaActividad(tabla *tablaRecursos, zr *zip.Reader, pedido string, layoutID uint32, actividad string) (string, error) {
+	if pedido != "" {
+		ruta, err := rutaDelLayout(tabla, zr, []string{pedido})
+		if err != nil {
+			return "", err
+		}
+		if ruta == "" {
+			// `--layout` es una orden explícita: si no existe, se dice por su nombre en vez de
+			// publicar el centinela de una actividad sin layout declarado.
+			return "", fmt.Errorf("el apk no lleva el layout %q", pedido)
+		}
+		return ruta, nil
+	}
+	if layoutID != 0 && tabla != nil {
 		if ruta, err := rutaDeLayoutPorId(tabla, layoutID); err == nil {
 			return ruta, nil
 		}
 	}
-	return rutaDelLayout(tabla, zr, pedido)
+	return rutaDelLayout(tabla, zr, nombresDeLayoutDeActividad(actividad))
+}
+
+// nombresDeLayoutDeActividad convierte el descriptor de la actividad en los nombres de layout que
+// puede declarar: `activity_<nombre>` con y sin el sufijo Activity, en minúsculas y tal cual. `main`
+// queda al final como nombre por defecto documentado de `--layout`, nunca como primer XML del zip.
+func nombresDeLayoutDeActividad(actividad string) []string {
+	if actividad == "" {
+		return []string{"main"}
+	}
+	simple := strings.TrimSuffix(actividad, ";")
+	if i := strings.LastIndexAny(simple, "./"); i >= 0 {
+		simple = simple[i+1:]
+	}
+	base := strings.TrimSuffix(simple, "Activity")
+	nombres := []string{}
+	for _, n := range []string{"activity_" + strings.ToLower(base), "activity_" + base,
+		"activity_" + strings.ToLower(simple), "activity_" + simple, "main"} {
+		if n != "" && !contieneNombre(nombres, n) {
+			nombres = append(nombres, n)
+		}
+	}
+	return nombres
+}
+
+func contieneNombre(lista []string, buscada string) bool {
+	for _, s := range lista {
+		if s == buscada {
+			return true
+		}
+	}
+	return false
 }
 
 // rutaDeLayoutPorId resuelve el id de un `R.layout.*` a la entrada del apk. La tabla guarda la ruta
@@ -1163,10 +1229,11 @@ func entradaDeZip(zr *zip.Reader, nombre string) ([]byte, error) {
 	return nil, fmt.Errorf("el apk no lleva %s", nombre)
 }
 
-// rutaDelLayout elige el fichero del layout: el que se pida por nombre, si no `main`, y si no el
-// primero de la tabla por orden alfabético. La entrada del tipo `layout` de la tabla guarda la ruta
-// dentro del apk como cadena del pool global, que es lo que se devuelve.
-func rutaDelLayout(tabla *tablaRecursos, zr *zip.Reader, pedido string) (string, error) {
+// rutaDelLayout busca los nombres que se le dan, en orden, primero en la tabla de recursos y
+// después entre las entradas del zip con forma `res/layout/<nombre>.xml`. No hay caída al primero
+// por orden alfabético: si no está ninguno devuelve cadena vacía y el llamador decide cómo avisar.
+// La entrada del tipo `layout` de la tabla guarda la ruta dentro del apk como cadena del pool global.
+func rutaDelLayout(tabla *tablaRecursos, zr *zip.Reader, nombres []string) (string, error) {
 	type entrada struct {
 		clave string
 		ruta  string
@@ -1196,58 +1263,40 @@ func rutaDelLayout(tabla *tablaRecursos, zr *zip.Reader, pedido string) (string,
 			}
 		}
 	}
-	// sin tabla: lo que haya en el zip con la forma res/layout/<nombre>.xml
-	if len(encontradas) == 0 {
-		nombres := []string{}
-		for _, f := range zr.File {
-			if strings.HasPrefix(f.Name, "res/layout/") && strings.HasSuffix(f.Name, ".xml") {
-				nombres = append(nombres, f.Name)
-			}
-		}
-		sort.Strings(nombres)
-		if len(nombres) == 0 {
-			return "", fmt.Errorf("el apk no lleva ningún res/layout/*.xml")
-		}
-		if pedido == "" {
-			for _, n := range nombres {
-				if n == "res/layout/main.xml" {
-					return n, nil
-				}
-			}
-			return nombres[0], nil
-		}
-		for _, n := range nombres {
-			if n == "res/layout/"+pedido+".xml" {
-				return n, nil
-			}
-		}
-		return "", fmt.Errorf("el apk no lleva el layout %q", pedido)
-	}
-	sort.Slice(encontradas, func(i, j int) bool { return encontradas[i].clave < encontradas[j].clave })
-	if pedido != "" {
+	for _, nombre := range nombres {
 		for _, e := range encontradas {
-			if e.clave == pedido {
+			if e.clave == nombre {
 				return e.ruta, nil
 			}
 		}
-		return "", fmt.Errorf("la tabla no tiene el layout %q", pedido)
 	}
-	for _, e := range encontradas {
-		if e.clave == "main" {
-			return e.ruta, nil
+	// sin tabla (o con una tabla que no nombra estos layouts): rutas literales del zip
+	disponibles := map[string]bool{}
+	for _, f := range zr.File {
+		disponibles[f.Name] = true
+	}
+	for _, nombre := range nombres {
+		ruta := "res/layout/" + nombre + ".xml"
+		if disponibles[ruta] {
+			return ruta, nil
 		}
 	}
-	return encontradas[0].ruta, nil
+	return "", nil
 }
 
-// actividadLanzadora busca la `activity` con el filtro MAIN+LAUNCHER; si ninguna lo lleva, la
-// primera, que es lo que haría un `am start` sin nombre.
+// actividadLanzadora elige la actividad real que arranca la app. Manda la `<activity>` con
+// MAIN+LAUNCHER+DEFAULT, después MAIN+LAUNCHER, luego el alias habilitado con MAIN+LAUNCHER (del que
+// se sigue `targetActivity`) y por último MAIN+LEANBACK_LAUNCHER. Un alias `enabled=false` nunca
+// cuenta, y sin ningún filtro se devuelve la primera actividad, como un `am start` sin nombre.
 func actividadLanzadora(arbol *elementoLeido, ctx *contextoVista) (*elementoLeido, bool) {
 	app := arbol.hijo("application")
 	if app == nil {
 		return nil, false
 	}
+	paquete := ctx.textoDeAtributo(arbol, "", "package")
 	var primera *elementoLeido
+	mejorPuntos := 0
+	var elegida *elementoLeido
 	for _, h := range app.hijos {
 		if h.nombre != "activity" && h.nombre != "activity-alias" {
 			continue
@@ -1255,14 +1304,152 @@ func actividadLanzadora(arbol *elementoLeido, ctx *contextoVista) (*elementoLeid
 		if primera == nil {
 			primera = h
 		}
-		if esLanzadora(h, ctx) {
-			return h, true
+		puntos := puntosDeLanzadora(h, ctx)
+		if puntos > mejorPuntos {
+			mejorPuntos = puntos
+			elegida = h
 		}
 	}
-	if primera != nil {
-		return primera, true
+	if elegida == nil {
+		if primera != nil {
+			return primera, true
+		}
+		return nil, false
 	}
-	return nil, false
+	if elegida.nombre == "activity-alias" {
+		objetivo := ctx.textoDeAtributo(elegida, uriDeRecursos, "targetActivity")
+		descriptor := descriptorDeActividad(paquete, objetivo)
+		for _, h := range app.hijos {
+			if h.nombre != "activity" {
+				continue
+			}
+			nombre := ctx.textoDeAtributo(h, uriDeRecursos, "name")
+			if descriptorDeActividad(paquete, nombre) == descriptor {
+				return h, true
+			}
+		}
+	}
+	return elegida, true
+}
+
+// habilitada decide `android:enabled` con el valor tipado: solo un booleano explícitamente falso
+// deshabilita la actividad o el alias. Una referencia o un valor ausente valen por habilitados,
+// como en el manifiesto; comparar el texto resuelto con "false" confundiría un `@bool/…`.
+func habilitada(actividad *elementoLeido, ctx *contextoVista) bool {
+	v, ok := actividad.atributo(uriDeRecursos, "enabled")
+	if !ok || v.tipo != tipoBooleano {
+		return true
+	}
+	return v.datos != 0
+}
+
+// puntosDeLanzadora puntúa el filtro MAIN con LAUNCHER o LEANBACK_LAUNCHER. Una actividad real va
+// siempre por delante de un alias con la misma categoría, y DEFAULT rompe la igualdad entre las
+// actividades. Devuelve cero si el componente está deshabilitado o no es lanzador.
+func puntosDeLanzadora(actividad *elementoLeido, ctx *contextoVista) int {
+	if !habilitada(actividad, ctx) {
+		return 0
+	}
+	for _, filtro := range actividad.hijos {
+		if filtro.nombre != "intent-filter" {
+			continue
+		}
+		main, launcher, leanback, defecto := false, false, false, false
+		for _, h := range filtro.hijos {
+			nombre := ctx.textoDeAtributo(h, uriDeRecursos, "name")
+			switch h.nombre {
+			case "action":
+				if nombre == "android.intent.action.MAIN" {
+					main = true
+				}
+			case "category":
+				switch nombre {
+				case "android.intent.category.LAUNCHER":
+					launcher = true
+				case "android.intent.category.LEANBACK_LAUNCHER":
+					leanback = true
+				case "android.intent.category.DEFAULT":
+					defecto = true
+				}
+			}
+		}
+		if !main {
+			continue
+		}
+		if actividad.nombre == "activity-alias" {
+			if launcher {
+				return 4
+			}
+			if leanback {
+				return 2
+			}
+			continue
+		}
+		if launcher && defecto {
+			return 6
+		}
+		if launcher {
+			return 5
+		}
+		if leanback {
+			return 3
+		}
+	}
+	return 0
+}
+
+// textoDeEtiqueta resuelve una etiqueta del manifiesto siguiendo referencias encadenadas: en F-Droid
+// `app_name` apunta a `app_name_full`, que es el que trae la cadena "F-Droid". La resolución general
+// de `resuelve` se queda en `string/app_name` porque solo sigue un enlace que ya es cadena.
+func (c *contextoVista) textoDeEtiqueta(v valor) string {
+	for profundidad := 0; profundidad < profundidadMaxima; profundidad++ {
+		if v.tipo == tipoReferencia && c.tabla != nil {
+			enlace, ok := c.tabla.valorDeId(v.datos)
+			if !ok {
+				return ""
+			}
+			v = enlace
+			continue
+		}
+		if v.tipo == tipoCadena && c.tabla != nil {
+			if int(v.datos) < len(c.tabla.global.cadenas) {
+				return c.tabla.global.cadenas[v.datos]
+			}
+			return ""
+		}
+		return c.texto(v)
+	}
+	return ""
+}
+
+// etiquetaDeLaApp lee `android:label` de `<application>`, ya resuelta contra la tabla de recursos.
+func etiquetaDeLaApp(arbol *elementoLeido, ctx *contextoVista) string {
+	app := arbol.hijo("application")
+	if app == nil {
+		return ""
+	}
+	v, ok := app.atributo(uriDeRecursos, "label")
+	if !ok {
+		return ""
+	}
+	return ctx.textoDeEtiqueta(v)
+}
+
+// raizSinLayout es el marco que se publica cuando la actividad no tiene layout XML: lleva la
+// etiqueta de la app y no finge ningún fichero nuevo.
+func raizSinLayout(etiqueta string) *nodoVista {
+	return &nodoVista{Tipo: "FrameLayout", Texto: etiqueta,
+		declAncho: medidaMatch, declAlto: medidaMatch, layoutGravity: -1}
+}
+
+// avisoSinLayoutDevuelve los avisos con el centinela de esta familia, sin repetirlo.
+func avisoSinLayoutDevuelve(avisos []string, actividad string) []string {
+	texto := avisoSinLayout + " la actividad " + actividad +
+		" no declara setContentView ni lleva un layout con su nombre; no se inventa pantalla"
+	if contieneNombre(avisos, texto) {
+		return avisos
+	}
+	return append(append([]string(nil), avisos...), texto)
 }
 
 // actividadesDeclaradas recoge los `android:name` de cada `<activity>` del manifiesto, ya como
@@ -1287,29 +1474,10 @@ func actividadesDeclaradas(arbol *elementoLeido, ctx *contextoVista) map[string]
 	return declaradas
 }
 
+// esLanzadora responde si el componente puede abrir la app por un filtro MAIN+LAUNCHER (o su
+// variante leanback) y no está deshabilitado. Es la forma booleana de puntosDeLanzadora.
 func esLanzadora(actividad *elementoLeido, ctx *contextoVista) bool {
-	for _, filtro := range actividad.hijos {
-		if filtro.nombre != "intent-filter" {
-			continue
-		}
-		main, launcher := false, false
-		for _, h := range filtro.hijos {
-			switch h.nombre {
-			case "action":
-				if ctx.textoDeAtributo(h, uriDeRecursos, "name") == "android.intent.action.MAIN" {
-					main = true
-				}
-			case "category":
-				if ctx.textoDeAtributo(h, uriDeRecursos, "name") == "android.intent.category.LAUNCHER" {
-					launcher = true
-				}
-			}
-		}
-		if main && launcher {
-			return true
-		}
-	}
-	return false
+	return puntosDeLanzadora(actividad, ctx) > 0
 }
 
 // arbol arma el árbol a partir de la lista plana de nodos del lector. Los trozos de namespace no

@@ -273,8 +273,10 @@ func TestPreviewRechazaLoQueNoEs(t *testing.T) {
 		t.Fatal(err)
 	}
 	sinLayout := zipDeEntradas(t, map[string][]byte{"AndroidManifest.xml": manifiesto})
-	if _, err := modeloVistaDeAPK(sinLayout, ""); err == nil {
-		t.Error("se aceptó un apk sin ningún layout")
+	if m, err := modeloVistaDeAPK(sinLayout, ""); err != nil || m.Layout != "" ||
+		m.Ejecucion == nil || len(m.Ejecucion.Avisos) != 1 ||
+		!strings.HasPrefix(m.Ejecucion.Avisos[0], avisoSinLayout) {
+		t.Errorf("un apk sin layout no publicó el centinela: err %v, modelo %+v", err, m)
 	}
 	if _, err := modeloVistaDeAPK(apkDeLosEscritores(t), "otro"); err == nil {
 		t.Error("se aceptó pedir un layout que la tabla no tiene")

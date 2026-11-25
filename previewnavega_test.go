@@ -6,6 +6,8 @@ package main
 // versionados).
 
 import (
+	"archive/zip"
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -540,5 +542,302 @@ func TestElPreviewTopeDeNavegacionCircular(t *testing.T) {
 	}
 	if m.Ejecucion.Error != "" {
 		t.Errorf("el tope dejó un error de ejecución: %s", m.Ejecucion.Error)
+	}
+}
+// Las cinco reglas del §359: la lanzadora se decide por el manifiesto tipado, se sigue hasta la
+// actividad real y el layout sale del id de `setContentView` o del nombre de esa actividad. Cuando
+// no hay XML, el modelo publica el centinela y un marco con la etiqueta, sin inventar pantalla.
+func contextoDeLanzadoraDePrueba() *contextoVista {
+	return &contextoVista{axml: &axml{tabla: tablaCadenas{}}}
+}
+
+func cadenaDePrueba(ctx *contextoVista, texto string) valor {
+	for i, s := range ctx.axml.tabla.cadenas {
+		if s == texto {
+			return valor{tipo: tipoCadena, datos: uint32(i)}
+		}
+	}
+	ctx.axml.tabla.cadenas = append(ctx.axml.tabla.cadenas, texto)
+	return valor{tipo: tipoCadena, datos: uint32(len(ctx.axml.tabla.cadenas) - 1)}
+}
+
+func atributoTextoDePrueba(ctx *contextoVista, ns, nombre, texto string) atributoLeido {
+	return atributoLeido{ns: ns, nombre: nombre, valor: cadenaDePrueba(ctx, texto)}
+}
+
+func atributoBoolDePrueba(nombre string, activo bool) atributoLeido {
+	v := valor{tipo: tipoBooleano}
+	if activo {
+		v.datos = 1
+	}
+	return atributoLeido{ns: uriDeRecursos, nombre: nombre, valor: v}
+}
+
+func elementoDePrueba(nombre string, piezas ...any) *elementoLeido {
+	e := &elementoLeido{nombre: nombre}
+	for _, p := range piezas {
+		switch v := p.(type) {
+		case atributoLeido:
+			e.attrs = append(e.attrs, v)
+		case *elementoLeido:
+			e.hijos = append(e.hijos, v)
+		default:
+			panic("pieza desconocida en el elemento de prueba")
+		}
+	}
+	return e
+}
+
+func filtroDePrueba(ctx *contextoVista, acciones, categorias []string) *elementoLeido {
+	f := &elementoLeido{nombre: "intent-filter"}
+	for _, a := range acciones {
+		f.hijos = append(f.hijos, elementoDePrueba("action",
+			atributoTextoDePrueba(ctx, uriDeRecursos, "name", a)))
+	}
+	for _, c := range categorias {
+		f.hijos = append(f.hijos, elementoDePrueba("category",
+			atributoTextoDePrueba(ctx, uriDeRecursos, "name", c)))
+	}
+	return f
+}
+
+func manifiestoCon(ctx *contextoVista, hijos ...*elementoLeido) *elementoLeido {
+	return &elementoLeido{nombre: "manifest",
+		attrs: []atributoLeido{{nombre: "package", valor: cadenaDePrueba(ctx, "org.fdroid.fdroid")}},
+		hijos: []*elementoLeido{{nombre: "application", hijos: hijos}}}
+}
+
+// TestLanzadoraNoEsAliasDeshabilitado falsifica la regla 1: un alias con `enabled=false` tipado no
+// puede abrir la app, aunque traiga MAIN+LAUNCHER. El alias habilitado sí, y se sigue hasta su
+// `targetActivity` (regla 2), en vez de quedarse con el nombre del alias.
+func TestLanzadoraNoEsAliasDeshabilitado(t *testing.T) {
+	ctx := contextoDeLanzadoraDePrueba()
+	main := filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+		[]string{"android.intent.category.LEANBACK_LAUNCHER"})
+	real := elementoDePrueba("activity",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.MainActivity"), main)
+	deshabilitado := elementoDePrueba("activity-alias",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.IconCalculatorActivity"),
+		atributoTextoDePrueba(ctx, uriDeRecursos, "targetActivity", "org.fdroid.MainActivity"),
+		atributoBoolDePrueba("enabled", false),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LAUNCHER"}))
+	habilitado := elementoDePrueba("activity-alias",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.IconActivity"),
+		atributoTextoDePrueba(ctx, uriDeRecursos, "targetActivity", "org.fdroid.MainActivity"),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LAUNCHER"}))
+	manifiesto := manifiestoCon(ctx, real, deshabilitado, habilitado)
+
+	if esLanzadora(deshabilitado, ctx) {
+		t.Fatal("el alias con enabled=false tipado sigue siendo lanzador")
+	}
+	if !esLanzadora(habilitado, ctx) {
+		t.Fatal("el alias habilitado por omisión no es lanzador")
+	}
+	elegida, ok := actividadLanzadora(manifiesto, ctx)
+	if !ok {
+		t.Fatal("no se encontró lanzadora")
+	}
+	if elegida != real {
+		t.Fatalf("la lanzadora es %s (%s) y tenía que ser la actividad real a la que apunta el alias",
+			ctx.textoDeAtributo(elegida, uriDeRecursos, "name"), elegida.nombre)
+	}
+	if elegida.nombre != "activity" {
+		t.Fatalf("se eligió un %s en vez de la actividad real", elegida.nombre)
+	}
+}
+
+// TestLanzadoraEnabledSoloEsBooleano falsifica la comparación de texto: `s != "false"` descartaría
+// un alias cuyo `enabled` es una cadena "false", cuando el valor tipado dice que no es booleano.
+func TestLanzadoraEnabledSoloEsBooleano(t *testing.T) {
+	ctx := contextoDeLanzadoraDePrueba()
+	alias := elementoDePrueba("activity-alias",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.IconActivity"),
+		atributoTextoDePrueba(ctx, uriDeRecursos, "enabled", "false"),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LAUNCHER"}))
+	if !esLanzadora(alias, ctx) {
+		t.Fatal("un enabled escrito como cadena se trató como booleano falso")
+	}
+}
+
+// TestLanzadoraPriorizaActividadConDefault falsifica la regla 3: MAIN+LAUNCHER+DEFAULT manda sobre
+// LEANBACK_LAUNCHER y sobre un alias, incluso cuando ambos van antes en el manifiesto.
+func TestLanzadoraPriorizaActividadConDefault(t *testing.T) {
+	ctx := contextoDeLanzadoraDePrueba()
+	leanback := elementoDePrueba("activity",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.LeanbackActivity"),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LEANBACK_LAUNCHER"}))
+	alias := elementoDePrueba("activity-alias",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "org.fdroid.IconActivity"),
+		atributoTextoDePrueba(ctx, uriDeRecursos, "targetActivity", "org.fdroid.LeanbackActivity"),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LAUNCHER"}))
+	preferida := elementoDePrueba("activity",
+		atributoTextoDePrueba(ctx, uriDeRecursos, "name", "com.otra.RealActivity"),
+		filtroDePrueba(ctx, []string{"android.intent.action.MAIN"},
+			[]string{"android.intent.category.LAUNCHER", "android.intent.category.DEFAULT"}))
+	elegida, ok := actividadLanzadora(manifiestoCon(ctx, leanback, alias, preferida), ctx)
+	if !ok || elegida != preferida {
+		t.Fatalf("se eligió %v y tenía que ganar la actividad con MAIN+LAUNCHER+DEFAULT",
+			elegida)
+	}
+}
+
+// tablaDeLayoutsDePrueba tiene dos entradas de layout: v9, con ruta acortada por aapt2, y
+// activity_termux, con la ruta que escribe el enlazador de Go.
+func tablaDeLayoutsDePrueba() *tablaRecursos {
+	return &tablaRecursos{
+		idPaquete: 0x7f,
+		global: tablaCadenas{cadenas: []string{"res/v9.xml", "res/layout/activity_termux.xml"}},
+		claves:    []string{"v9", "activity_termux"},
+		bloques: []bloqueTipo{{id: 0x0b, nombre: "layout", config: make([]byte, 8),
+			entradas: []entradaRecurso{
+				{clave: 0, valor: valor{tipo: tipoCadena, datos: 0}},
+				{clave: 1, valor: valor{tipo: tipoCadena, datos: 1}},
+			}}},
+	}
+}
+
+// TestRutaDelLayoutSetContentViewAntesQueNombre falsifica la regla 4: el id inflado gana al nombre,
+// el nombre de la actividad gana a `main` y `main` gana al primero por orden alfabético.
+func TestRutaDelLayoutSetContentViewAntesQueNombre(t *testing.T) {
+	datosZip := zipDeEntradas(t, map[string][]byte{
+		"res/layout/A1.xml":              []byte("no"),
+		"res/layout/main.xml":            []byte("no"),
+		"res/layout/activity_termux.xml": []byte("no"),
+	})
+	zr, err := zip.NewReader(bytes.NewReader(datosZip), int64(len(datosZip)))
+	if err != nil {
+		t.Fatalf("el zip: %v", err)
+	}
+	tabla := tablaDeLayoutsDePrueba()
+	const actividad = "Lcom/termux/app/TermuxActivity;"
+
+	if ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, "", 0, actividad); err != nil || ruta != "res/layout/activity_termux.xml" {
+		t.Fatalf("por nombre se eligió %q (err %v) y se esperaba activity_termux.xml", ruta, err)
+	}
+	if ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, "", 0x7f0b0000, actividad); err != nil || ruta != "res/v9.xml" {
+		t.Fatalf("con setContentView se eligió %q (err %v) y se esperaba res/v9.xml", ruta, err)
+	}
+	if ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, "main", 0x7f0b0000, actividad); err != nil || ruta != "res/layout/main.xml" {
+		t.Fatalf("con --layout se eligió %q (err %v) y se esperaba main.xml", ruta, err)
+	}
+}
+
+// TestSinLayoutXmlNoInventaPantalla falsifica la regla 5 de punta a punta: un apk con un aliased
+// MAIN+LAUNCHER y un único `res/A1.xml` no puede caer a ese fichero; publica el centinela y el marco
+// con la etiqueta de la app.
+func TestSinLayoutXmlNoInventaPantalla(t *testing.T) {
+	ctx := contextoDeLanzadoraDePrueba()
+	manifiesto, err := escribeAXML(documentoAXML{
+		ns: []declaracionNS{{prefijo: "android", uri: uriAndroid}},
+		raiz: &elementoEscribir{nombre: "manifest", attrs: []atributoEscribir{
+			{nombre: "package", tipo: tipoCadena, texto: "org.fdroid.fdroid"},
+		}, hijos: []*elementoEscribir{{
+			nombre: "application", attrs: []atributoEscribir{
+				{ns: "android", nombre: "label", id: 0x01010001, tipo: tipoCadena, texto: "F-Droid"},
+			},
+			hijos: []*elementoEscribir{
+				{nombre: "activity", attrs: []atributoEscribir{
+					{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "org.fdroid.MainActivity"},
+				}, hijos: []*elementoEscribir{{
+					nombre: "intent-filter",
+					hijos: []*elementoEscribir{
+						{nombre: "action", attrs: []atributoEscribir{
+							{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "android.intent.action.MAIN"},
+						}},
+						{nombre: "category", attrs: []atributoEscribir{
+							{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "android.intent.category.LEANBACK_LAUNCHER"},
+						}},
+					},
+				}}},
+				{nombre: "activity-alias", attrs: []atributoEscribir{
+					{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "org.fdroid.IconActivity"},
+					{ns: "android", nombre: "targetActivity", id: 0x01010099, tipo: tipoCadena, texto: "org.fdroid.MainActivity"},
+				}, hijos: []*elementoEscribir{{
+					nombre: "intent-filter",
+					hijos: []*elementoEscribir{
+						{nombre: "action", attrs: []atributoEscribir{
+							{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "android.intent.action.MAIN"},
+						}},
+						{nombre: "category", attrs: []atributoEscribir{
+							{ns: "android", nombre: "name", id: 0x01010003, tipo: tipoCadena, texto: "android.intent.category.LAUNCHER"},
+						}},
+					},
+				}}},
+			},
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("el manifiesto: %v", err)
+	}
+	axml, err := leeAXML(manifiesto)
+	if err != nil {
+		t.Fatalf("leer el manifiesto: %v", err)
+	}
+	ctx.axml = axml
+	arbol, err := ctx.arbol()
+	if err != nil {
+		t.Fatalf("el árbol del manifiesto: %v", err)
+	}
+	elegida, ok := actividadLanzadora(arbol, ctx)
+	if !ok || ctx.textoDeAtributo(elegida, uriDeRecursos, "name") != "org.fdroid.MainActivity" {
+		t.Fatalf("el alias no llevó a MainActivity: %v", elegida)
+	}
+	inventada, err := escribeAXML(documentoAXML{raiz: &elementoEscribir{nombre: "FrameLayout"}})
+	if err != nil {
+		t.Fatalf("el layout estoy: %v", err)
+	}
+	datos := zipDeEntradas(t, map[string][]byte{
+		"AndroidManifest.xml": manifiesto,
+		"res/A1.xml":          inventada,
+	})
+	m, err := modeloVistaDeAPKCon(datos, "", false)
+	if err != nil {
+		t.Fatalf("el modelo sin layout: %v", err)
+	}
+	if m.Layout != "" {
+		t.Errorf("se inventó el layout %q", m.Layout)
+	}
+	if strings.Contains(m.Layout, "A1") {
+		t.Errorf("el modelo cayó al primer XML: %q", m.Layout)
+	}
+	if m.Actividad != "org.fdroid.MainActivity" {
+		t.Errorf("la actividad es %q y se esperaba la del targetActivity del alias", m.Actividad)
+	}
+	if m.Raiz == nil || m.Raiz.Tipo != "FrameLayout" || m.Raiz.Texto != "F-Droid" {
+		t.Errorf("el marco raíz es %+v y tenía que llevar la etiqueta F-Droid", m.Raiz)
+	}
+	if m.Ejecucion == nil || len(m.Ejecucion.Avisos) != 1 ||
+		!strings.HasPrefix(m.Ejecucion.Avisos[0], avisoSinLayout) {
+		t.Errorf("los avisos son %v y tenían que traer el centinela", m.Ejecucion)
+	}
+}
+
+// TestRutaDelLayoutDelExploradorSimple falsifica el mecanismo del cuarto APK medido: la tabla dice
+// `layout/activity_main` → `res/R5.xml` y el nombre de su MainActivity es `activity_main`. Que el id
+// de `setContentView` lleve al mismo sitio se comprueba aparte, porque las dos vías pueden coincidir.
+func TestRutaDelLayoutDelExploradorSimple(t *testing.T) {
+	tabla := &tablaRecursos{
+		idPaquete: 0x7f,
+		global:    tablaCadenas{cadenas: []string{"res/R5.xml"}},
+		claves:    []string{"activity_main"},
+		bloques: []bloqueTipo{{id: 0x04, nombre: "layout", config: make([]byte, 8),
+			entradas: []entradaRecurso{{clave: 0, valor: valor{tipo: tipoCadena, datos: 0}}}}},
+	}
+	datosZip := zipDeEntradas(t, map[string][]byte{"res/A1.xml": []byte("no")})
+	zr, err := zip.NewReader(bytes.NewReader(datosZip), int64(len(datosZip)))
+	if err != nil {
+		t.Fatalf("el zip: %v", err)
+	}
+	const actividad = "Lcom/martinmimigames/simplefileexplorer/MainActivity;"
+	if ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, "", 0, actividad); err != nil || ruta != "res/R5.xml" {
+		t.Errorf("por nombre del actividad se eligió %q (err %v) y se esperaba res/R5.xml", ruta, err)
+	}
+	if ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, "", 0x7f040000, ""); err != nil || ruta != "res/R5.xml" {
+		t.Errorf("por id de setContentView se eligió %q (err %v) y se esperaba res/R5.xml", ruta, err)
 	}
 }

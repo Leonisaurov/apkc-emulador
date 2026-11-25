@@ -141,8 +141,31 @@ func (s *sesionPreview) preparadorSesion() func(*maquinaDalvik) {
 				tabla.locale = s.locale
 			}
 		}
-		preparaVistasDelLayout(m, zr, tabla, s.layout)
+		actividad := ""
+		if s.res != nil {
+			actividad = s.res.Actividad
+		}
+		preparaVistasDelLayout(m, zr, tabla, s.layout, actividad)
 	}
+}
+
+// etiquetaDeLaApkEnZip lee el manifiesto del apk vivo para el marco que se publica cuando la
+// actividad no tiene layout XML. La sesión no guarda el árbol del arranque, así que lo reconstruye.
+func etiquetaDeLaApkEnZip(zr *zip.Reader, tabla *tablaRecursos) string {
+	datos, err := entradaDeZip(zr, "AndroidManifest.xml")
+	if err != nil {
+		return ""
+	}
+	axml, err := leeAXML(datos)
+	if err != nil {
+		return ""
+	}
+	ctx := &contextoVista{axml: axml, tabla: tabla}
+	arbol, err := ctx.arbol()
+	if err != nil {
+		return ""
+	}
+	return etiquetaDeLaApp(arbol, ctx)
 }
 
 // estabilizaSesion hace por la sesión viva lo que el cierre `estabiliza` de previewinterprete.go:1453
@@ -340,9 +363,28 @@ func (s *sesionPreview) modeloConResultado() (*modeloVista, error) {
 			tabla.locale = s.locale
 		}
 	}
-	ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, s.layout, s.m.layoutID)
+	actividad := ""
+	res := s.res
+	if res != nil {
+		actividad = res.Actividad
+	}
+	ruta, err := rutaDelLayoutDeLaActividad(tabla, zr, s.layout, s.m.layoutID, actividad)
 	if err != nil {
 		return nil, err
+	}
+	if ruta == "" {
+		// Igual que en la pasada única: aviso por familia y marco con la etiqueta, sin inventar XML.
+		if res == nil {
+			res = &resultadoEjecucion{}
+		}
+		copia := *res
+		copia.Avisos = avisoSinLayoutDevuelve(res.Avisos, actividad)
+		raiz := raizSinLayout(etiquetaDeLaApkEnZip(zr, tabla))
+		coloca(raiz, 0, 0, dpPantallaAncho, dpPantallaAlto)
+		return &modeloVista{Aproximado: true, Paquete: s.paquete,
+			Pantalla: rectVista{Ancho: dpPantallaAncho, Alto: dpPantallaAlto},
+			Actividad: actividad, Layout: "", Raiz: raiz, Ejecucion: &copia,
+			Nodos: contarNodos(raiz)}, nil
 	}
 	layoutBytes, err := entradaDeZip(zr, ruta)
 	if err != nil {
