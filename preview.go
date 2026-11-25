@@ -1506,6 +1506,23 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 			n.orientacion = "vertical"
 		}
 	}
+	// La otra forma de poblar una lista es `addView` en código, sin adaptador. El gestor limpia con
+	// `removeAllViews` el contenedor id/drive_list (0x7f030001) y añade un Button por cada ruta
+	// legible de la ROM; el modelo expone esas filas en id/list, que es el nodo de lista que se
+	// enseña. Solo se publica el contenedor refrescado: los `addView` de los diálogos no son filas.
+	if id := ejecucion.maquina.listaRefrescada; id != 0 {
+		if n := porID["id/list"]; n != nil {
+			filas := make([]*nodoVista, 0)
+			for _, hijo := range ejecucion.maquina.contenedores[id] {
+				filas = append(filas, nodoDeFila(filaPintada{Tipo: claseCorta(hijo.clase),
+					Texto: textoDeFilaCodigo(hijo)}, tabla, zr))
+			}
+			n.Hijos = filas
+			if n.orientacion == "" {
+				n.orientacion = "vertical"
+			}
+		}
+	}
 }
 
 // textoDeFilaCodigo busca el texto de una fila añadida por código: puede estar en la propia vista
