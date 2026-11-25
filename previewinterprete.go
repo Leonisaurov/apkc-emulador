@@ -438,8 +438,8 @@ func cargaPrograma(dxs ...*dexFile) (*programaDalvik, error) {
 		}
 		for _, c := range d.classes {
 			cl := &claseDalvik{
-				nombre:    c.name,
-				super:     c.super,
+				nombre:             c.name,
+				super:              c.super,
 				metodos:            map[string]*metodoDalvik{},
 				estaticos:          map[string]any{},
 				estaticosIniciales: map[string]any{},
@@ -5882,18 +5882,25 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// objeto ya trae una traza sembrada se respeta; si es una excepción, además se siembran
 		// clase, método y línea para que los getters no entreguen un nombre vacío. La pila real no
 		// existe en la vista previa y el aviso lo dice expresamente.
-		if len(vals) == 0 && obj != nil && (es("Ljava/lang/Thread;") || esThrowableObj()) {
-			if sembrada, ok := obj.campos["throwable.stackTrace"].(*arregloDalvik); ok && sembrada != nil {
-				return sembrada, true, nil
+		if len(vals) == 0 && obj != nil {
+			esHilo := es("Ljava/lang/Thread;")
+			// el cortocircuito evita volver a preguntar por la jerarquía de excepciones cuando el
+			// receptor es el hilo sintético: esa jerarquía necesita el dex cargado y en la prueba
+			// de hilos no hay ninguno (medido: panic en tipoAcepta al llamar getStackTrace).
+			esExcepcion := esHilo || esThrowableObj()
+			if esHilo || esExcepcion {
+				if sembrada, ok := obj.campos["throwable.stackTrace"].(*arregloDalvik); ok && sembrada != nil {
+					return sembrada, true, nil
+				}
+				elemento := &objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{}}
+				if esExcepcion {
+					elemento.campos["StackTraceElement.clase"] = claseCorta(obj.clase)
+					elemento.campos["StackTraceElement.metodo"] = "<init>"
+					elemento.campos["StackTraceElement.linea"] = int32(-1)
+				}
+				m.avisa("getStackTrace: la vista previa no tiene pila real; se devuelve una casilla sintética (aproximación)")
+				return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}, true, nil
 			}
-			elemento := &objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{}}
-			if esThrowableObj() {
-				elemento.campos["StackTraceElement.clase"] = claseCorta(obj.clase)
-				elemento.campos["StackTraceElement.metodo"] = "<init>"
-				elemento.campos["StackTraceElement.linea"] = int32(-1)
-			}
-			m.avisa("getStackTrace: la vista previa no tiene pila real; se devuelve una casilla sintética (aproximación)")
-			return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}, true, nil
 		}
 	case "getClassName", "getMethodName", "getLineNumber":
 		// los getters de StackTraceElement leen el objeto que sembró `getStackTrace`. Sin un campo

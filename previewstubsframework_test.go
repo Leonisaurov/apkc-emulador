@@ -1275,3 +1275,85 @@ func TestStackTraceGetStackTraceYGetters(t *testing.T) {
 func protoReturn(proto string) string {
 	return strings.TrimPrefix(proto, "()")
 }
+// TestStackTraceGettersConCamposVacios falsifica la casilla que sembró el frente de lifecycle: un
+// StackTraceElement sin campos debe leerse como cadena vacía y línea cero, nunca como un objeto
+// nulo que reviente el siguiente `equals`, y sin dejar un aviso nuevo.
+func TestStackTraceGettersConCamposVacios(t *testing.T) {
+	m := maquinaDeStubs()
+	elemento := objDe("Ljava/lang/StackTraceElement;")
+	candidatos := []string{"Ljava/lang/StackTraceElement;"}
+	casos := []struct {
+		nombre   string
+		proto    string
+		esperado any
+	}{
+		{"getClassName", "()Ljava/lang/String;", ""},
+		{"getMethodName", "()Ljava/lang/String;", ""},
+		{"getLineNumber", "()I", int32(0)},
+	}
+	for _, c := range casos {
+		v, ok, err := m.intentaStub(candidatos, c.nombre, c.proto, nil, elemento)
+		if err != nil || !ok {
+			t.Fatalf("%s con campos vacíos: v=%v ok=%v err=%v", c.nombre, v, ok, err)
+		}
+		if v == nil {
+			t.Errorf("%s con campos vacíos devolvió el receptor nulo", c.nombre)
+			continue
+		}
+		if texto, esTexto := c.esperado.(string); esTexto {
+			esperaCadenaDeStub(t, v, texto)
+		} else if v != c.esperado {
+			t.Errorf("%s con campos vacíos devolvió %v y se esperaba %v", c.nombre, v, c.esperado)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); avisos != "" {
+		t.Errorf("los getters con campos vacíos registraron avisos: %s", avisos)
+	}
+}
+
+// TestCadenasSubstringCortaParesSurrogate: un emoji son dos unidades de 16 bits y una sola runa.
+// Si `substring` contara runas, el corte (1,2) lanzaría StringIndexOutOfBoundsException; al cortar
+// unidades devuelve una casilla suelta. El par completo y el fin también se comprueban.
+func TestCadenasSubstringCortaParesSurrogate(t *testing.T) {
+	m := maquinaDeStubs()
+	candidatos := []string{"Ljava/lang/String;"}
+	emoji := "😀"
+	if unidades := unidadesDeCadena(emoji); len(unidades) != 2 {
+		t.Fatalf("el emoji tiene %d unidades y se esperaban 2", len(unidades))
+	}
+	casos := []struct {
+		vals     []any
+		unidades int
+	}{
+		{[]any{int32(0), int32(1)}, 1},
+		{[]any{int32(1), int32(2)}, 1},
+		{[]any{int32(0), int32(2)}, 2},
+		{[]any{int32(2), int32(2)}, 0},
+	}
+	for _, c := range casos {
+		v, ok, err := m.intentaStub(candidatos, "substring", "(II)Ljava/lang/String;", c.vals, emoji)
+		if err != nil || !ok {
+			t.Errorf("substring(%v): v=%v ok=%v err=%v", c.vals, v, ok, err)
+			continue
+		}
+		s, esCadena := cadenaDe(v)
+		if !esCadena {
+			t.Errorf("substring(%v) devolvió %T y se esperaba una cadena", c.vals, v)
+			continue
+		}
+		if n := len(unidadesDeCadena(s)); n != c.unidades {
+			t.Errorf("substring(%v) devolvió %d unidades y se esperaban %d", c.vals, n, c.unidades)
+		}
+	}
+	v, ok, err := m.intentaStub(candidatos, "substring", "(II)Ljava/lang/String;",
+		[]any{int32(0), int32(3)}, emoji)
+	if !ok {
+		t.Fatal("substring(0,3) sobre un emoji no fue atendido")
+	}
+	var ex *excepcionDalvik
+	if !errors.As(err, &ex) {
+		t.Errorf("substring(0,3) devolvió v=%v err=%v y se esperaba una excepción", v, err)
+	} else if ex.tipo != "Ljava/lang/StringIndexOutOfBoundsException;" {
+		t.Errorf("substring(0,3) lanzó %s y se esperaba StringIndexOutOfBoundsException", ex.tipo)
+	}
+}
