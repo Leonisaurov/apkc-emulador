@@ -104,6 +104,21 @@ const (
 	dpTextoReferencia = 16
 )
 
+// Ids de los atributos del tema del framework, tomados de
+// platforms/android-34/data/res/values/public-final.xml. El estilo de la app los nombra por id,
+// aunque el nombre del recurso esté ofuscado (`m3_`/`abc_`) en el apk: resolver por id hace que la
+// ofuscación no cambie el resultado. `theme` es el atributo con el que el manifiesto elige estilo.
+const (
+	idAtributoTema         = 0x01010000 // android:theme
+	idAtributoTextoTema    = 0x01010036 // textColorPrimary
+	idAtributoFondoTema    = 0x01010031 // colorBackground
+	idAtributoFondoVentana = 0x01010054 // windowBackground
+	// los colores del framework que el enlazador escribe como referencia y no viven en la tabla del apk
+	idColorBlanco       = 0x0106000b
+	idColorNegro        = 0x0106000c
+	idColorTransparente = 0x0106000d
+)
+
 // pixelesDeImagenMaximos es el máximo que se vuelca de un PNG: una imagen mayor se recorta para que
 // el JSON no crezca sin límite; el tamaño intrínseco se conserva siempre.
 const pixelesDeImagenMaximos = 64 * 64
@@ -214,6 +229,14 @@ type nodoVista struct {
 	imagenAncho   int    // el tamaño intrínseco del PNG ya en dp
 	imagenAlto    int
 	fondoRef      uint32 // el id de `android:background` si es una referencia, o 0
+}
+
+// coloresTema son los colores que el tema de la app aporta a la pantalla. No se publican como un
+// campo nuevo del JSON: se copian a `color` y `fondo`, que el modelo ya traía para lo declarado en el
+// layout y en un `@style` propio. El tema es el defecto; lo que la vista declara gana siempre.
+type coloresTema struct {
+	Texto string
+	Fondo string
 }
 
 // estaOculta: `gone` no se mide ni se coloca; `invisible` sí ocupa su sitio.
@@ -738,6 +761,8 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 		modelo.Actividad = nombreActividad
 	}
 	etiquetaApp := etiquetaDeLaApp(arbolManifiesto, ctxManifiesto)
+	coloresTema := ctxManifiesto.coloresDelTema(
+		temaDelManifiesto(arbolManifiesto, nombreActividad, modelo.Paquete, ctxManifiesto))
 
 	// Fase 2: la actividad se ejecuta antes de elegir el layout, porque el `setContentView` dice cuál
 	// es. La actividad puede vivir en cualquier `classesN.dex`, así que se carga el conjunto completo.
@@ -827,6 +852,8 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 	// las listas se expanden después de los clics: el adaptador ya está armado y es su getView el
 	// que decide qué filas y qué textos se ven
 	expandeListas(raiz, modelo.Ejecucion, tabla, zr)
+	// el tema se aplica después de expandir las listas para que sus filas hereden el color del texto
+	aplicaColoresDelTema(raiz, coloresTema, true)
 	// el rectángulo se calcula con el texto que se va a ver: si la app lo cambió, la medida del
 	// layout declarado ya no es la de la pantalla que el modelo describe
 	coloca(raiz, 0, 0, dpPantallaAncho, dpPantallaAlto)
@@ -972,6 +999,18 @@ func admiteTecleo(tipo string) bool {
 		return true
 	}
 	return false
+}
+
+// muestraTexto dice si una vista del layout puede enseñar texto. Es la misma familia que el pintor
+// del navegador trata como texto, sin importar el prefijo de AppCompat o Material3.
+func muestraTexto(tipo string) bool {
+	switch tipo {
+	case "TextView", "Button", "EditText", "CheckedTextView", "Chronometer", "ToggleButton",
+		"AutoCompleteTextView", "MultiAutoCompleteTextView", "TextInputEditText":
+		return true
+	}
+	return strings.HasSuffix(tipo, "TextView") || strings.HasSuffix(tipo, "Button") ||
+		strings.HasSuffix(tipo, "EditText")
 }
 
 // anotaTextoDinamico copia a cada nodo la última escritura que el intérprete capturó sobre su id.
@@ -1892,6 +1931,160 @@ func (c *contextoVista) valoresDeEstilo(id uint32, profundidad int) map[uint32]v
 		}
 	}
 	return valores
+}
+
+// temaDelManifiesto devuelve el id del estilo que la app elige como tema: el de la actividad
+// lanzadora si lo declara, y si no el de <application>. El atributo `android:theme` llega como
+// referencia a un estilo del paquete, así que el id se lee directamente del valor compilado.
+func temaDelManifiesto(arbol *elementoLeido, actividad, paquete string, ctx *contextoVista) uint32 {
+	if arbol == nil || ctx == nil {
+		return 0
+	}
+	var aplicacion *elementoLeido
+	var busca func(*elementoLeido)
+	busca = func(e *elementoLeido) {
+		for _, h := range e.hijos {
+			if h.nombre == "application" {
+				aplicacion = h
+			}
+			busca(h)
+		}
+	}
+	busca(arbol)
+	if aplicacion == nil {
+		return 0
+	}
+	valor, ok := aplicacion.atributo(uriDeRecursos, "theme")
+	if !ok {
+		return 0
+	}
+	for _, h := range aplicacion.hijos {
+		if h.nombre != "activity" {
+			continue
+		}
+		nombre := ctx.textoDeAtributo(h, uriDeRecursos, "name")
+		if nombreCoincideActividad(nombre, actividad, paquete) {
+			if propia, hay := h.atributo(uriDeRecursos, "theme"); hay {
+				valor = propia
+			}
+		}
+	}
+	if valor.tipo == tipoReferencia {
+		return valor.datos
+	}
+	return 0
+}
+
+// nombreCoincideActividad compara el `android:name` del manifiesto, que puede empezar por punto, con
+// el nombre completo que publica el modelo.
+func nombreCoincideActividad(declarado, buscado, paquete string) bool {
+	declarado = strings.TrimSpace(declarado)
+	if declarado == "" || buscado == "" {
+		return false
+	}
+	if strings.HasPrefix(declarado, ".") {
+		declarado = paquete + declarado
+	} else if !strings.Contains(declarado, ".") {
+		declarado = paquete + "." + declarado
+	}
+	return declarado == buscado
+}
+
+// colorDelFramework traduce los colores más corrientes de `android.R.color` que no están en la tabla
+// del apk. Lo que no esté en esta lista se deja sin resolver: no se inventa un color.
+func colorDelFramework(id uint32) (string, bool) {
+	switch id {
+	case idColorBlanco:
+		return "#ffffff", true
+	case idColorNegro:
+		return "#000000", true
+	case idColorTransparente:
+		return "#00000000", true
+	}
+	return "", false
+}
+
+// coloresDelTema resuelve texto y fondo del estilo de tema de la app. Los ítems se leen por id de
+// atributo (`valoresDeEstilo`), nunca por nombre: así un `m3_`/`abc_` ofuscado se resuelve igual que
+// un `AppTheme` legible. Una referencia se sigue primero dentro del propio estilo —es lo que hace
+// `?attr/…`— y después en la tabla de recursos.
+func (c *contextoVista) coloresDelTema(id uint32) coloresTema {
+	salida := coloresTema{}
+	if id == 0 || c == nil || c.tabla == nil {
+		return salida
+	}
+	items := c.valoresDeEstilo(id, 0)
+	if len(items) == 0 {
+		return salida
+	}
+	enCurso := map[uint32]bool{}
+	var colorDeItem func(valor, int) string
+	colorDeItem = func(v valor, nivel int) string {
+		if nivel >= profundidadMaxima {
+			return ""
+		}
+		switch v.tipo {
+		case tipoColor, tipoColorRGB8, tipoEnteroHex, tipoEnteroDec:
+			return c.colorDe(v)
+		case tipoCadena:
+			if col, ok := colorDeCadena(c.resuelve(v, c.tabla.global.cadenas, 0)); ok {
+				return col
+			}
+		case tipoReferencia:
+			if enCurso[v.datos] {
+				return ""
+			}
+			enCurso[v.datos] = true
+			defer delete(enCurso, v.datos)
+			if col, ok := colorDelFramework(v.datos); ok {
+				return col
+			}
+			if otro, ok := items[v.datos]; ok {
+				if col := colorDeItem(otro, nivel+1); col != "" {
+					return col
+				}
+			}
+			if enlace, ok := c.tabla.valorDeId(v.datos); ok {
+				return colorDeItem(enlace, nivel+1)
+			}
+		}
+		return ""
+	}
+	if v, ok := items[idAtributoTextoTema]; ok {
+		salida.Texto = colorDeItem(v, 0)
+	}
+	if salida.Texto == "" {
+		if v, ok := items[idVistaTextColor]; ok {
+			salida.Texto = colorDeItem(v, 0)
+		}
+	}
+	if v, ok := items[idAtributoFondoTema]; ok {
+		salida.Fondo = colorDeItem(v, 0)
+	}
+	if salida.Fondo == "" {
+		if v, ok := items[idAtributoFondoVentana]; ok {
+			salida.Fondo = colorDeItem(v, 0)
+		}
+	}
+	return salida
+}
+
+// aplicaColoresDelTema rellena `fondo` en la raíz —es el windowBackground del decor— y `color` en
+// las vistas que pueden mostrar texto, incluidas las filas que el adaptador acaba de devolver. Un
+// nodo que ya declare color o fondo, en el layout o en su `@style` propio, conserva lo que declara.
+func aplicaColoresDelTema(n *nodoVista, c coloresTema, raiz bool) {
+	if n == nil || (c.Texto == "" && c.Fondo == "") {
+		return
+	}
+	if raiz && n.Fondo == "" && c.Fondo != "" {
+		n.Fondo = c.Fondo
+	}
+	if n.Color == "" && c.Texto != "" && muestraTexto(n.Tipo) {
+		n.Color = c.Texto
+	}
+	for _, h := range n.Hijos {
+		aplicaColoresDelTema(h, c, false)
+	}
 }
 
 // colorDe lleva un color a `#rrggbb` (o `#aarrggbb` si tiene alfa) venga como entero ARGB8, como

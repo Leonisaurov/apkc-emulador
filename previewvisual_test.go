@@ -269,3 +269,116 @@ func TestElColorRGB8DeAapt2SeLeeComoColor(t *testing.T) {
 		t.Fatalf("colorDe con tipo 0x1d dio %q: se esperaba %q", obtenido, "#336699")
 	}
 }
+
+// La resolución del tema de la Fase E se comprueba con el mismo APK del adaptador: el manifiesto
+// elige un estilo del paquete y el modelo tiene que publicar su texto y su fondo en los campos que
+// ya existen (`color` y `fondo`), también en las filas que devuelve el adaptador. El nombre del
+// estilo se eligió con prefijo ofuscado a propósito: la resolución va por id de atributo.
+
+// tablaDeListasConTema añade un color y un estilo al final de la tabla de listas, sin mover los ids
+// de `id` y `layout` que las pruebas anteriores ya usan.
+func tablaDeListasConTema() tablaEscribir {
+	t := tablaDeListas()
+	t.nombresTipo = append(append([]string{}, t.nombresTipo...), "color", "style")
+	t.claves = append(append([]string{}, t.claves...), "tinta", "abc_TemaOfuscado")
+	t.tipos = append(append([]tipoEscribir{}, t.tipos...),
+		tipoEscribir{id: 3, specFlags: []uint32{0}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+			{clave: 5, valor: valorEscribir{tipo: tipoColor, datos: 0xff123456}},
+		}}}},
+		tipoEscribir{id: 4, specFlags: []uint32{0}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+			{clave: 6, flags: 0x0001, compleja: true, registros: []registroEscribir{
+				{nombre: idAtributoTextoTema, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f030000}},
+				{nombre: idAtributoFondoVentana, valor: valorEscribir{tipo: tipoReferencia, datos: idColorBlanco}},
+			}},
+		}}}},
+	)
+	return t
+}
+
+func manifiestoDeListasConTema() documentoAXML {
+	m := manifiestoDeListas()
+	aplicacion := m.raiz.hijos[0]
+	aplicacion.attrs = append(aplicacion.attrs, atributoEscribir{
+		ns: "android", nombre: "theme", id: idAtributoTema,
+		tipo: tipoReferencia, datos: 0x7f040000,
+	})
+	return m
+}
+
+func apkDeListasConTema(t *testing.T) []byte {
+	t.Helper()
+	manifiesto, err := escribeAXML(manifiestoDeListasConTema())
+	if err != nil {
+		t.Fatalf("el manifiesto con tema: %v", err)
+	}
+	main, err := escribeAXML(layoutDeLaLista())
+	if err != nil {
+		t.Fatalf("el layout main: %v", err)
+	}
+	fila, err := escribeAXML(layoutDeLaFila())
+	if err != nil {
+		t.Fatalf("el layout fila: %v", err)
+	}
+	tabla := tablaDeListasConTema()
+	arsc, err := escribeTablaRecursos(tabla)
+	if err != nil {
+		t.Fatalf("la tabla con tema: %v", err)
+	}
+	r, err := rDeTabla(tabla)
+	if err != nil {
+		t.Fatalf("el R.java: %v", err)
+	}
+	return zipDeEntradas(t, map[string][]byte{
+		"AndroidManifest.xml": manifiesto,
+		"resources.arsc":      arsc,
+		"res/layout/main.xml": main,
+		"res/layout/fila.xml": fila,
+		"classes.dex": dexDeFuentes(t,
+			fuenteJava{nombre: "R.java", contenido: r},
+			fuenteJava{nombre: "MainActivity.java", contenido: fuenteMainListas},
+			fuenteJava{nombre: "Adaptador.java", contenido: fuenteAdaptador}),
+	})
+}
+
+// TestElModeloTraeElTemaYLasFilasDelAdaptador es el criterio falsable de la Fase E del lado Go: el
+// color del texto del tema (una referencia a un `@color` ofuscado) y el fondo windowBackground
+// (una referencia a un color del framework) llegan a los nodos, y las filas del adaptador traen su
+// texto real. No se añade ninguna clave al JSON.
+func TestElModeloTraeElTemaYLasFilasDelAdaptador(t *testing.T) {
+	modelo, err := modeloVistaDeAPKConPulsos(apkDeListasConTema(t), "", true, nil)
+	if err != nil {
+		t.Fatalf("el apk con tema no se lee: %v", err)
+	}
+	if modelo.Raiz == nil {
+		t.Fatal("el modelo no trae raíz")
+	}
+	if modelo.Raiz.Fondo != "#ffffff" {
+		t.Errorf("el fondo del tema no llegó a la raíz: %q", modelo.Raiz.Fondo)
+	}
+	if len(modelo.Raiz.Hijos) != 2 {
+		t.Fatalf("la pantalla no tiene sus dos hijos: %+v", modelo.Raiz.Hijos)
+	}
+	if pie := modelo.Raiz.Hijos[1]; pie.Color != "#123456" {
+		t.Errorf("el color del tema no llegó al TextView: %q", pie.Color)
+	}
+	lista := modelo.Raiz.Hijos[0]
+	if lista.Tipo != "ListView" || len(lista.Hijos) != 3 {
+		t.Fatalf("la lista no trae tres filas: %s, %+v", lista.Tipo, lista.Hijos)
+	}
+	esperados := []string{"Fila 0: Alfa", "Fila 1: Beta", "Fila 2: Gama"}
+	for i, fila := range lista.Hijos {
+		if texto := textoDeLaFila(fila); texto != esperados[i] {
+			t.Errorf("la fila %d dice %q y se esperaba %q", i, texto, esperados[i])
+		}
+		if fila.Color != "#123456" {
+			t.Errorf("la fila %d no heredó el color del tema: %q", i, fila.Color)
+		}
+	}
+	crudo, err := json.Marshal(modelo)
+	if err != nil {
+		t.Fatalf("el modelo no se serializa: %v", err)
+	}
+	if strings.Contains(string(crudo), `"tema"`) {
+		t.Error("el JSON añadió un campo `tema`: el criterio exige reutilizar color/fondo")
+	}
+}
