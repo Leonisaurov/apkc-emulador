@@ -3069,6 +3069,15 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 			case 0x00: // nop
 				pc++
 
+			// Los monitores de `synchronized` son instrucciones 11x de una sola palabra: `1dAA`
+			// (`monitor-enter`) y `1eAA` (`monitor-exit`), con la referencia del candado en vAA,
+			// medidos en apkc/dexinstr.go:125-126 (`opMonitorEntra` y `opMonitorSale`). Frontera
+			// documentada: el intérprete es de un solo hilo, sin `wait`/`notify`, sin contención y
+			// sin verificación de que `monitor-enter` y `monitor-exit` formen pareja; se consumen
+			// avanzando `pc`, sin estado adicional y sin aviso.
+			case 0x1d, 0x1e: // monitor-enter / monitor-exit (11x)
+				pc++
+
 			// --- movimientos -------------------------------------------------------------------
 			case 0x01, 0x04, 0x07: // move / move-wide / move-object (12x)
 				dst, src := int(u>>8)&0xf, int(u>>12)

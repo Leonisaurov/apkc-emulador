@@ -12,6 +12,7 @@ package main
 // `total.setText("Pulsos: " + pulsos)` sale capturado.
 
 import (
+	"encoding/base64"
 	"errors"
 	"os"
 	"strings"
@@ -1547,4 +1548,129 @@ func TestElPreviewNoTieneTopeDeClics(t *testing.T) {
 	if got := m.Raiz.Hijos[0].TextoDinamico; got != "Pulsos: 100" {
 		t.Errorf("tras 100 clics el texto es %q", got)
 	}
+}
+
+// moniValorB64 es el fixture del §358: el `.class` de `MoniValor` que sale de javac, medido en
+// `$HOME/.cache/apkc-web/moni-valor-fixture/moni.b64` (sha256 del class
+// 2d2b95da8d59944bdd635af4231f017dfbbb06097561661f5e8756ad68c269c5). Viaja como texto, no como
+// binario (regla 2). Los tres métodos son `synchronized`, así que el dex trae `monitor-enter` y
+// `monitor-exit`; el oráculo ART (`app_process64` sobre Android 14) da los mismos tres resultados.
+const moniValorB64 = "yv66vgAAADQAHgoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClWCAAIAQABeAoACgALBwAMDAANAA4BABFqYXZhL2xhbmcvSW50ZWdlcgEACHBhcnNlSW50AQAVKExqYXZhL2xhbmcvU3RyaW5nOylJBwAQAQAfamF2YS9sYW5nL051bWJlckZvcm1hdEV4Y2VwdGlvbgcAEgEACU1vbmlWYWxvcgEABENvZGUBAA9MaW5lTnVtYmVyVGFibGUBAAxzaW5jRGV2dWVsdmUBABUoTGphdmEvbGFuZy9PYmplY3Q7KUkBAA1TdGFja01hcFRhYmxlBwAZAQATamF2YS9sYW5nL1Rocm93YWJsZQEACXNpbmNMYW56YQEADnNpbmNSZWVudnVlbHZlAQAKU291cmNlRmlsZQEADk1vbmlWYWxvci5qYXZhACEAEQACAAAAAAAEAAEABQAGAAEAEwAAAB0AAQABAAAABSq3AAGxAAAAAQAUAAAABgABAAAAAQAIABUAFgABABMAAABOAAIAAwAAAA4qWUzCECorw6xNK8MsvwACAAQACAAJAAAACQAMAAkAAAACABQAAAAGAAEAAAACABcAAAASAAH/AAkAAgcAAgcAAgABBwAYAAgAGgAWAAEAEwAAAFQAAgADAAAAFCpZTMISB7gACVcQKivDrE0rwyy/AAIABAAOAA8AAAAPABIADwAAAAIAFAAAAAYAAQAAAAMAFwAAABIAAf8ADwACBwACBwACAAEHABgACAAbABYAAQATAAAAjAACAAMAAAAjKllMwhIHuAAJVyvDpwAITSvDLL+nAAZMK7+nAAdMECqsAqwABAAEAAwADwAAAA8AEgAPAAAAAAAUABcADwAAABoAHQAPAAIAFAAAABIABAAAAAYAFAAHABoACAAhAAkAFwAAAB8ABv8ADwACBwACBwACAAEHABj6AARCBwAPAkIHAA8DAAEAHAAAAAIAHQ=="
+
+// TestElInterpreteDecodificaLosMonitoresDeSynchronized cierra el §358: los opcodes 0x1d y 0x1e
+// dejan de caer en el `default` del opcode no decodificado y se consumen como instrucciones 11x de
+// una palabra, sin estado, sin avisos y sin tocar el despacho de excepciones. La guardia sobre
+// `ci.insns` es imprescindible: sin los monitores en el dex, un test en verde no probaría nada.
+func TestElInterpreteDecodificaLosMonitoresDeSynchronized(t *testing.T) {
+	datos, err := base64.StdEncoding.DecodeString(moniValorB64)
+	if err != nil {
+		t.Fatalf("el fixture no es base64: %v", err)
+	}
+	cf, err := readClassFull(datos)
+	if err != nil {
+		t.Fatalf("el fixture no se lee: %v", err)
+	}
+	dexBytes, err := dexDeClases([]classFull{cf})
+	if err != nil {
+		t.Fatalf("el dex del fixture no sale: %v", err)
+	}
+	d, err := readDex(dexBytes)
+	if err != nil {
+		t.Fatalf("el dex del fixture no se relee: %v", err)
+	}
+
+	ci, err := codeItemDeMetodo(d, "sincDevuelve")
+	if err != nil {
+		t.Fatalf("sincDevuelve no tiene code_item: %v", err)
+	}
+	entra, sale := 0, 0
+	for _, w := range ci.insns {
+		switch int(w & 0xff) {
+		case 0x1d:
+			entra++
+		case 0x1e:
+			sale++
+		}
+	}
+	if entra == 0 || sale == 0 {
+		t.Fatalf("el dex no trae monitores: 0x1d=%d 0x1e=%d; el test no probaría nada", entra, sale)
+	}
+	t.Logf("guardia: sincDevuelve trae %d monitor-enter y %d monitor-exit", entra, sale)
+
+	prog, err := cargaPrograma(d)
+	if err != nil {
+		t.Fatalf("cargaPrograma del fixture: %v", err)
+	}
+	clase := ""
+	for c := range prog.clases {
+		if strings.HasSuffix(c, "/MoniValor;") || c == "LMoniValor;" {
+			clase = c
+		}
+	}
+	if clase == "" {
+		for c := range prog.clases {
+			t.Logf("clase disponible: %q", c)
+		}
+		t.Fatal("no aparece MoniValor en el dex")
+	}
+	m := nuevaMaquina(prog, nil)
+	candado := &objetoDalvik{clase: "Ljava/lang/Object;", campos: map[string]any{}}
+	llama := func(nombre string) (any, error) {
+		t.Helper()
+		met := m.buscaMetodo(clase, nombre, "(Ljava/lang/Object;)I")
+		if met == nil {
+			t.Fatalf("%s.%s no está en el programa", clase, nombre)
+		}
+		return m.ejecutaCuerpo(clase, met, []any{candado}, []string{"Ljava/lang/Object;"})
+	}
+
+	antes := len(m.avisos)
+	v, err := llama("sincDevuelve")
+	if err != nil {
+		t.Fatalf("sincDevuelve falló: %v", err)
+	}
+	if v != int32(42) {
+		t.Errorf("sincDevuelve=%v (%T), esperaba int32(42)", v, v)
+	}
+	if got := m.avisos[antes:]; len(got) != 0 {
+		t.Errorf("sincDevuelve dejó avisos: %v", got)
+	}
+	t.Logf("sincDevuelve=%v", v)
+
+	v, err = llama("sincLanza")
+	if err == nil {
+		t.Fatalf("sincLanza devolvió %v y debería lanzar NumberFormatException", v)
+	}
+	ex := excepcionDe(err)
+	if ex == nil {
+		t.Fatalf("sincLanza: %q no es una excepción de la app", err)
+	}
+	if ex.tipo != "Ljava/lang/NumberFormatException;" {
+		t.Errorf("sincLanza lanzó %s, esperaba Ljava/lang/NumberFormatException;", ex.tipo)
+	}
+	if ex.objeto == nil || ex.objeto.mensajeExcepcion != `For input string: "x"` {
+		t.Errorf("sincLanza: el mensaje es %v y debía ser For input string: \"x\"", ex.objeto)
+	}
+	if strings.Contains(err.Error(), "balance") {
+		t.Errorf("sincLanza: %q menciona balance", err)
+	}
+	t.Logf("sincLanza=%q", err)
+
+	antes = len(m.avisos)
+	v, err = llama("sincReenvuelve")
+	if err != nil {
+		t.Fatalf("sincReenvuelve falló: %v", err)
+	}
+	if v != int32(42) {
+		t.Errorf("sincReenvuelve=%v (%T), esperaba int32(42)", v, v)
+	}
+	if got := m.avisos[antes:]; len(got) != 0 {
+		t.Errorf("sincReenvuelve dejó avisos: %v", got)
+	}
+	t.Logf("sincReenvuelve=%v", v)
+
+	if len(m.avisos) != 0 {
+		t.Errorf("los monitores dejaron %d avisos: %v", len(m.avisos), m.avisos)
+	}
+	t.Logf("avisos=%d", len(m.avisos))
 }
