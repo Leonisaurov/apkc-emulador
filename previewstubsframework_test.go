@@ -2051,3 +2051,73 @@ func TestRecursosMapaInmutableDeTermux(t *testing.T) {
 		t.Errorf("el mapa filtrado es %v", datos)
 	}
 }
+
+// TestLayoutParamsSinteticoDeTermux falsifica el `iget LayoutParams.height` de
+// `setTerminalToolbarView`: sin stub, `getLayoutParams` devolvía el cero y la lectura abortaba la
+// ejecución en 6599 pasos. La vista se especializa con `check-cast` a ViewPager, igual que en el dex.
+func TestLayoutParamsSinteticoDeTermux(t *testing.T) {
+	m := maquinaDeStubs()
+	vista := objDe("Landroidx/viewpager/widget/ViewPager;")
+	proto := "()Landroid/view/ViewGroup$LayoutParams;"
+
+	// fusila los field_ids del dex de Termux para pasar por `leeCampo`/`escribeCampo`, que son los
+	// que ejecutan el iget y el iput reales.
+	d := &dexFile{fields: []dexField{
+		{owner: "android/view/ViewGroup$LayoutParams", name: "height", typeOf: "I"},
+		{owner: "android/view/ViewGroup$LayoutParams", name: "width", typeOf: "I"},
+	}}
+	if _, err := m.leeCampo(d, 0, nil, false); err == nil ||
+		!strings.Contains(err.Error(), "de un objeto nulo") {
+		t.Fatalf("la lectura sobre nulo debería fallar, dio %v", err)
+	}
+
+	primero, ok, err := m.intentaStub([]string{"Landroid/view/View;"}, "getLayoutParams", proto,
+		nil, vista)
+	if err != nil || !ok {
+		t.Fatalf("getLayoutParams: v=%v ok=%v err=%v", primero, ok, err)
+	}
+	params := esperaObjetoDeStub(t, primero, "Landroid/view/ViewGroup$LayoutParams;")
+	if alto, _ := m.leeCampo(d, 0, params, false); alto != int32(0) {
+		t.Errorf("el alto sintético es %v y se esperaba 0", alto)
+	}
+	if ancho, _ := m.leeCampo(d, 1, params, false); ancho != int32(0) {
+		t.Errorf("el ancho sintético es %v y se esperaba 0", ancho)
+	}
+	if !strings.Contains(strings.Join(m.avisos, " "), "LayoutParams sintético") {
+		t.Errorf("falta el aviso de aproximación: %v", m.avisos)
+	}
+
+	// el objeto se conserva: la altura que la app calcula después se escribe sobre el mismo.
+	segundo, ok, err := m.intentaStub([]string{"Landroid/view/View;"}, "getLayoutParams", proto,
+		nil, vista)
+	if err != nil || !ok || segundo != primero {
+		t.Fatalf("la segunda lectura no devolvió el mismo objeto: %v %v %v", segundo, ok, err)
+	}
+	if err := m.escribeCampo(d, 0, params, int32(38), false); err != nil {
+		t.Fatalf("escribir height: %v", err)
+	}
+	if alto, _ := m.leeCampo(d, 0, params, false); alto != int32(38) {
+		t.Errorf("el alto escrito es %v y se esperaba 38", alto)
+	}
+}
+
+// TestLayoutParamsPuestosPorLaApp comprueba que un `setLayoutParams` previo gana sobre el objeto
+// sintético: los parámetros que la app creó se devuelven tal cual, sin aviso de aproximación.
+func TestLayoutParamsPuestosPorLaApp(t *testing.T) {
+	m := maquinaDeStubs()
+	vista := objDe("Landroidx/viewpager/widget/ViewPager;")
+	puestos := objDe("Landroid/widget/LinearLayout$LayoutParams;")
+	protoPoner := "(Landroid/view/ViewGroup$LayoutParams;)V"
+	if _, ok, err := m.intentaStub([]string{"Landroid/view/View;"}, "setLayoutParams", protoPoner,
+		[]any{puestos}, vista); err != nil || !ok {
+		t.Fatalf("setLayoutParams: ok=%v err=%v", ok, err)
+	}
+	leidos, ok, err := m.intentaStub([]string{"Landroid/view/View;"}, "getLayoutParams",
+		"()Landroid/view/ViewGroup$LayoutParams;", nil, vista)
+	if err != nil || !ok || leidos != puestos {
+		t.Fatalf("getLayoutParams no devolvió los parámetros puestos: %v %v %v", leidos, ok, err)
+	}
+	if len(m.avisos) != 0 {
+		t.Errorf("no debería haber aviso de aproximación: %v", m.avisos)
+	}
+}

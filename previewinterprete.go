@@ -2455,6 +2455,11 @@ func esOrdenDeDialogo(pedido string) bool {
 const (
 	campoDialogoTitulo  = "dialogo.titulo"
 	campoDialogoMensaje = "dialogo.mensaje"
+	// los nombres con dueño de los campos que `claveCampo` usa para ViewGroup$LayoutParams: el
+	// objeto sintético que devuelve `getLayoutParams` los lleva para que la app pueda leerlos
+	// y escribirlos como si vinieran del inflado.
+	campoLayoutParamsAncho = "android/view/ViewGroup$LayoutParams.width"
+	campoLayoutParamsAlto  = "android/view/ViewGroup$LayoutParams.height"
 )
 
 func campoBotonDialogo(tipo, parte string) string {
@@ -4789,6 +4794,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			"Landroid/widget/CompoundButton;", "Landroid/widget/CheckedTextView;")
 	}
 	obj, _ := receptor.(*objetoDalvik)
+	// esPortadorDeParametros añade el ViewPager de AndroidX: `findViewById` entrega una View
+	// genérica y el `check-cast` posterior la especializa, así que esa clase no está en esVista.
+	esPortadorDeParametros := func() bool {
+		return obj != nil && (esVista() || strings.HasSuffix(obj.clase, "ViewPager;"))
+	}
 	// esLista reconoce la instancia de `java.util.ArrayList` que creó `new ArrayList()`: el estado
 	// vive en el objeto, así que cada lista lleva sus elementos y `get` respeta su índice. Se mira
 	// la clase del receptor y no la del invoke porque un `List.add` llega declarado en la interfaz.
@@ -5464,9 +5474,29 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	case "setLayoutParams":
 		// los parámetros que la app pone a una vista creada en código se guardan en esa vista; el
 		// modelo los ignora porque mide desde el XML, pero la app puede volver a leerlos.
-		if len(vals) == 1 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+		if len(vals) == 1 && esPortadorDeParametros() {
 			obj.campos["vista.layoutParams"] = vals[0]
 			return nil, true, nil
+		}
+	case "getLayoutParams":
+		// Termux lee y escribe `LayoutParams.height` del ViewPager del toolbar. El modelo no infla
+		// parámetros desde el layout, así que el cero del retorno llegaba como receptor nulo al
+		// `iget`/`iput` y detenía la ejecución. Si la app ya puso los suyos se devuelven; si no, se
+		// entrega un objeto sintético sin medidas inventadas y se avisa de la aproximación.
+		if len(vals) == 0 && esPortadorDeParametros() &&
+			strings.HasSuffix(proto, ")Landroid/view/ViewGroup$LayoutParams;") {
+			if puestos, ok := obj.campos["vista.layoutParams"].(*objetoDalvik); ok && puestos != nil {
+				return puestos, true, nil
+			}
+			m.avisa("getLayoutParams%s: la vista no trae medidas del layout; se devuelve un "+
+				"LayoutParams sintético con ancho y alto cero (aproximación)", proto)
+			params := &objetoDalvik{clase: "Landroid/view/ViewGroup$LayoutParams;",
+				campos: map[string]any{
+					campoLayoutParamsAncho: int32(0),
+					campoLayoutParamsAlto:  int32(0),
+				}}
+			obj.campos["vista.layoutParams"] = params
+			return params, true, nil
 		}
 	case "setId":
 		// el id lo pone la app sobre la vista que acaba de crear. No se registra en el mapa global
