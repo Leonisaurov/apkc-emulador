@@ -4246,6 +4246,40 @@ func (m *maquinaDalvik) valorDeEstado(obj *objetoDalvik, clave string) (any, boo
 	return nil, false
 }
 
+// clavesDelMapa ordena las claves del mapa: el orden del mapa de Go es aleatorio y el modelo publicado
+// tiene que ser determinista. Es la fuente común de `keySet` y del `iterator()` de un Set. Traída
+// del frente de recursos para no escribir un segundo ordenador de claves.
+func clavesDelMapa(mapa map[string]any) []any {
+	claves := make([]string, 0, len(mapa))
+	for c := range mapa {
+		claves = append(claves, c)
+	}
+	sort.Strings(claves)
+	salida := make([]any, 0, len(claves))
+	for _, c := range claves {
+		salida = append(salida, cadenaObjeto(c))
+	}
+	return salida
+}
+
+// clavesModeladasDelObjeto reúne las claves que el intérprete ya guardó en un objeto: las entradas
+// `mapa.*` que lee `Map.get`, el Bundle y el editor de SharedPreferences. No inventa ninguna clave.
+func clavesModeladasDelObjeto(o *objetoDalvik) map[string]any {
+	datos := map[string]any{}
+	for k, v := range o.campos {
+		if strings.HasPrefix(k, "mapa.") {
+			datos[strings.TrimPrefix(k, "mapa.")] = v
+		}
+	}
+	for k, v := range o.bundle {
+		datos[k] = v
+	}
+	for k, v := range o.editor {
+		datos[k] = v
+	}
+	return datos
+}
+
 // guardaValor pone un valor con clave en el Bundle o en el editor del SharedPreferences, ya
 // normalizado (texto, entero, booleano o long), para que el volcado a JSON sea el mismo en cada
 // ejecución. Devuelve falso si la firma no es la de un `put*` que emulamos.
@@ -4534,6 +4568,50 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				cuenta++
 			}
 			return int32(32) - cuenta, true, nil
+		}
+	case "asList":
+		// `Arrays.asList(Object[])` entrega una lista de tamaño fijo sobre esos elementos. Se copian
+		// al objeto para que el arreglo original y la lista no compartan estado; la marca distingue
+		// esta lista inmutable de un ArrayList al que la app sí puede añadir.
+		if len(vals) == 1 && es("Ljava/util/Arrays;") {
+			arr, ok := vals[0].(*arregloDalvik)
+			if !ok || arr == nil {
+				return nil, true, fmt.Errorf("Arrays.asList sobre un registro que no es arreglo")
+			}
+			return &objetoDalvik{clase: "Ljava/util/ArrayList;", campos: map[string]any{
+				"lista.inmutable": true,
+			}, lista: append([]any(nil), arr.datos...)}, true, nil
+		}
+	case "copyOfRange":
+		// `Arrays.copyOfRange` copia el rango [desde, hasta) del arreglo. Si `hasta` pasa de su
+		// longitud, el framework rellena con null; si el rango va hacia atrás o empieza antes del
+		// principio, lanza ArrayIndexOutOfBoundsException en vez de devolver un arreglo inventado.
+		if len(vals) == 3 && es("Ljava/util/Arrays;") {
+			arr, ok := vals[0].(*arregloDalvik)
+			if !ok || arr == nil {
+				return nil, true, fmt.Errorf("Arrays.copyOfRange sobre un registro que no es arreglo")
+			}
+			desde, err := aInt32(vals[1])
+			if err != nil {
+				return nil, true, err
+			}
+			hasta, err := aInt32(vals[2])
+			if err != nil {
+				return nil, true, err
+			}
+			if desde < 0 || desde > hasta {
+				return nil, true, nuevaExcepcion("Ljava/lang/ArrayIndexOutOfBoundsException;",
+					"%d > %d", hasta, desde)
+			}
+			datos := make([]any, 0, int(hasta-desde))
+			for i := int(desde); i < int(hasta); i++ {
+				if i < len(arr.datos) {
+					datos = append(datos, arr.datos[i])
+				} else {
+					datos = append(datos, nil)
+				}
+			}
+			return &arregloDalvik{tipo: arr.tipo, datos: datos}, true, nil
 		}
 	case "fill":
 		// `Arrays.fill(long[], desde, hasta, valor)` escribe el valor dado en ese rango. Sin él,
@@ -5394,6 +5472,16 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{},
 					iterando: obj.conjunto}, true, nil
 			}
+			// `Set.iterator()` sobre un mapa modelado recorre sus claves con `clavesDelMapa`, la
+			// misma fuente ordenada que publica `keySet`: no se escribe un segundo iterador y no se
+			// inventa ninguna clave que la app no haya guardado.
+			if obj != nil && es("Ljava/util/Set;") {
+				// un conjunto sin claves guardadas es un conjunto vacío: su iterador existe y no
+				// recorre nada. Devolver el cero aquí era el aviso genérico de Termux; devolver
+				// una casilla inventada sería peor, así que solo se entregan las claves modeladas.
+				return &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{},
+					iterando: clavesDelMapa(clavesModeladasDelObjeto(obj))}, true, nil
+			}
 			// el `for (X x : lista)` que emite javac llama a `List.iterator()` aunque el receptor
 			// sea un ArrayList: sin esto el iterador llegaba nulo y el bucle reventaba en hasNext.
 			if esLista() {
@@ -5427,7 +5515,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return item, true, nil
 		}
 		// `add(E)` y `add(int, E)` del ArrayList: el segundo respeta el índice e inserta delante de
-		// lo que ya estaba, como el framework
+		// lo que ya estaba, como el framework. La lista de `Arrays.asList` es de tamaño fijo y en
+		// el framework rechaza el cambio con UnsupportedOperationException.
+		if esLista() && boolDe(obj.campos["lista.inmutable"]) {
+			return nil, true, nuevaExcepcion("Ljava/lang/UnsupportedOperationException;", "")
+		}
 		if esLista() {
 			if len(vals) == 1 {
 				obj.lista = append(obj.lista, vals[0])
@@ -5498,6 +5590,9 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && obj != nil && es("Landroid/view/Menu;", "Landroid/view/SubMenu;") {
 			obj.menuItems = nil
 			return nil, true, nil
+		}
+		if len(vals) == 0 && esLista() && boolDe(obj.campos["lista.inmutable"]) {
+			return nil, true, nuevaExcepcion("Ljava/lang/UnsupportedOperationException;", "")
 		}
 		if len(vals) == 0 && esLista() {
 			obj.lista = []any{}
@@ -5748,6 +5843,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"Landroid/text/Spanned;")
 		}
 	case "forName", "getMethod", "getDeclaredMethod", "newInstance", "invoke":
+		// `Class.forName` queda FUERA del subconjunto a propósito: cargar una clase por nombre
+		// exigiría resolver y ejecutar código que la app no trae en el dex, y devolver un Class
+		// inventado sería peor que el aviso. Se mantiene `forName: la reflexión no está en el
+		// subconjunto`, que es explícito y fail-closed; esta ronda no añade un stub para él.
 		if esReflexion(candidatos) {
 			return m.rechaza(nombre, proto,
 				"la reflexión no está en el subconjunto", "")
@@ -5901,6 +6000,16 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				m.avisa("getStackTrace: la vista previa no tiene pila real; se devuelve una casilla sintética (aproximación)")
 				return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}, true, nil
 			}
+		}
+	case "setStackTrace":
+		// `Throwable.setStackTrace` guarda en el objeto la traza que la app le pone. Es el mismo
+		// campo que lee `getStackTrace`, así que lo sembrado por el frente de lifecycle se conserva
+		// y la app puede encadenar ambos métodos sin un aviso sin valor.
+		if len(vals) == 1 && esThrowableObj() {
+			if arr, ok := vals[0].(*arregloDalvik); ok && arr != nil {
+				obj.campos["throwable.stackTrace"] = arr
+			}
+			return nil, true, nil
 		}
 	case "getClassName", "getMethodName", "getLineNumber":
 		// los getters de StackTraceElement leen el objeto que sembró `getStackTrace`. Sin un campo

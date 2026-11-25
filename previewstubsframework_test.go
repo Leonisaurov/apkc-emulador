@@ -1357,3 +1357,190 @@ func TestCadenasSubstringCortaParesSurrogate(t *testing.T) {
 		t.Errorf("substring(0,3) lanzó %s y se esperaba StringIndexOutOfBoundsException", ex.tipo)
 	}
 }
+
+// TestArraysAsListCopiaLosElementosYEsInmutable: la lista no comparte el arreglo original y rechaza
+// add/clear con la excepción del framework, en vez de mutarse en silencio.
+func TestArraysAsListCopiaLosElementosYEsInmutable(t *testing.T) {
+	m := maquinaDeStubs()
+	arr := &arregloDalvik{tipo: "[Ljava/lang/Object;", datos: []any{cadenaObjeto("a"), int32(2)}}
+	candidatos := []string{"Ljava/util/Arrays;"}
+
+	v, ok, err := m.intentaStub(candidatos, "asList",
+		"([Ljava/lang/Object;)Ljava/util/List;", []any{arr}, nil)
+	if err != nil || !ok {
+		t.Fatalf("Arrays.asList: v=%v ok=%v err=%v", v, ok, err)
+	}
+	lista := esperaObjetoDeStub(t, v, "Ljava/util/ArrayList;")
+	if len(lista.lista) != 2 {
+		t.Fatalf("la lista tiene %d elementos y se esperaban 2", len(lista.lista))
+	}
+	if !boolDe(lista.campos["lista.inmutable"]) {
+		t.Error("la lista no quedó marcada como inmutable")
+	}
+	arr.datos[0] = cadenaObjeto("z")
+	esperaCadenaDeStub(t, lista.lista[0], "a")
+
+	for _, caso := range []struct {
+		nombre string
+		proto  string
+		vals   []any
+	}{
+		{"add", "(Ljava/lang/Object;)Z", []any{cadenaObjeto("x")}},
+		{"clear", "()V", nil},
+	} {
+		_, ok, err := m.intentaStub([]string{"Ljava/util/ArrayList;"}, caso.nombre, caso.proto,
+			caso.vals, lista)
+		if !ok {
+			t.Errorf("%s sobre la lista inmutable no fue atendido", caso.nombre)
+			continue
+		}
+		var ex *excepcionDalvik
+		if !errors.As(err, &ex) {
+			t.Errorf("%s devolvió err=%v y se esperaba UnsupportedOperationException", caso.nombre, err)
+		} else if ex.tipo != "Ljava/lang/UnsupportedOperationException;" {
+			t.Errorf("%s lanzó %s y se esperaba UnsupportedOperationException", caso.nombre, ex.tipo)
+		}
+	}
+	if len(lista.lista) != 2 {
+		t.Errorf("add/clear mutaron la lista: quedan %d elementos", len(lista.lista))
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("Arrays.asList cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestArraysCopyOfRangeRespetaLimites: copia el rango pedido, rellena con null si `hasta` pasa de
+// la longitud y lanza la excepción del framework si el rango va hacia atrás o empieza antes del cero.
+func TestArraysCopyOfRangeRespetaLimites(t *testing.T) {
+	m := maquinaDeStubs()
+	arr := &arregloDalvik{tipo: "[Ljava/lang/Object;", datos: []any{int32(1), int32(2), int32(3)}}
+	candidatos := []string{"Ljava/util/Arrays;"}
+	proto := "([Ljava/lang/Object;II)[Ljava/lang/Object;"
+
+	v, ok, err := m.intentaStub(candidatos, "copyOfRange", proto,
+		[]any{arr, int32(1), int32(3)}, nil)
+	if err != nil || !ok {
+		t.Fatalf("copyOfRange(1,3): v=%v ok=%v err=%v", v, ok, err)
+	}
+	copia, esArreglo := v.(*arregloDalvik)
+	if !esArreglo || copia.tipo != arr.tipo || len(copia.datos) != 2 {
+		t.Fatalf("la copia es %T (%v) y se esperaba un arreglo de dos elementos", v, v)
+	}
+	if copia.datos[0] != int32(2) || copia.datos[1] != int32(3) {
+		t.Errorf("la copia trae %v y se esperaba [2 3]", copia.datos)
+	}
+
+	v, ok, err = m.intentaStub(candidatos, "copyOfRange", proto,
+		[]any{arr, int32(1), int32(5)}, nil)
+	if err != nil || !ok {
+		t.Fatalf("copyOfRange(1,5): v=%v ok=%v err=%v", v, ok, err)
+	}
+	relleno := v.(*arregloDalvik)
+	if len(relleno.datos) != 4 || relleno.datos[2] != nil || relleno.datos[3] != nil {
+		t.Errorf("el relleno con null salió mal: %v", relleno.datos)
+	}
+
+	for _, vals := range [][]any{{arr, int32(-1), int32(2)}, {arr, int32(2), int32(1)}} {
+		v, ok, err := m.intentaStub(candidatos, "copyOfRange", proto, vals, nil)
+		if !ok {
+			t.Errorf("copyOfRange(%v) no fue atendido", vals)
+			continue
+		}
+		var ex *excepcionDalvik
+		if !errors.As(err, &ex) {
+			t.Errorf("copyOfRange(%v) devolvió v=%v err=%v y se esperaba una excepción", vals, v, err)
+		} else if ex.tipo != "Ljava/lang/ArrayIndexOutOfBoundsException;" {
+			t.Errorf("copyOfRange(%v) lanzó %s y se esperaba ArrayIndexOutOfBoundsException", vals, ex.tipo)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("Arrays.copyOfRange cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestIteradorDelSetRecorreClavesOrdenadas reutiliza `clavesDelMapa`: el mismo iterador de siempre
+// entrega las claves que el objeto ya guardó, en orden determinista y sin inventar ninguna.
+func TestIteradorDelSetRecorreClavesOrdenadas(t *testing.T) {
+	m := maquinaDeStubs()
+	set := objDe("Ljava/util/Set;")
+	set.campos["mapa.b"] = int32(2)
+	set.campos["mapa.a"] = int32(1)
+
+	v, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, set)
+	if err != nil || !ok {
+		t.Fatalf("Set.iterator: v=%v ok=%v err=%v", v, ok, err)
+	}
+	it := esperaObjetoDeStub(t, v, "Ljava/util/Iterator;")
+	for _, esperado := range []string{"a", "b"} {
+		siguiente, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "next",
+			"()Ljava/lang/Object;", nil, it)
+		if err != nil || !ok {
+			t.Fatalf("next: v=%v ok=%v err=%v", siguiente, ok, err)
+		}
+		esperaCadenaDeStub(t, siguiente, esperado)
+	}
+	hay, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok || hay != int32(0) {
+		t.Errorf("hasNext al final devolvió %v ok=%v err=%v y se esperaba 0", hay, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("Set.iterator cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestIteradorDelSetVacioNoEsNuelo falsifica el caso de Termux: un HashSet sin claves guardadas
+// devuelve un iterador no nulo que no recorre nada, nunca el cero ni una clave inventada.
+func TestIteradorDelSetVacioNoEsNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	vacio := objDe("Ljava/util/HashSet;")
+	v, ok, err := m.intentaStub([]string{"Ljava/util/HashSet;", "Ljava/util/Set;"},
+		"iterator", "()Ljava/util/Iterator;", nil, vacio)
+	if err != nil || !ok {
+		t.Fatalf("iterator sobre un HashSet vacío: v=%v ok=%v err=%v", v, ok, err)
+	}
+	it := esperaObjetoDeStub(t, v, "Ljava/util/Iterator;")
+	if it.iterando == nil || len(it.iterando) != 0 {
+		t.Errorf("el iterador vacío trae %v y se esperaba una lista vacía no nula", it.iterando)
+	}
+	hay, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok || hay != int32(0) {
+		t.Errorf("hasNext devolvió %v ok=%v err=%v y se esperaba 0", hay, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("el conjunto vacío cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestStackTraceSetStackTraceGuardaLaTraza comprueba el camino de ida y vuelta: lo que la app pone
+// con setStackTrace es exactamente lo que devuelve getStackTrace, sin una casilla inventada.
+func TestStackTraceSetStackTraceGuardaLaTraza(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	ex := objDe("Ljava/lang/IllegalStateException;")
+	elemento := &objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{
+		"StackTraceElement.clase": "com.ejemplo.Main",
+	}}
+	traza := &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}
+	candidatos := []string{"Ljava/lang/Throwable;"}
+
+	v, ok, err := m.intentaStub(candidatos, "setStackTrace",
+		"([Ljava/lang/StackTraceElement;)V", []any{traza}, ex)
+	if err != nil || !ok || v != nil {
+		t.Fatalf("setStackTrace: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if guardada, ok := ex.campos["throwable.stackTrace"].(*arregloDalvik); !ok || guardada != traza {
+		t.Fatalf("la traza guardada es %T y se esperaba la misma instancia", ex.campos["throwable.stackTrace"])
+	}
+	v, ok, err = m.intentaStub(candidatos, "getStackTrace",
+		"()[Ljava/lang/StackTraceElement;", nil, ex)
+	if err != nil || !ok {
+		t.Fatalf("getStackTrace: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != traza {
+		t.Errorf("getStackTrace devolvió %T y se esperaba la traza guardada", v)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); avisos != "" {
+		t.Errorf("el camino set/get registró avisos: %s", avisos)
+	}
+}
