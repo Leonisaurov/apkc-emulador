@@ -4074,9 +4074,27 @@ func (m *maquinaDalvik) leeEstatico(f dexField) (any, error) {
 			}
 		}
 		m.inicializaClase(cl)
-		if v, ok := cl.estaticos[clave]; ok {
+		// un valor guardado a nil no es un valor: es lo que deja un `<clinit>` que no corrió o que
+		// asignó el cero del tipo. No debe ganarle al modelo de abajo.
+		if v, ok := cl.estaticos[clave]; ok && v != nil {
 			return v, nil
 		}
+	}
+	// Termux comprueba dos listas estáticas de nombres de propiedades con `Set.contains`. Su
+	// `<clinit>` no corre en la vista previa, así que el campo llegaba como null y el intérprete
+	// abortaba. Se entrega un conjunto vacío NO nulo y se avisa de la aproximación: no se inventa
+	// ninguna clave, solo se evita el receptor nulo. Si la clase ya guardó el campo, gana lo que
+	// ella escribió (la comprobación de arriba).
+	if f.owner == "Lcom/termux/shared/settings/properties/TermuxPropertyConstants;" &&
+		(f.name == "TERMUX_DEFAULT_FALSE_BOOLEAN_BEHAVIOUR_PROPERTIES_LIST" ||
+			f.name == "TERMUX_DEFAULT_TRUE_BOOLEAN_BEHAVIOUR_PROPERTIES_LIST") {
+		m.avisa("aproximación-estática: %s.%s es un conjunto vacío no nulo, sin claves inventadas",
+			claseCorta(f.owner), f.name)
+		conjunto := &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{}, conjunto: []any{}}
+		if cl, ok := m.prog.clases[f.owner]; ok {
+			cl.estaticos[claveCampo(f)] = conjunto
+		}
+		return conjunto, nil
 	}
 	return valorCero(f.typeOf), nil
 }

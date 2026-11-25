@@ -1825,3 +1825,54 @@ func TestRecursosSinteticosNoInventanRecursos(t *testing.T) {
 		t.Errorf("faltó el aviso de familia para algún id ausente: %v", m.avisos)
 	}
 }
+
+// TestRecursosEstaticosDeTermuxNoNulos falsifica el `sget-object` que detenía a Termux en
+// `getInternalTermuxPropertyValueFromValue`: sin `<clinit>`, los dos campos de
+// TermuxPropertyConstants llegaban como null al `Set.contains` siguiente. El modelo entrega un Set
+// vacío no nulo, avisa de la aproximación y no inventa ninguna clave de propiedad.
+func TestRecursosEstaticosDeTermuxNoNulos(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}
+	const dueño = "Lcom/termux/shared/settings/properties/TermuxPropertyConstants;"
+	m.prog.clases[dueño] = &claseDalvik{estaticos: map[string]any{}}
+	campos := []string{
+		"TERMUX_DEFAULT_FALSE_BOOLEAN_BEHAVIOUR_PROPERTIES_LIST",
+		"TERMUX_DEFAULT_TRUE_BOOLEAN_BEHAVIOUR_PROPERTIES_LIST",
+	}
+	for _, campo := range campos {
+		v, err := m.leeEstatico(dexField{owner: dueño, name: campo, typeOf: "Ljava/util/Set;"})
+		if err != nil || v == nil {
+			t.Fatalf("leeEstatico(%s): v=%v err=%v", campo, v, err)
+		}
+		conjunto := esperaObjetoDeStub(t, v, "Ljava/util/Set;")
+		if conjunto.conjunto == nil || len(conjunto.conjunto) != 0 {
+			t.Errorf("%s entregó las claves %v y se esperaba un conjunto vacío", campo, conjunto.conjunto)
+		}
+		// el `Set.contains` siguiente se resuelve y responde falso sin receptor nulo.
+		valor, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "contains",
+			"(Ljava/lang/Object;)Z", []any{cadenaObjeto("extra-keys")}, conjunto)
+		if err != nil || !ok || valor != int32(0) {
+			t.Errorf("contains sobre %s: v=%v ok=%v err=%v", campo, valor, ok, err)
+		}
+		// la segunda lectura devuelve el mismo objeto: el estático quedó guardado en la clase.
+		v2, err := m.leeEstatico(dexField{owner: dueño, name: campo, typeOf: "Ljava/util/Set;"})
+		if err != nil || v2 != v {
+			t.Errorf("la segunda lectura de %s devolvió %v (primera %v, err=%v)", campo, v2, v, err)
+		}
+	}
+	// Falsificación del fallo encontrado en la APK: el `<clinit>` deja el campo guardado a nil y
+	// esa entrada no debe ganarle al conjunto del modelo.
+	guardado := dexField{owner: dueño, name: campos[0], typeOf: "Ljava/util/Set;"}
+	m.prog.clases[dueño].estaticos[claveCampo(guardado)] = nil
+	vGuardado, errGuardado := m.leeEstatico(guardado)
+	if errGuardado != nil || vGuardado == nil {
+		t.Errorf("lectura con el estático guardado a nil: v=%v err=%v", vGuardado, errGuardado)
+	}
+
+	avisos := strings.Join(m.avisos, "\n")
+	for _, campo := range campos {
+		if !strings.Contains(avisos, "aproximación-estática: com.termux.shared.settings.properties.TermuxPropertyConstants."+campo) {
+			t.Errorf("falta el aviso de aproximación para %s: %s", campo, avisos)
+		}
+	}
+}
