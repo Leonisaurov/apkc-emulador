@@ -12,6 +12,8 @@ package main
 // `total.setText("Pulsos: " + pulsos)` sale capturado.
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"os"
@@ -1673,4 +1675,244 @@ func TestElInterpreteDecodificaLosMonitoresDeSynchronized(t *testing.T) {
 		t.Errorf("los monitores dejaron %d avisos: %v", len(m.avisos), m.avisos)
 	}
 	t.Logf("avisos=%d", len(m.avisos))
+}
+
+// --- multidex (Fase B, §360) -----------------------------------------------------------------
+
+// lectorDeZipAux envuelve un zip en memoria con el lector que espera dexDelApk.
+func lectorDeZipAux(t *testing.T, datos []byte) *zip.Reader {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(datos), int64(len(datos)))
+	if err != nil {
+		t.Fatalf("el apk sintético no es un zip: %v", err)
+	}
+	return zr
+}
+
+// dexesDelProyecto compila las fuentes una sola vez y reparte las clases entre dos dex: el primero
+// lleva las que están en `enPrimero` y el segundo el resto. Así comparten javac y la división es solo
+// de empaquetado, como en un apk multidex de verdad.
+func dexesDelProyecto(t *testing.T, enPrimero map[string]bool, fuentes ...fuenteJava) ([]byte, []byte) {
+	t.Helper()
+	emitidas, err := compilarProyectoJava(fuentes, jarDelSDK(t))
+	if err != nil {
+		t.Fatalf("las fuentes no compilan: %v", err)
+	}
+	primero := []classFull{}
+	segundo := []classFull{}
+	for _, c := range emitidas {
+		cf, err := readClassFull(c.datos)
+		if err != nil {
+			t.Fatalf("%s no se lee: %v", c.interno, err)
+		}
+		if enPrimero[cf.Name] {
+			primero = append(primero, cf)
+		} else {
+			segundo = append(segundo, cf)
+		}
+	}
+	un, err := dexDeClases(primero)
+	if err != nil {
+		t.Fatalf("el primer dex no sale: %v", err)
+	}
+	dos, err := dexDeClases(segundo)
+	if err != nil {
+		t.Fatalf("el segundo dex no sale: %v", err)
+	}
+	return un, dos
+}
+
+// TestMultidexDescubreTodosLosDexEnOrdenNumerico falsa el descubrimiento: las entradas se escriben
+// en un mapa, así que el directorio del zip no garantiza el orden, y `classes10.dex` va delante de
+// `classes2.dex` en orden alfabético. El orden tiene que ser el numérico de ART.
+func TestMultidexDescubreTodosLosDexEnOrdenNumerico(t *testing.T) {
+	fuente := func(nombre string) fuenteJava {
+		return fuenteJava{nombre: nombre + ".java", contenido: "package com.multidex;\npublic class " +
+			nombre + " { public static int valor() { return 1; } }\n"}
+	}
+	un := dexDeFuentes(t, fuente("ClaseUn"))
+	dos := dexDeFuentes(t, fuente("ClaseDos"))
+	diez := dexDeFuentes(t, fuente("ClaseDiez"))
+	apk := zipDeEntradas(t, map[string][]byte{
+		"classes.dex":   un,
+		"classes2.dex":  dos,
+		"classes10.dex": diez,
+	})
+	dxs, tabla, err := dexDelApk(lectorDeZipAux(t, apk))
+	if err != nil {
+		t.Fatalf("dexDelApk rechazó el apk multidex: %v", err)
+	}
+	if len(dxs) != 3 {
+		t.Fatalf("se descubrieron %d dex y se esperaban 3", len(dxs))
+	}
+	descriptorDe := func(b []byte) string {
+		d, err := readDex(b)
+		if err != nil {
+			t.Fatalf("el dex sintético no se lee: %v", err)
+		}
+		return d.classes[0].name
+	}
+	esperado := []string{descriptorDe(un), descriptorDe(dos), descriptorDe(diez)}
+	for i, d := range dxs {
+		if tabla[esperado[i]] != d {
+			t.Errorf("el dex %d no es el que contiene %s: tabla=%p, esperado=%p", i, esperado[i], tabla[esperado[i]], d)
+		}
+	}
+}
+
+// fuenteAuxMultidex y fuenteActividadMultidex son las dos piezas del apk sintético: el auxiliar
+// vive en classes.dex, la actividad en classes2.dex y el onCreate cruza de un dex al otro.
+const fuenteAuxMultidex = `package com.hola.contador;
+public class Aux {
+    public static int diez() { return 10; }
+}
+`
+
+const fuenteActividadMultidex = `package com.hola.contador;
+import android.app.*;
+import android.os.*;
+import android.view.*;
+import android.widget.*;
+public class MainActivity extends Activity {
+    TextView total;
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.main);
+        total = (TextView) findViewById(R.id.total);
+        total.setText("Hola " + Aux.diez());
+    }
+}
+`
+
+// apkConActividadEnElSegundoDex arma el apk con la actividad fuera del primer dex.
+func apkConActividadEnElSegundoDex(t *testing.T) []byte {
+	t.Helper()
+	un, dos := dexesDelProyecto(t, map[string]bool{"Lcom/hola/contador/Aux;": true},
+		fuenteJava{nombre: "R.java", contenido: rContador(t)},
+		fuenteJava{nombre: "Aux.java", contenido: fuenteAuxMultidex},
+		fuenteJava{nombre: "MainActivity.java", contenido: fuenteActividadMultidex})
+	manifiesto, err := escribeAXML(manifiestoConActividad(".MainActivity"))
+	if err != nil {
+		t.Fatalf("el manifiesto: %v", err)
+	}
+	layout, err := escribeAXML(layoutDelContador())
+	if err != nil {
+		t.Fatalf("el layout: %v", err)
+	}
+	arsc, err := escribeTablaRecursos(tablaDelContador())
+	if err != nil {
+		t.Fatalf("la tabla: %v", err)
+	}
+	return zipDeEntradas(t, map[string][]byte{
+		"AndroidManifest.xml": manifiesto,
+		"resources.arsc":      arsc,
+		"res/layout/main.xml": layout,
+		"classes.dex":         un,
+		"classes2.dex":        dos,
+	})
+}
+
+// descriptorLanzadorDelApk deriva el descriptor de la actividad del manifiesto usando la MISMA
+// función que produce el modelo (`actividadLanzadora`), sin escribir el nombre a mano. Así el test
+// sigue la resolución de Fase C cuando cambie, en vez de quedar atado al nombre del fixture.
+func descriptorLanzadorDelApk(t *testing.T, apk []byte) string {
+	t.Helper()
+	zr := lectorDeZipAux(t, apk)
+	manifiesto, err := entradaDeZip(zr, "AndroidManifest.xml")
+	if err != nil {
+		t.Fatalf("el manifiesto del fixture: %v", err)
+	}
+	axml, err := leeAXML(manifiesto)
+	if err != nil {
+		t.Fatalf("el AXML del manifiesto: %v", err)
+	}
+	ctx := &contextoVista{axml: axml}
+	arbol, err := ctx.arbol()
+	if err != nil {
+		t.Fatalf("el árbol del manifiesto: %v", err)
+	}
+	actividad, ok := actividadLanzadora(arbol, ctx)
+	if !ok {
+		t.Fatal("el manifiesto del fixture no tiene lanzadora")
+	}
+	paquete := ctx.textoDeAtributo(arbol, "", "package")
+	nombre := ctx.textoDeAtributo(actividad, uriDeRecursos, "name")
+	return descriptorDeActividad(paquete, nombre)
+}
+
+// TestMultidexElMetodoEjecutadoEsDelSegundoDex falsa que el método que se ejecuta pertenece al dex
+// donde está su clase, no al primero de la lista.
+func TestMultidexElMetodoEjecutadoEsDelSegundoDex(t *testing.T) {
+	apk := apkConActividadEnElSegundoDex(t)
+	descriptor := descriptorLanzadorDelApk(t, apk)
+	dxs, tabla, err := dexDelApk(lectorDeZipAux(t, apk))
+	if err != nil {
+		t.Fatalf("dexDelApk rechazó el apk: %v", err)
+	}
+	if len(dxs) != 2 || tabla[descriptor] != dxs[1] {
+		t.Fatalf("la actividad no está en el segundo dex: %d dex, tabla=%p", len(dxs), tabla[descriptor])
+	}
+	res, _, err := ejecutaOnCreateConEventos(dxs, nil, descriptor, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("la ejecución multidex devolvió error: %v", err)
+	}
+	if res.Error != "" || res.maquina == nil {
+		t.Fatalf("la ejecución no dejó máquina: %+v", res)
+	}
+	met := res.maquina.buscaMetodo(descriptor, "onCreate", "(Landroid/os/Bundle;)V")
+	if met == nil {
+		t.Fatal("no se encontró el onCreate de la actividad")
+	}
+	if met.dex != dxs[1] {
+		t.Fatalf("el onCreate está en el dex %p y se esperaba el segundo %p", met.dex, dxs[1])
+	}
+}
+
+// TestMultidexElModeloNoRegresaDelSegundoDex falsa el criterio observable sin campo nuevo: la
+// actividad del JSON es la lanzadora calculada desde el manifiesto, el ciclo pasa por onCreate y las
+// capturas traen el texto real que el onCreate escribió llamando al otro dex.
+func TestMultidexElModeloNoRegresaDelSegundoDex(t *testing.T) {
+	apk := apkConActividadEnElSegundoDex(t)
+	descriptor := descriptorLanzadorDelApk(t, apk)
+	m, err := modeloVistaDeAPK(apk, "")
+	if err != nil {
+		t.Fatalf("el apk multidex no se deja leer: %v", err)
+	}
+	if m.Ejecucion == nil {
+		t.Fatal("el modelo no trae ejecución")
+	}
+	if m.Ejecucion.Error != "" {
+		t.Fatalf("la ejecución multidex falló: %s", m.Ejecucion.Error)
+	}
+	quiero := claseCorta(descriptor)
+	if m.Ejecucion.Actividad != quiero {
+		t.Errorf("la actividad es %q y se esperaba la lanzadora %q", m.Ejecucion.Actividad, quiero)
+	}
+	if !tienePaso(m.Ejecucion.Ciclo, quiero+".onCreate") {
+		t.Errorf("el ciclo no pasó por onCreate: %v", m.Ejecucion.Ciclo)
+	}
+	if len(m.Ejecucion.Capturas) == 0 {
+		t.Fatal("el onCreate no capturó ninguna escritura")
+	}
+	if m.Ejecucion.Capturas[0].Texto != "Hola 10" {
+		t.Errorf("la captura es %q y se esperaba «Hola 10» del otro dex", m.Ejecucion.Capturas[0].Texto)
+	}
+	if m.Raiz == nil || len(m.Raiz.Hijos) == 0 || m.Raiz.Hijos[0].TextoDinamico != "Hola 10" {
+		t.Errorf("el layout no recibió el texto dinámico: %+v", m.Raiz)
+	}
+}
+
+// TestMultidexRechazaDescriptorDuplicado falsa la frontera: el mismo class_def en dos dex se rechaza
+// con el descriptor en el mensaje, porque sus índices no se pueden mezclar.
+func TestMultidexRechazaDescriptorDuplicado(t *testing.T) {
+	d := dexDeFuentes(t, fuenteJava{nombre: "Dup.java", contenido: "package com.multidex;\n" +
+		"public class Dup { public static int uno() { return 1; } }\n"})
+	apk := zipDeEntradas(t, map[string][]byte{"classes.dex": d, "classes2.dex": d})
+	_, _, err := dexDelApk(lectorDeZipAux(t, apk))
+	if err == nil {
+		t.Fatal("dexDelApk aceptó el mismo descriptor en dos dex")
+	}
+	if !strings.Contains(err.Error(), "Lcom/multidex/Dup;") || !strings.Contains(err.Error(), "duplicado") {
+		t.Errorf("el error no nombra el descriptor duplicado: %q", err)
+	}
 }

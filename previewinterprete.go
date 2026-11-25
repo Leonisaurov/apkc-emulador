@@ -409,52 +409,59 @@ type programaDalvik struct {
 	clases map[string]*claseDalvik
 }
 
-// cargaPrograma convierte el dex leído por dexreader.go en un programa ejecutable. Los estáticos
+// cargaPrograma convierte los dex leídos por dexreader.go en un programa ejecutable. Los estáticos
 // toman su constante del encoded_array_item que ya lee dexcode.go: las de R son lo que hace que
-// `setContentView(R.layout.main)` sea un `const` con el id dentro.
-func cargaPrograma(d *dexFile) (*programaDalvik, error) {
-	datos, err := d.methodsDeCadaClase()
-	if err != nil {
-		return nil, err
+// `setContentView(R.layout.main)` sea un `const` con el id dentro. Cada método guarda el dex del que
+// salió: sus índices apuntan a las tablas de ese fichero, no a las del primero. El dex primera es el
+// de la sesión, para los caminos que no tienen un método delante.
+func cargaPrograma(dxs ...*dexFile) (*programaDalvik, error) {
+	if len(dxs) == 0 {
+		return nil, fmt.Errorf("no hay classes.dex que cargar")
 	}
-	p := &programaDalvik{dex: d, clases: make(map[string]*claseDalvik, len(d.classes))}
-	for _, c := range d.classes {
-		cl := &claseDalvik{
-			nombre:    c.name,
-			super:     c.super,
-			metodos:   map[string]*metodoDalvik{},
-			estaticos: map[string]any{},
+	p := &programaDalvik{dex: dxs[0], clases: map[string]*claseDalvik{}}
+	for _, d := range dxs {
+		datos, err := d.methodsDeCadaClase()
+		if err != nil {
+			return nil, err
 		}
-		cd := datos[c.name]
-		metodos := append(append([]encodedMethod{}, cd.directs...), cd.virtuals...)
-		for _, m := range metodos {
-			if int(m.methodIdx) >= len(d.methods) {
-				return nil, fmt.Errorf("%s: el método %d no está en method_ids", c.name, m.methodIdx)
+		for _, c := range d.classes {
+			cl := &claseDalvik{
+				nombre:    c.name,
+				super:     c.super,
+				metodos:   map[string]*metodoDalvik{},
+				estaticos: map[string]any{},
 			}
-			ref := d.methods[m.methodIdx]
-			met := &metodoDalvik{
-				nombre:  ref.name,
-				proto:   descDeProto(ref.proto),
-				retorno: ref.proto.returnType,
-				acceso:  m.accessFlags,
-				dex:     d,
-			}
-			if m.codeOff != 0 {
-				item, err := d.readCodeItem(m.codeOff)
-				if err != nil {
-					return nil, fmt.Errorf("%s.%s: %w", c.name, ref.name, err)
+			cd := datos[c.name]
+			metodos := append(append([]encodedMethod{}, cd.directs...), cd.virtuals...)
+			for _, m := range metodos {
+				if int(m.methodIdx) >= len(d.methods) {
+					return nil, fmt.Errorf("%s: el método %d no está en method_ids", c.name, m.methodIdx)
 				}
-				met.item = &item
+				ref := d.methods[m.methodIdx]
+				met := &metodoDalvik{
+					nombre:  ref.name,
+					proto:   descDeProto(ref.proto),
+					retorno: ref.proto.returnType,
+					acceso:  m.accessFlags,
+					dex:     d,
+				}
+				if m.codeOff != 0 {
+					item, err := d.readCodeItem(m.codeOff)
+					if err != nil {
+						return nil, fmt.Errorf("%s.%s: %w", c.name, ref.name, err)
+					}
+					met.item = &item
+				}
+				cl.metodos[ref.name+met.proto] = met
 			}
-			cl.metodos[ref.name+met.proto] = met
-		}
-		for _, f := range cd.staticFields {
-			if int(f.fieldIdx) >= len(d.fields) {
-				continue
+			for _, f := range cd.staticFields {
+				if int(f.fieldIdx) >= len(d.fields) {
+					continue
+				}
+				cl.estaticos[claveCampo(d.fields[f.fieldIdx])] = valorCodificado(f.valueType, f.value)
 			}
-			cl.estaticos[claveCampo(d.fields[f.fieldIdx])] = valorCodificado(f.valueType, f.value)
+			p.clases[c.name] = cl
 		}
-		p.clases[c.name] = cl
 	}
 	return p, nil
 }
@@ -1354,7 +1361,7 @@ func ejecutaOnCreateConPulsos(d *dexFile, tabla *tablaRecursos, actividad string
 	for _, p := range pulsos {
 		eventos = append(eventos, eventoUsuario{Tipo: "pulsar", Dato: p})
 	}
-	return ejecutaOnCreateConEventos(d, tabla, actividad, eventos, nil, nil)
+	return ejecutaOnCreateConEventos([]*dexFile{d}, tabla, actividad, eventos, nil, nil)
 }
 
 // ejecutaOnCreatePreparando es el mismo arranque con un gancho entre `onCreate` y los clics. Lo usa
@@ -1368,14 +1375,14 @@ func ejecutaOnCreatePreparando(d *dexFile, tabla *tablaRecursos, actividad strin
 	for _, p := range pulsos {
 		eventos = append(eventos, eventoUsuario{Tipo: "pulsar", Dato: p})
 	}
-	return ejecutaOnCreateConEventos(d, tabla, actividad, eventos, preparar, nil)
+	return ejecutaOnCreateConEventos([]*dexFile{d}, tabla, actividad, eventos, preparar, nil)
 }
 
 // ejecutaOnCreateNavegando es el nombre anterior del arranque con navegación: se queda como
 // envoltorio fino para las llamadas que solo piden entregar el guion.
 func ejecutaOnCreateNavegando(d *dexFile, tabla *tablaRecursos, actividad string, eventos []eventoUsuario,
 	preparar func(m *maquinaDalvik), declaradas map[string]bool) (*resultadoEjecucion, uint32, error) {
-	return ejecutaOnCreateConEventos(d, tabla, actividad, eventos, preparar, declaradas)
+	return ejecutaOnCreateConEventos([]*dexFile{d}, tabla, actividad, eventos, preparar, declaradas)
 }
 
 // ejecutaOnCreateConEventos es el arranque con el guion de entrada completo —clics, texto tecleado,
@@ -1386,15 +1393,17 @@ func ejecutaOnCreateNavegando(d *dexFile, tabla *tablaRecursos, actividad string
 // mueve el reloj lógico y drena las tareas diferidas que vencen. El orden entre unos y otros es el
 // de la línea de comandos, para que el mismo guion reproduzca el mismo JSON.
 //
-// La pila de actividades vive aquí y no en el dex: cada pantalla conserva su propia máquina (sus
-// objetos, sus capturas y sus oyentes) mientras está cubierta, y `finish()` la descubre otra vez sin
-// repetir su `onCreate`, que es lo que hace que el estado vuelva como estaba. `declaradas` son las
-// actividades que el manifiesto declara, por descriptor: una que no esté ahí no se lanza, como en el
-// aparato.
-func ejecutaOnCreateConEventos(d *dexFile, tabla *tablaRecursos, actividad string, eventos []eventoUsuario,
+// `dxs` es el conjunto completo de dex del apk, en orden: la actividad lanzadora puede estar en
+// cualquier `classesN.dex` y las llamadas entre clases de ficheros distintos se resuelven contra el
+// dex de cada método. La pila de actividades vive aquí y no en el dex: cada pantalla conserva su
+// propia máquina (sus objetos, sus capturas y sus oyentes) mientras está cubierta, y `finish()` la
+// descubre otra vez sin repetir su `onCreate`, que es lo que hace que el estado vuelva como estaba.
+// `declaradas` son las actividades que el manifiesto declara, por descriptor: una que no esté ahí no
+// se lanza, como en el aparato.
+func ejecutaOnCreateConEventos(dxs []*dexFile, tabla *tablaRecursos, actividad string, eventos []eventoUsuario,
 	preparar func(m *maquinaDalvik), declaradas map[string]bool) (*resultadoEjecucion, uint32, error) {
 	res := &resultadoEjecucion{Metodo: "onCreate"}
-	prog, err := cargaPrograma(d)
+	prog, err := cargaPrograma(dxs...)
 	if err != nil {
 		res.falla(err)
 		return res, 0, nil
@@ -1563,6 +1572,10 @@ func ejecutaOnCreateConEventos(d *dexFile, tabla *tablaRecursos, actividad strin
 		}
 		// lo que la app posteó en el arranque sin retraso corre antes de cualquier orden
 		drena(m.ahora())
+		// base del delta del hot swap: el dex del método que se va a sustituir, que en un apk con
+		// varios dex puede no ser el primero. Se recalcula en cada orden porque el swap anterior
+		// ya instaló su propio dex en el método.
+		base := prog.dex
 		for _, orden := range eventos {
 			if orden.Tipo == ordenIntercambiarTipo {
 				// el hot swap del guion: el dex nuevo entra en la tabla de despacho de la sesión
@@ -1573,7 +1586,15 @@ func ejecutaOnCreateConEventos(d *dexFile, tabla *tablaRecursos, actividad strin
 					errEventos = fmt.Errorf("--intercambiar %s: %w", orden.Dato, err)
 					break
 				}
-				cambios, err := deltaDeDexes(d, nuevo)
+				claseSwap, nombreSwap, protoSwap, errFirma := parteFirmaDeIntercambio(orden.Dato)
+				if errFirma == nil {
+					if cl, ok := prog.clases[claseSwap]; ok {
+						if met := cl.metodos[nombreSwap+protoSwap]; met != nil && met.dex != nil {
+							base = met.dex
+						}
+					}
+				}
+				cambios, err := deltaDeDexes(base, nuevo)
 				if err != nil {
 					errEventos = fmt.Errorf("--intercambiar %s: %w", orden.Dato, err)
 					break
@@ -1584,7 +1605,7 @@ func ejecutaOnCreateConEventos(d *dexFile, tabla *tablaRecursos, actividad strin
 					break
 				}
 				// la base del siguiente delta es el dex recién instalado; en fallo no se tocó
-				d = nuevo
+				base = nuevo
 				res.Intercambios = append(res.Intercambios, hechos...)
 				estabiliza()
 				drena(m.ahora())

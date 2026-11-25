@@ -37,6 +37,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -739,38 +740,38 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 	etiquetaApp := etiquetaDeLaApp(arbolManifiesto, ctxManifiesto)
 
 	// Fase 2: la actividad se ejecuta antes de elegir el layout, porque el `setContentView` dice cuál
-	// es. Si no hay classes.dex o el dex no se deja ejecutar, el modelo de la Fase 1 sigue saliendo.
+	// es. La actividad puede vivir en cualquier `classesN.dex`, así que se carga el conjunto completo.
+	// Si no hay dex o los dex no se dejan cargar, el modelo de la Fase 1 sigue saliendo.
 	var layoutID uint32
 	declaradas := actividadesDeclaradas(arbolManifiesto, ctxManifiesto)
 	if ejecutar {
-		if dexBytes, err := entradaDeZip(zr, "classes.dex"); err == nil {
-			if d, err := readDex(dexBytes); err == nil {
-				preferida := descriptorDeActividad(modelo.Paquete, nombreActividad)
-				var errEventos error
-				modelo.Ejecucion, layoutID, errEventos = ejecutaOnCreateConEventos(d, tabla, preferida, eventos,
-					func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, layout, nombreActividad) }, declaradas)
-				if errEventos != nil {
-					return nil, errEventos
-				}
-				// la pantalla que se pinta es la que quedó delante tras la navegación, no la lanzadora
-				if modelo.Ejecucion != nil && len(modelo.Ejecucion.Pantallas) > 1 &&
-					modelo.Ejecucion.Actividad != "" {
-					modelo.Actividad = modelo.Ejecucion.Actividad
-				}
-				// un dex mal formado no se ejecuta a medias ni se tapa con un modelo que parecería
-				// medido: el comando lo rechaza. Una API fuera del subconjunto, en cambio, solo deja
-				// avisos y el modelo sale igual.
-				if modelo.Ejecucion != nil && modelo.Ejecucion.malformado {
-					return nil, fmt.Errorf("el classes.dex no es ejecutable: %s", modelo.Ejecucion.Error)
-				}
-				// el diálogo propio que quedó abierto se publica como capa; el último de la pila es
-				// el que está delante
-				if modelo.Ejecucion != nil && len(modelo.Ejecucion.Dialogos) > 0 {
-					capa := modelo.Ejecucion.Dialogos[len(modelo.Ejecucion.Dialogos)-1]
-					modelo.Dialogo = &capa
-				}
-			} else {
-				modelo.Ejecucion = &resultadoEjecucion{Error: "el classes.dex no se deja leer: " + err.Error()}
+		dxs, _, errDex := dexDelApk(zr)
+		if errDex != nil {
+			modelo.Ejecucion = &resultadoEjecucion{Error: "los dex del apk no se dejan cargar: " + errDex.Error()}
+		} else if len(dxs) > 0 {
+			preferida := descriptorDeActividad(modelo.Paquete, nombreActividad)
+			var errEventos error
+			modelo.Ejecucion, layoutID, errEventos = ejecutaOnCreateConEventos(dxs, tabla, preferida, eventos,
+				func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, layout, nombreActividad) }, declaradas)
+			if errEventos != nil {
+				return nil, errEventos
+			}
+			// la pantalla que se pinta es la que quedó delante tras la navegación, no la lanzadora
+			if modelo.Ejecucion != nil && len(modelo.Ejecucion.Pantallas) > 1 &&
+				modelo.Ejecucion.Actividad != "" {
+				modelo.Actividad = modelo.Ejecucion.Actividad
+			}
+			// un dex mal formado no se ejecuta a medias ni se tapa con un modelo que parecería
+			// medido: el comando lo rechaza. Una API fuera del subconjunto, en cambio, solo deja
+			// avisos y el modelo sale igual.
+			if modelo.Ejecucion != nil && modelo.Ejecucion.malformado {
+				return nil, fmt.Errorf("el classes.dex no es ejecutable: %s", modelo.Ejecucion.Error)
+			}
+			// el diálogo propio que quedó abierto se publica como capa; el último de la pila es
+			// el que está delante
+			if modelo.Ejecucion != nil && len(modelo.Ejecucion.Dialogos) > 0 {
+				capa := modelo.Ejecucion.Dialogos[len(modelo.Ejecucion.Dialogos)-1]
+				modelo.Dialogo = &capa
 			}
 		}
 	}
@@ -1227,6 +1228,74 @@ func entradaDeZip(zr *zip.Reader, nombre string) ([]byte, error) {
 		return buf.Bytes(), nil
 	}
 	return nil, fmt.Errorf("el apk no lleva %s", nombre)
+}
+
+// indiceDeDex reconoce las entradas de código de un apk y les da el orden numérico que usa ART:
+// `classes.dex` es la primera y `classes2.dex` la segunda, aunque el directorio del zip las liste
+// en orden alfabético (`classes10.dex` antes que `classes2.dex`). Solo cuentan las de la raíz.
+func indiceDeDex(nombre string) (int, bool) {
+	if strings.Contains(nombre, "/") {
+		return 0, false
+	}
+	if nombre == "classes.dex" {
+		return 1, true
+	}
+	if !strings.HasPrefix(nombre, "classes") || !strings.HasSuffix(nombre, ".dex") {
+		return 0, false
+	}
+	sufijo := strings.TrimSuffix(strings.TrimPrefix(nombre, "classes"), ".dex")
+	if sufijo == "" {
+		return 0, false
+	}
+	for _, r := range sufijo {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(sufijo)
+	if err != nil || n < 2 {
+		return 0, false
+	}
+	return n, true
+}
+
+// dexDelApk descubre y parsea TODOS los dex de código del apk, en orden, y devuelve también la tabla
+// descriptor de clase → dex que la contiene. Un descriptor repetido en dos dex es un error: los
+// índices de un code_item apuntan a las tablas de su propio fichero y dos dueños del mismo nombre no
+// se pueden resolver sin elegir uno a ciegas. El corpus medido no tiene duplicados; la falsación es
+// sintética y se hace en el test.
+func dexDelApk(zr *zip.Reader) ([]*dexFile, map[string]*dexFile, error) {
+	type entradaDex struct {
+		indice int
+		nombre string
+	}
+	entradas := []entradaDex{}
+	for _, f := range zr.File {
+		if indice, ok := indiceDeDex(f.Name); ok {
+			entradas = append(entradas, entradaDex{indice: indice, nombre: f.Name})
+		}
+	}
+	sort.Slice(entradas, func(i, j int) bool { return entradas[i].indice < entradas[j].indice })
+	dxs := make([]*dexFile, 0, len(entradas))
+	tabla := map[string]*dexFile{}
+	for _, e := range entradas {
+		bytesDex, err := entradaDeZip(zr, e.nombre)
+		if err != nil {
+			return nil, nil, fmt.Errorf("el %s: %w", e.nombre, err)
+		}
+		d, err := readDex(bytesDex)
+		if err != nil {
+			return nil, nil, fmt.Errorf("el %s no se deja leer: %w", e.nombre, err)
+		}
+		for _, c := range d.classes {
+			if _, ya := tabla[c.name]; ya {
+				return nil, nil, fmt.Errorf("el descriptor %s está duplicado: aparece en dos dex, el segundo es %s", c.name, e.nombre)
+			}
+			tabla[c.name] = d
+		}
+		dxs = append(dxs, d)
+	}
+	return dxs, tabla, nil
 }
 
 // rutaDelLayout busca los nombres que se le dan, en orden, primero en la tabla de recursos y
