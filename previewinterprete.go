@@ -4405,7 +4405,9 @@ func clavesDeMapaPreferencias(mapa map[string]any) []any {
 
 // datosDelMapa entrega el mapa de un objeto Map del modelo: el de `getAll` o un `HashMap` creado por
 // la propia app. Un HashMap sin estado nace con el mapa vacío; no se inventan claves, solo se leen
-// las que la app guardó con `put` o heredó de `HashMap(Map)`.
+// las que la app guardó con `put` o heredó de `HashMap(Map)`. Las entradas `mapa.*` que el intérprete
+// sembró en los campos también cuentan: son las que el frente de colecciones publicaba antes de que
+// existiera este respaldo, y perderlas sería una regresión.
 func datosDelMapa(obj *objetoDalvik) map[string]any {
 	if obj == nil {
 		return nil
@@ -4421,6 +4423,11 @@ func datosDelMapa(obj *objetoDalvik) map[string]any {
 			obj.campos = map[string]any{}
 		}
 		datos := map[string]any{}
+		for c, v := range obj.campos {
+			if strings.HasPrefix(c, "mapa.") && c != "mapa.datos" {
+				datos[strings.TrimPrefix(c, "mapa.")] = v
+			}
+		}
 		obj.campos["mapa.datos"] = datos
 		return datos
 	}
@@ -5918,6 +5925,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			if datos := datosDelMapa(obj); datos != nil {
 				if v, ok := datos[textoDe(vals[0])]; ok {
 					return v, true, nil
+				}
+				if !esMapaPreferencias(obj) {
+					m.avisa("Map.get(%s): el mapa no tiene esa entrada; se devuelve null (aproximación)",
+						textoDe(vals[0]))
 				}
 				return nil, true, nil
 			}
