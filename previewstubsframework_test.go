@@ -1092,3 +1092,186 @@ func TestInertesCuentaUnaVezAvisosRecortadosRepetidos(t *testing.T) {
 		t.Errorf("el último aviso es %q y se esperaba el marcador", ultimo)
 	}
 }
+
+// --- mapas, cadenas y trazas que aparecieron tras ejecutar <clinit> ---------------------------
+//
+// Los cinco métodos de abajo llegaban a la fase 3 de `invoca` («no está en el dex ni en los
+// stubs») con el frente de clinit (evidencia en clinit/salida2) y, en el de lifecycle, el getter de
+// StackTraceElement era el único aviso vivo de Libre Memory Game (`lifecycle/post`). Se comprueban
+// directamente sobre `intentaStub`, sin dex ni compilación: la semántica es sobre los objetos que el
+// intérprete ya modela, no sobre un jar ajeno.
+
+// TestColeccionesMapGetLeeLaEntradaSinInventar: la entrada sembrada se devuelve y la ausente es
+// `null` con un aviso que dice que es una aproximación, nunca el cero silencioso de antes.
+func TestColeccionesMapGetLeeLaEntradaSinInventar(t *testing.T) {
+	m := maquinaDeStubs()
+	mapa := objDe("Ljava/util/HashMap;")
+	mapa.campos["mapa.clave"] = cadenaObjeto("valor")
+	candidatos := []string{"Ljava/util/Map;"} // el invoke declara la interfaz
+
+	v, ok, err := m.intentaStub(candidatos, "get", "(Ljava/lang/Object;)Ljava/lang/Object;",
+		[]any{cadenaObjeto("clave")}, mapa)
+	if err != nil || !ok {
+		t.Fatalf("get de una entrada sembrada: v=%v ok=%v err=%v", v, ok, err)
+	}
+	esperaCadenaDeStub(t, v, "valor")
+
+	v, ok, err = m.intentaStub(candidatos, "get", "(Ljava/lang/Object;)Ljava/lang/Object;",
+		[]any{cadenaObjeto("ausente")}, mapa)
+	if err != nil || !ok {
+		t.Fatalf("get de una entrada ausente: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != nil {
+		t.Errorf("una clave ausente devolvió %v y se esperaba el receptor nulo", v)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "aproximación") {
+		t.Errorf("la clave ausente no registró que es una aproximación: %s", avisos)
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("Map.get cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestCadenasSubstringCuentaUnidadesYRespetaLimites: recorta en unidades UTF-16, acepta las dos
+// firmas que usa javac (`substring(I)` y `substring(II)`) y lanza la excepción del framework cuando
+// el rango no es válido, para que un `catch` del proyecto pueda seguir.
+func TestCadenasSubstringCuentaUnidadesYRespetaLimites(t *testing.T) {
+	m := maquinaDeStubs()
+	candidatos := []string{"Ljava/lang/String;"}
+
+	casos := []struct {
+		receptor any
+		vals     []any
+		esperado string
+	}{
+		{cadenaObjeto("abcdef"), []any{int32(2)}, "cdef"},
+		{"abcdef", []any{int32(1), int32(4)}, "bcd"},
+		{cadenaObjeto("aéb"), []any{int32(1), int32(2)}, "é"},
+		{"abcdef", []any{int32(2), int32(2)}, ""},
+	}
+	for _, c := range casos {
+		v, ok, err := m.intentaStub(candidatos, "substring", "(I)Ljava/lang/String;", c.vals, c.receptor)
+		if err != nil || !ok {
+			t.Errorf("substring(%v) sobre %v: v=%v ok=%v err=%v", c.vals, c.receptor, v, ok, err)
+			continue
+		}
+		esperaCadenaDeStub(t, v, c.esperado)
+	}
+
+	malos := [][]any{{int32(-1)}, {int32(1), int32(0)}, {int32(1), int32(9)}}
+	for _, vals := range malos {
+		v, ok, err := m.intentaStub(candidatos, "substring", "(I)Ljava/lang/String;", vals, "abc")
+		if !ok {
+			t.Errorf("substring(%v) no fue atendido", vals)
+			continue
+		}
+		var ex *excepcionDalvik
+		if !errors.As(err, &ex) {
+			t.Errorf("substring(%v) devolvió v=%v err=%v y se esperaba una excepción", vals, v, err)
+			continue
+		}
+		if ex.tipo != "Ljava/lang/StringIndexOutOfBoundsException;" {
+			t.Errorf("substring(%v) lanzó %s y se esperaba StringIndexOutOfBoundsException", vals, ex.tipo)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("substring cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestCadenasIntegerValueOfYIntValue: el boxeo devuelve un Integer no nulo con el valor guardado,
+// que `intValue` lee sin caer en el guardián de receptor nulo del invoke siguiente.
+func TestCadenasIntegerValueOfYIntValue(t *testing.T) {
+	m := maquinaDeStubs()
+	candidatos := []string{"Ljava/lang/Integer;"}
+
+	v, ok, err := m.intentaStub(candidatos, "valueOf", "(I)Ljava/lang/Integer;", []any{int32(42)}, nil)
+	if err != nil || !ok {
+		t.Fatalf("Integer.valueOf: v=%v ok=%v err=%v", v, ok, err)
+	}
+	entero := esperaObjetoDeStub(t, v, "Ljava/lang/Integer;")
+
+	v, ok, err = m.intentaStub(candidatos, "intValue", "()I", nil, entero)
+	if err != nil || !ok {
+		t.Fatalf("Integer.intValue: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != int32(42) {
+		t.Errorf("intValue devolvió %v y se esperaba 42", v)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("el boxeo cayó en el aviso genérico: %s", avisos)
+	}
+}
+
+// TestStackTraceGetStackTraceYGetters: respeta la traza ya sembrada; sin ella, entrega una casilla
+// no nula con clase, método y línea para que `getClassName` no devuelva un nombre vacío que reviente
+// el `HashMap.get` o el `equals` siguientes (medido en Libre Memory Game).
+func TestStackTraceGetStackTraceYGetters(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	candidatos := []string{"Ljava/lang/Throwable;"}
+	proto := "()[Ljava/lang/StackTraceElement;"
+
+	elemento := &objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{
+		"StackTraceElement.clase":  "com.ejemplo.Main",
+		"StackTraceElement.metodo": "onCreate",
+		"StackTraceElement.linea":  int32(17),
+	}}
+	sembrada := &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}
+	ex := objDe("Ljava/lang/IllegalStateException;")
+	ex.campos["throwable.stackTrace"] = sembrada
+
+	v, ok, err := m.intentaStub(candidatos, "getStackTrace", proto, nil, ex)
+	if err != nil || !ok {
+		t.Fatalf("getStackTrace con traza sembrada: v=%v ok=%v err=%v", v, ok, err)
+	}
+	arreglo, esArreglo := v.(*arregloDalvik)
+	if !esArreglo || arreglo != sembrada {
+		t.Fatalf("getStackTrace devolvió %T y se esperaba la traza sembrada", v)
+	}
+
+	getters := []struct {
+		nombre   string
+		proto    string
+		esperado any
+	}{
+		{"getClassName", "()Ljava/lang/String;", "com.ejemplo.Main"},
+		{"getMethodName", "()Ljava/lang/String;", "onCreate"},
+		{"getLineNumber", "()I", int32(17)},
+	}
+	for _, g := range getters {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/StackTraceElement;"}, g.nombre, g.proto, nil, elemento)
+		if err != nil || !ok {
+			t.Errorf("%s: v=%v ok=%v err=%v", g.nombre, v, ok, err)
+			continue
+		}
+		if texto, esTexto := g.esperado.(string); esTexto {
+			esperaCadenaDeStub(t, v, texto)
+		} else if v != g.esperado {
+			t.Errorf("%s devolvió %v y se esperaba %v", g.nombre, v, g.esperado)
+		}
+	}
+
+	// sin traza sembrada: una casilla sintética, con aviso explícito de aproximación
+	otra := objDe("Ljava/lang/RuntimeException;")
+	v, ok, err = m.intentaStub(candidatos, "getStackTrace", proto, nil, otra)
+	if err != nil || !ok {
+		t.Fatalf("getStackTrace sin traza: v=%v ok=%v err=%v", v, ok, err)
+	}
+	sintetica, esArreglo := v.(*arregloDalvik)
+	if !esArreglo || sintetica == nil || sintetica.tipo != protoReturn(proto) || len(sintetica.datos) != 1 {
+		t.Fatalf("la traza sintética no es un arreglo de una casilla: %T %v", v, v)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "aproximación") {
+		t.Errorf("la traza sintética no registró que es una aproximación: %v", m.avisos)
+	}
+	if _, ok := sintetica.datos[0].(*objetoDalvik); !ok {
+		t.Errorf("la casilla sintética es %T y se esperaba un StackTraceElement", sintetica.datos[0])
+	}
+}
+
+// protoReturn es el descriptor del arreglo que devuelve getStackTrace, sin depender de un dex.
+func protoReturn(proto string) string {
+	return strings.TrimPrefix(proto, "()")
+}

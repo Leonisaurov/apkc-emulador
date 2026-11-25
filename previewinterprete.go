@@ -4432,6 +4432,31 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	// puede leer del objeto que recibió. Se decide por la jerarquía real —una excepción del proyecto
 	// como `MiExcepcion` no lleva el sufijo en el descriptor— y no por el nombre de la clase.
 	esThrowableObj := func() bool { return obj != nil && m.esThrowableDe(obj.clase) }
+	// esMapa reconoce un `java.util.Map` del framework, sea la interfaz declarada en el invoke o la
+	// implementación que creó la app. El mapa no trae entradas de fábrica: su respaldo es el mapa de
+	// campos del objeto y `get` devuelve lo que haya en él, sin inventar un valor.
+	esMapa := func() bool {
+		if obj == nil {
+			return false
+		}
+		for _, c := range append([]string{obj.clase}, candidatos...) {
+			switch {
+			case strings.HasSuffix(c, "Ljava/util/Map;"),
+				strings.HasSuffix(c, "Ljava/util/HashMap;"),
+				strings.HasSuffix(c, "Ljava/util/LinkedHashMap;"),
+				strings.HasSuffix(c, "Ljava/util/TreeMap;"),
+				strings.HasSuffix(c, "Ljava/util/AbstractMap;"):
+				return true
+			}
+		}
+		return false
+	}
+	// esEntero y esElementoDeTraza reconocen los objetos que crean estos stubs y que la app encadena
+	// justo después (`Integer.intValue`, los getters de `StackTraceElement`).
+	esEntero := func() bool { return obj != nil && strings.HasSuffix(obj.clase, "Ljava/lang/Integer;") }
+	esElementoDeTraza := func() bool {
+		return obj != nil && strings.HasSuffix(obj.clase, "Ljava/lang/StackTraceElement;")
+	}
 	// esContexto reconoce la actividad que corre y el Application que devuelve
 	// `getApplicationContext`: son los dos objetos sobre los que el framework atiende
 	// `getPackageManager`, `getSystemService` y compañía. La actividad se reconoce por identidad;
@@ -4575,17 +4600,6 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// hilo sintético que `currentThread()`, para que la app pueda compararlos por identidad.
 		if len(vals) == 0 && obj != nil && es("Landroid/os/Looper;") {
 			return m.hiloPrincipalSintetico(), true, nil
-		}
-	case "getStackTrace":
-		// `Thread.getStackTrace()` y `Throwable.getStackTrace()` entregan un arreglo de
-		// StackTraceElement. Kotlin lee la primera casilla para formar el mensaje de un parámetro
-		// nulo, así que hace falta un elemento sintético: con el arreglo vacío la app caía en
-		// «aget con el índice 0 fuera del arreglo de 0». Inventar la traza real no es posible, pero
-		// sí dar una casilla no nula con el nombre del hilo.
-		if len(vals) == 0 && obj != nil && (es("Ljava/lang/Thread;") || esThrowableObj()) {
-			return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{
-				&objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{}},
-			}}, true, nil
 		}
 	case "uptimeMillis":
 		// `SystemClock.uptimeMillis()` alimenta los relojes lógicos de la app. Se responde con el
@@ -5446,6 +5460,28 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			return obj.lista[int(i)], true, nil
 		}
+		// `Map.get` sobre un mapa del framework: la clave se guarda con un prefijo en el mapa de
+		// campos del objeto. Sin entrada sembrada el valor es `null`, que es lo que devuelve el
+		// framework y no el cero inventado que antes disparaba el aviso de stub ausente.
+		if esMapa() && len(vals) == 1 {
+			clave := "mapa." + textoDe(vals[0])
+			if v, ok := obj.campos[clave]; ok {
+				return v, true, nil
+			}
+			m.avisa("Map.get(%s): el mapa no tiene esa entrada; se devuelve null (aproximación)",
+				textoDe(vals[0]))
+			return nil, true, nil
+		}
+		// Un `Map.get` cuyo receptor es un registro cero no tiene mapa modelado del que leer. Se
+		// mantiene el mismo resultado nulo de siempre, pero se dice qué pasa en vez de caer en el
+		// aviso genérico «no está en los stubs» (medido en NewPipe: el receptor llegaba como int32).
+		// El guardián de receptor nulo de `invoca` no se toca: este valor ya lo pasaba antes.
+		if len(vals) == 1 && es("Ljava/util/Map;", "Ljava/util/HashMap;",
+			"Ljava/util/LinkedHashMap;", "Ljava/util/TreeMap;", "Ljava/util/AbstractMap;") {
+			m.avisa("Map.get(%s): el receptor no es un mapa modelado; se devuelve null (aproximación)",
+				textoDe(vals[0]))
+			return nil, true, nil
+		}
 	case "size":
 		if len(vals) == 0 {
 			if obj != nil && es("Landroid/view/Menu;", "Landroid/view/SubMenu;") {
@@ -5837,6 +5873,49 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	case "printStackTrace":
 		if len(vals) == 0 && esThrowableObj() {
 			return nil, true, nil
+		}
+	case "getStackTrace":
+		// Caso único tras integrar lifecycle y colecciones: `Thread.getStackTrace()` y
+		// `Throwable.getStackTrace()` entregan un arreglo de StackTraceElement. Kotlin lee la
+		// primera casilla para formar el mensaje de un parámetro nulo, así que nunca se devuelve
+		// el arreglo vacío (el frente de lifecycle sembró esa casilla con `campos` vacíos). Si el
+		// objeto ya trae una traza sembrada se respeta; si es una excepción, además se siembran
+		// clase, método y línea para que los getters no entreguen un nombre vacío. La pila real no
+		// existe en la vista previa y el aviso lo dice expresamente.
+		if len(vals) == 0 && obj != nil && (es("Ljava/lang/Thread;") || esThrowableObj()) {
+			if sembrada, ok := obj.campos["throwable.stackTrace"].(*arregloDalvik); ok && sembrada != nil {
+				return sembrada, true, nil
+			}
+			elemento := &objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{}}
+			if esThrowableObj() {
+				elemento.campos["StackTraceElement.clase"] = claseCorta(obj.clase)
+				elemento.campos["StackTraceElement.metodo"] = "<init>"
+				elemento.campos["StackTraceElement.linea"] = int32(-1)
+			}
+			m.avisa("getStackTrace: la vista previa no tiene pila real; se devuelve una casilla sintética (aproximación)")
+			return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{elemento}}, true, nil
+		}
+	case "getClassName", "getMethodName", "getLineNumber":
+		// los getters de StackTraceElement leen el objeto que sembró `getStackTrace`. Sin un campo
+		// sembrado se entrega el cero del tipo: no se inventa un nombre de clase ajeno a la traza.
+		if len(vals) == 0 && esElementoDeTraza() {
+			switch nombre {
+			case "getClassName":
+				if s, ok := obj.campos["StackTraceElement.clase"].(string); ok {
+					return cadenaObjeto(s), true, nil
+				}
+				return cadenaObjeto(""), true, nil
+			case "getMethodName":
+				if s, ok := obj.campos["StackTraceElement.metodo"].(string); ok {
+					return cadenaObjeto(s), true, nil
+				}
+				return cadenaObjeto(""), true, nil
+			case "getLineNumber":
+				if n, ok := obj.campos["StackTraceElement.linea"].(int32); ok {
+					return n, true, nil
+				}
+				return int32(0), true, nil
+			}
 		}
 	case "getClass":
 		// `Object.getClass()` devuelve un java.lang.Class no nulo con el descriptor del receptor.
@@ -6362,6 +6441,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 1 && es("Ljava/lang/String;") {
 			return textoDe(vals[0]), true, nil
 		}
+		// `Integer.valueOf(I)` crea un Integer con el valor: el objeto existe para que el
+		// `intValue()` o el `equals()` siguiente no reciban un receptor nulo.
+		if len(vals) == 1 && es("Ljava/lang/Integer;") {
+			n, err := aInt32(vals[0])
+			if err != nil {
+				return nil, true, err
+			}
+			return &objetoDalvik{clase: "Ljava/lang/Integer;", campos: map[string]any{
+				"Ljava/lang/Integer;.value": n,
+			}}, true, nil
+		}
 	case "parseInt":
 		if len(vals) >= 1 && es("Ljava/lang/Integer;", "Ljava/lang/Long;") {
 			n, err := strconv.ParseInt(strings.TrimSpace(textoDe(vals[0])), 10, 32)
@@ -6375,6 +6465,43 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return n, true, nil
 			}
 			return int32(n), true, nil
+		}
+	case "substring":
+		// `String.substring` cuenta unidades de 16 bits, igual que `length` y `charAt`, y devuelve
+		// un String del intérprete. Fuera de rango lanza StringIndexOutOfBoundsException, que un
+		// `catch` del proyecto puede capturar en vez de caer en un aviso sin valor.
+		if es("Ljava/lang/String;", "Ljava/lang/CharSequence;") && (len(vals) == 1 || len(vals) == 2) {
+			s, ok := cadenaDe(receptor)
+			if !ok {
+				return nil, true, fmt.Errorf("substring sobre un receptor que no es una cadena")
+			}
+			unidades := unidadesDeCadena(s)
+			i, err := aInt32(vals[0])
+			if err != nil {
+				return nil, true, err
+			}
+			inicio, fin := int(i), len(unidades)
+			if len(vals) == 2 {
+				j, err := aInt32(vals[1])
+				if err != nil {
+					return nil, true, err
+				}
+				fin = int(j)
+			}
+			if inicio < 0 || inicio > fin || fin > len(unidades) {
+				return nil, true, nuevaExcepcion("Ljava/lang/StringIndexOutOfBoundsException;",
+					"begin %d, end %d, length %d", inicio, fin, len(unidades))
+			}
+			return cadenaObjeto(string(utf16.Decode(unidades[inicio:fin]))), true, nil
+		}
+	case "intValue":
+		// el valor que `Integer.valueOf` guardó en el objeto. Sin valor sembrado se devuelve el
+		// cero del entero, nunca un objeto nulo sobre el que la app seguiría encadenando.
+		if len(vals) == 0 && esEntero() {
+			if n, ok := obj.campos["Ljava/lang/Integer;.value"].(int32); ok {
+				return n, true, nil
+			}
+			return int32(0), true, nil
 		}
 	case "charAt":
 		if len(vals) == 1 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
