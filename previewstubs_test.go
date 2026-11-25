@@ -655,12 +655,13 @@ func TestTermuxLosAvisosQueSePuedenQuitar(t *testing.T) {
 		t.Fatalf("iterator sobre el conjunto de propiedades: v=%v ok=%v err=%v", it, ok, err)
 	}
 
-	// File.exists y File.isFile son del frente de ROM: aquí se comprueba que siguen SIN stub.
+	// File.exists y File.isFile los resuelve el frente de ROM, ya integrado en este árbol: un File
+	// sin ruta en el árbol ROM devuelve falso, sin caer en el aviso genérico de stub ausente.
 	for _, nombre := range []string{"exists", "isFile"} {
 		v, ok, err := m.intentaStub([]string{"Ljava/io/File;"}, nombre, "()Z", nil,
 			objDe("Ljava/io/File;"))
-		if err != nil || ok || v != nil {
-			t.Errorf("%s se resolvió en este frente: v=%v ok=%v err=%v", nombre, v, ok, err)
+		if err != nil || !ok || v != int32(0) {
+			t.Errorf("%s no fue resuelto por el frente de ROM: v=%v ok=%v err=%v", nombre, v, ok, err)
 		}
 	}
 
