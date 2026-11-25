@@ -547,7 +547,11 @@ type maquinaDalvik struct {
 	consola  []lineaConsola
 	avisos   []string
 	vistos   map[string]bool
-	layoutID uint32
+	// avisosRecortados cuenta los avisos distintos que NO cupieron en `avisosMaximos`. El modelo
+	// publica al final un marcador sintético con este número: sin él, un registro recortado
+	// parecería completo y una aproximación podría confundirse con una ejecución cubierta.
+	avisosRecortados int
+	layoutID         uint32
 	oyentes  []oyenteRegistrado
 	// las listas que `setAdapter` dejó armadas y los `OnItemClickListener` que se registraron
 	// sobre ellas: es lo que convierte `--pulsar id/lista:fila` en un clic por posición.
@@ -1218,7 +1222,19 @@ func (m *maquinaDalvik) vistaDeInstancia(padre *objetoDalvik, id uint32) *objeto
 
 func (m *maquinaDalvik) avisa(formato string, args ...any) {
 	texto := fmt.Sprintf(formato, args...)
-	if m.vistos[texto] || len(m.avisos) >= avisosMaximos {
+	if m.vistos[texto] {
+		return
+	}
+	if len(m.avisos) >= avisosMaximos {
+		m.avisosRecortados++
+		marcador := fmt.Sprintf("avisos-recortados: %d", m.avisosRecortados)
+		// el marcador es del modelo, no un aviso nuevo de la app: se reescribe en su plaza y no
+		// cuenta para el tope. Los avisos que sí cupieron no se tocan ni se desplazan.
+		if m.avisosRecortados == 1 {
+			m.avisos = append(m.avisos, marcador)
+		} else {
+			m.avisos[len(m.avisos)-1] = marcador
+		}
 		return
 	}
 	m.vistos[texto] = true
@@ -3310,12 +3326,17 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 				poner(aa&0xf, boolAInt(es))
 				pc += 2
 			case 0x21: // array-length
-				arr, ok := regs[int(u>>12)].(*arregloDalvik)
-				if !ok {
+				if arr, ok := regs[int(u>>12)].(*arregloDalvik); ok {
+					poner(int(u>>8)&0xf, int32(len(arr.datos)))
+					pc++
+				} else if obj, ok := regs[int(u>>12)].(*objetoDalvik); ok && obj.lista != nil {
+					// los arreglos que devuelve una API inerte son objetos con `lista` vacía: su
+					// longitud es cero, no un error de tipo
+					poner(int(u>>8)&0xf, int32(len(obj.lista)))
+					pc++
+				} else {
 					return nil, fmt.Errorf("array-length sobre un registro que no es arreglo")
 				}
-				poner(int(u>>8)&0xf, int32(len(arr.datos)))
-				pc++
 			case 0x22: // new-instance
 				w, err := segunda()
 				if err != nil {
@@ -3474,18 +3495,25 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 				if err != nil {
 					return nil, err
 				}
-				arr, ok := regs[int(w)&0xff].(*arregloDalvik)
-				if !ok {
+				var datos []any
+				switch a := regs[int(w)&0xff].(type) {
+				case *arregloDalvik:
+					datos = a.datos
+				case *objetoDalvik:
+					// el arreglo inerte de una API de reproductor lleva su contenido en `lista`
+					datos = a.lista
+				}
+				if datos == nil {
 					return nil, fmt.Errorf("aget sobre un registro que no es arreglo")
 				}
 				idx, err := aInt32(regs[int(w)>>8])
 				if err != nil {
 					return nil, err
 				}
-				if int(idx) < 0 || int(idx) >= len(arr.datos) {
-					return nil, fmt.Errorf("aget con el índice %d fuera del arreglo de %d", idx, len(arr.datos))
+				if int(idx) < 0 || int(idx) >= len(datos) {
+					return nil, fmt.Errorf("aget con el índice %d fuera del arreglo de %d", idx, len(datos))
 				}
-				v := arr.datos[idx]
+				v := datos[idx]
 				if op == 0x45 {
 					ponerAncho(aa, v)
 				} else {
@@ -6126,6 +6154,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			if retorno == "" {
 				return nil, true, nil
+			}
+			// un retorno de arreglo (`[I`, `[Ljava/lang/String;`…) no es un objeto corriente: lleva
+			// `lista` vacía para que `array-length` y `aget` lean cero elementos sin inventar
+			// contenido ni confundirlo con un receptor nulo.
+			if strings.HasPrefix(retorno, "[") {
+				return &objetoDalvik{clase: retorno, campos: map[string]any{
+					marca: retorno,
+				}, lista: []any{}}, true, nil
 			}
 			return objetoInerte(retorno, marca), true, nil
 		}

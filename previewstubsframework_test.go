@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"net/http"
@@ -962,5 +963,91 @@ func TestInertesSinCargaNativaNiRedEnElCodigo(t *testing.T) {
 		if strings.Contains(texto, prohibido) {
 			t.Errorf("el intérprete contiene %s, que cargaría código o pediría red", prohibido)
 		}
+	}
+}
+
+// TestInertesMarcaAvisosRecortados falsifica el tope con llamadas inertes DISTINTAS: los 24 primeros
+// avisos caben, los tres siguientes se recortan y el modelo tiene que decir cuántos faltan. Sin el
+// marcador, un registro recortado parecería completo.
+func TestInertesMarcaAvisosRecortados(t *testing.T) {
+	m := maquinaDeStubs()
+	vista := objDe("Landroid/webkit/WebView;")
+	vista.campos[markerInerteWeb] = vista.clase
+	for i := 0; i < avisosMaximos+3; i++ {
+		nombre := fmt.Sprintf("metodoInerte%02d", i)
+		v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, nombre, "()V", nil, vista)
+		if err != nil || !ok || v != nil {
+			t.Fatalf("%s: v=%v ok=%v err=%v", nombre, v, ok, err)
+		}
+	}
+	if m.avisosRecortados != 3 {
+		t.Errorf("se recortaron %d avisos y se esperaban 3", m.avisosRecortados)
+	}
+	cabidos := 0
+	for _, aviso := range m.avisos {
+		if strings.HasPrefix(aviso, "webview-inerte: android.webkit.WebView.metodoInerte") {
+			cabidos++
+		}
+	}
+	if cabidos != avisosMaximos {
+		t.Errorf("quedan %d avisos de la app y se esperaban los %d del tope", cabidos, avisosMaximos)
+	}
+	ultimo := m.avisos[len(m.avisos)-1]
+	if ultimo != "avisos-recortados: 3" {
+		t.Errorf("el último aviso es %q y se esperaba el marcador", ultimo)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "avisos-recortados: 3") {
+		t.Errorf("no aparece el marcador en %q", m.avisos)
+	}
+	// el tope sigue siendo el mismo: el marcador no abre hueco para un aviso nuevo de la app
+	if _, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, "metodoInerteTardio",
+		"()V", nil, vista); err != nil || !ok {
+		t.Fatalf("metodoInerteTardio: ok=%v err=%v", ok, err)
+	}
+	if m.avisosRecortados != 4 || m.avisos[len(m.avisos)-1] != "avisos-recortados: 4" {
+		t.Errorf("el marcador no se actualizó: recortados=%d último=%q", m.avisosRecortados,
+			m.avisos[len(m.avisos)-1])
+	}
+}
+
+// TestInertesRetornoArregloEsVacio comprueba el retorno de tipo arreglo del fallback: es un objeto
+// con la clase del arreglo y `lista` vacía, y `array-length` lo lee como cero en vez de fallar con
+// «no es arreglo». El índice cero, al estar vacío, da un error de rango honesto en `aget`.
+func TestInertesRetornoArregloEsVacio(t *testing.T) {
+	m := maquinaDeStubs()
+	reproductor := objDe("Landroidx/media3/exoplayer/ExoPlayer;")
+	reproductor.campos[markerInerteNativo] = reproductor.clase
+	arreglo := mustStub(t, m, []string{"Landroidx/media3/common/Player;"}, "getTrackList",
+		"()[I", nil, reproductor)
+	o, esObjeto := arreglo.(*objetoDalvik)
+	if !esObjeto || o == nil {
+		t.Fatalf("el retorno es %T y se esperaba un objeto de arreglo", arreglo)
+	}
+	if o.clase != "[I" {
+		t.Errorf("la clase es %q y se esperaba [I", o.clase)
+	}
+	if o.lista == nil || len(o.lista) != 0 {
+		t.Errorf("el arreglo inerte lleva %v y se esperaba una lista vacía no nula", o.lista)
+	}
+	if o.campos[markerInerteNativo] == nil {
+		t.Error("el arreglo inerte perdió la marca de su familia")
+	}
+	// `array-length v0, v1` sobre el argumento, seguido de `return v0`
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	met := unMetodoDePrueba("longitud", &codeItem{registersSize: 2, insSize: 1, insnsSize: 2,
+		insns: []uint16{0x1021, 0x000f}})
+	n, err := m.ejecutaCuerpo("Lcom/prueba/A;", met, []any{o}, []string{"[I"})
+	if err != nil {
+		t.Fatalf("array-length sobre el arreglo inerte falló: %v", err)
+	}
+	if n != int32(0) {
+		t.Errorf("array-length devolvió %v y se esperaba 0", n)
+	}
+	// `aget v0, v1, v2` con índice cero: el error tiene que ser de rango, no de tipo
+	met = unMetodoDePrueba("lee", &codeItem{registersSize: 3, insSize: 2, insnsSize: 3,
+		insns: []uint16{0x0044, 0x0201, 0x000e}})
+	_, err = m.ejecutaCuerpo("Lcom/prueba/A;", met, []any{o, int32(0)}, []string{"[I", "I"})
+	if err == nil || !strings.Contains(err.Error(), "fuera del arreglo de 0") {
+		t.Errorf("aget sobre el arreglo vacío dio %v y se esperaba el error de rango", err)
 	}
 }
