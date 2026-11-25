@@ -654,6 +654,149 @@ func TestRomArbolYReglaMasLarga(t *testing.T) {
 	}
 }
 
+// maquinaListConFiltro arma una máquina con la ROM sembrada y un filtro del dex cuyo `accept` es el
+// cuerpo dado. El dex de la prueba lleva los cuatro métodos de framework que el cuerpo de extensión
+// invoca, para que la resolución sea la misma que en la APK del gestor de archivos.
+func maquinaListConFiltro(t *testing.T, clase string, insns []uint16, registros int) (*maquinaDalvik, *objetoDalvik) {
+	t.Helper()
+	rom, err := cargaRom("", []string{"android.permission.READ_EXTERNAL_STORAGE"}, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM con permiso de lectura: %v", err)
+	}
+	d := &dexFile{
+		strings: []string{".txt"},
+		methods: []dexMethod{
+			{owner: "Ljava/io/File;", proto: dexProto{returnType: "Ljava/lang/String;"}, name: "getPath"},
+			{owner: "Ljava/lang/String;", proto: dexProto{returnType: "I"}, name: "length"},
+			{owner: "Ljava/lang/String;", proto: dexProto{params: []string{"I"}, returnType: "Ljava/lang/String;"}, name: "substring"},
+			{owner: "Ljava/lang/String;", proto: dexProto{params: []string{"Ljava/lang/Object;"}, returnType: "Z"}, name: "equals"},
+		},
+	}
+	met := &metodoDalvik{nombre: "accept", proto: "(Ljava/io/File;)Z", retorno: "Z", dex: d,
+		item: &codeItem{registersSize: uint32(registros), insSize: 2,
+			insnsSize: uint32(len(insns)), insns: insns}}
+	p := &programaDalvik{dex: d, clases: map[string]*claseDalvik{
+		clase: {nombre: clase, super: "Ljava/lang/Object;", metodos: map[string]*metodoDalvik{
+			"accept(Ljava/io/File;)Z": met,
+		}},
+	}}
+	m := nuevaMaquina(p, nil)
+	m.rom = rom
+	return m, &objetoDalvik{clase: clase, campos: map[string]any{}}
+}
+
+// nombresListados convierte el arreglo de listFiles o de list a nombres de fichero, sin añadir nada.
+func nombresListados(m *maquinaDalvik, v any, forma string) []string {
+	a, ok := v.(*arregloDalvik)
+	if !ok {
+		return nil
+	}
+	salida := make([]string, 0, len(a.datos))
+	for _, e := range a.datos {
+		if forma == "listFiles" {
+			f, ok := e.(*objetoDalvik)
+			if !ok {
+				continue
+			}
+			r := m.rutaDeFichero(f)
+			salida = append(salida, r[strings.LastIndex(r, "/")+1:])
+		} else {
+			salida = append(salida, textoDe(e))
+		}
+	}
+	return salida
+}
+
+// TestListFilesConFiltroQueAceptaTodo comprueba el eslabón que faltaba: listFiles con un FileFilter
+// de una clase del dex devuelve los hijos sembrados, no un arreglo vacío. Los cuatro ficheros están
+// en cuatro directorios reales de la ROM; se recorren todos con el mismo filtro, sin inventar rutas.
+func TestListFilesConFiltroQueAceptaTodo(t *testing.T) {
+	// con registersSize 3 e insSize 2 el receptor entra en v1 y el File en v2: el cuerpo usa v0.
+	m, filtro := maquinaListConFiltro(t, "Lfiltro/Todo;", []uint16{0x1012, 0x000f}, 3)
+	quiero := map[string]bool{
+		"leeme.txt": false, "gato.png": false, "notas.txt": false, "cancion.mp3": false,
+	}
+	for _, dir := range []string{"/sdcard/Download", "/sdcard/Download/fotos",
+		"/sdcard/Documents", "/sdcard/Music"} {
+		v, ok, err := m.intentaStub([]string{"Ljava/io/File;"}, "listFiles",
+			"(Ljava/io/FileFilter;)[Ljava/io/File;", []any{filtro}, objetoDeRuta(dir))
+		if err != nil || !ok {
+			t.Fatalf("listFiles con filtro sobre %s: ok=%v err=%v", dir, ok, err)
+		}
+		if a, esArreglo := v.(*arregloDalvik); !esArreglo || a.tipo != "[Ljava/io/File;" {
+			t.Fatalf("listFiles sobre %s devolvió %T y se esperaba [Ljava/io/File;", dir, v)
+		}
+		for _, nombre := range nombresListados(m, v, "listFiles") {
+			if _, esperado := quiero[nombre]; esperado {
+				quiero[nombre] = true
+			}
+		}
+	}
+	for nombre, visto := range quiero {
+		if !visto {
+			t.Errorf("el filtro que acepta todo no devolvió %s", nombre)
+		}
+	}
+	// sin filtro el comportamiento no cambia: el directorio se entrega tal cual, con su carpeta.
+	v, ok, err := m.intentaStub([]string{"Ljava/io/File;"}, "list",
+		"()[Ljava/lang/String;", nil, objetoDeRuta("/sdcard/Download"))
+	if err != nil || !ok {
+		t.Fatalf("list sin filtro: ok=%v err=%v", ok, err)
+	}
+	if nombres := nombresListados(m, v, "list"); len(nombres) != 2 ||
+		nombres[0] != "leeme.txt" || nombres[1] != "fotos" {
+		t.Errorf("list sin filtro dio %v y se esperaban [leeme.txt fotos]", nombres)
+	}
+}
+
+// TestListFilesFiltraPorExtension ejecuta el accept de una clase del dex que solo pasa los hijos
+// cuyo nombre termina en .txt: getPath + length + substring + equals, todos ellos stubs del modelo.
+func TestListFilesFiltraPorExtension(t *testing.T) {
+	// registersSize 8 e insSize 2: el filtro entra en v6 y el File en v7. Los temporales van de v0.
+	cuerpo := []uint16{
+		0x106e, 0x0000, 0x0007, // invoke-virtual {v7}, File.getPath:()Ljava/lang/String;
+		0x000c,                 // move-result-object v0
+		0x106e, 0x0001, 0x0000, // invoke-virtual {v0}, String.length:()I
+		0x010a,                 // move-result v1
+		0x4212,                 // const/4 v2, #4
+		0x0191, 0x0201,         // sub-int v1, v1, v2
+		0x206e, 0x0002, 0x0010, // invoke-virtual {v0, v1}, String.substring:(I)Ljava/lang/String;
+		0x030c,                 // move-result-object v3
+		0x041a, 0x0000,         // const-string v4, ".txt"
+		0x206e, 0x0003, 0x0043, // invoke-virtual {v3, v4}, String.equals:(Ljava/lang/Object;)Z
+		0x050a,                 // move-result v5
+		0x050f,                 // return v5
+	}
+	m, filtro := maquinaListConFiltro(t, "Lfiltro/Extension;", cuerpo, 8)
+	casos := []struct {
+		dir      string
+		esperado []string
+	}{
+		{"/sdcard/Download", []string{"leeme.txt"}},
+		{"/sdcard/Download/fotos", []string{}},
+		{"/sdcard/Documents", []string{"notas.txt"}},
+		{"/sdcard/Music", []string{}},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/io/File;"}, "listFiles",
+			"(Ljava/io/FileFilter;)[Ljava/io/File;", []any{filtro}, objetoDeRuta(caso.dir))
+		if err != nil || !ok {
+			t.Fatalf("listFiles filtrado sobre %s: ok=%v err=%v", caso.dir, ok, err)
+		}
+		obtenido := nombresListados(m, v, "listFiles")
+		if len(obtenido) != len(caso.esperado) {
+			t.Errorf("listFiles sobre %s dio %v y se esperaba %v", caso.dir, obtenido, caso.esperado)
+			continue
+		}
+		for i := range obtenido {
+			if obtenido[i] != caso.esperado[i] {
+				t.Errorf("listFiles sobre %s dio %v y se esperaba %v", caso.dir, obtenido, caso.esperado)
+				break
+			}
+		}
+	}
+}
+
 // TestRomVolcadoEsReleible cubre la persistencia opcional sin escribir en disco: el volcado tiene
 // que volver a cargarse con el mismo almacenamiento y los mismos nodos.
 func TestRomVolcadoEsReleible(t *testing.T) {

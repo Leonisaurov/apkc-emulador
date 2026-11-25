@@ -747,6 +747,55 @@ func objetoDeRuta(ruta string) *objetoDalvik {
 	return &objetoDalvik{clase: "Ljava/io/File;", campos: map[string]any{"file.ruta": ruta}}
 }
 
+// aceptaHijoFiltro invoca `accept` sobre el filtro que la app entregó a File.listFiles. Los filtros
+// propios del dex son clases con un método accept (FileFilter o FilenameFilter): se ejecuta su cuerpo
+// con un File sembrado con la ruta del hijo y solo pasan los que devuelven verdadero. Si el filtro no
+// es un objeto del dex, no tiene cuerpo o falla al ejecutarse, se aceptan todos los hijos y se deja
+// un aviso de aproximación: nunca un arreglo vacío silencioso que haga creer que el directorio está
+// vacío. El guardián de receptor nulo y los permisos no se tocan: esto solo decide qué hijos pasan.
+func (m *maquinaDalvik) aceptaHijoFiltro(filtro any, ruta string) bool {
+	obj, ok := filtro.(*objetoDalvik)
+	if !ok || obj == nil {
+		m.avisa("java.io.File.listFiles: el filtro no es una clase del dex; se aceptan todos los hijos")
+		return true
+	}
+	hijo := objetoDeRuta(ruta)
+	nombre := ruta[strings.LastIndex(ruta, "/")+1:]
+	formas := []struct {
+		proto string
+		args  []any
+		tipos []string
+	}{
+		{"(Ljava/io/File;)Z", []any{hijo}, []string{"Ljava/io/File;"}},
+		{"(Ljava/io/File;Ljava/lang/String;)Z",
+			[]any{hijo, cadenaObjeto(nombre)}, []string{"Ljava/io/File;", "Ljava/lang/String;"}},
+	}
+	for _, forma := range formas {
+		met := m.buscaMetodo(obj.clase, "accept", forma.proto)
+		if met == nil {
+			continue
+		}
+		res, err := m.ejecutaCuerpo(obj.clase, met,
+			append([]any{obj}, forma.args...),
+			append([]string{obj.clase}, forma.tipos...))
+		if err != nil {
+			m.avisa("java.io.File.listFiles: %s.accept no se pudo ejecutar; se aceptan todos los hijos",
+				claseCorta(obj.clase))
+			return true
+		}
+		v, err := aInt32(res)
+		if err != nil {
+			m.avisa("java.io.File.listFiles: %s.accept devolvió un valor inesperado; se aceptan todos los hijos",
+				claseCorta(obj.clase))
+			return true
+		}
+		return v != 0
+	}
+	m.avisa("java.io.File.listFiles: %s.accept no tiene cuerpo en el dex; se aceptan todos los hijos",
+		claseCorta(obj.clase))
+	return true
+}
+
 // avisoDenegado deja constancia de que la ROM cerró el paso. El texto no incluye la ruta para que
 // cien ficheros denegados no llenen el JSON de avisos repetidos.
 func (m *maquinaDalvik) avisoDenegado(operacion, permiso, ruta string) {
@@ -6949,7 +6998,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 		}
 	case "listFiles", "list":
-		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+		// Sin filtro se devuelve el árbol sembrado tal cual. Con un FileFilter o FilenameFilter se
+		// ejecuta su accept sobre cada hijo: solo pasan los aceptados. El permiso y la denegación no
+		// cambian; el filtro decide qué hijos se enseñan, no si se puede leer el directorio.
+		if (len(vals) == 0 || len(vals) == 1) && obj != nil && es("Ljava/io/File;") {
 			ruta := m.rutaDeFichero(obj)
 			rom := m.romActiva()
 			permiso := "android.permission.READ_EXTERNAL_STORAGE"
@@ -6964,6 +7016,9 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			if rom.accesoPermitido(ruta, permiso) {
 				if n := rom.arbol[rom.canonica(ruta)]; n != nil && n.directorio {
 					for _, hijo := range n.hijos {
+						if len(vals) == 1 && !m.aceptaHijoFiltro(vals[0], hijo) {
+							continue
+						}
 						if nombre == "listFiles" {
 							datos = append(datos, objetoDeRuta(hijo))
 						} else {
