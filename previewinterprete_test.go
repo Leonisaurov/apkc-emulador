@@ -1916,3 +1916,261 @@ func TestMultidexRechazaDescriptorDuplicado(t *testing.T) {
 		t.Errorf("el error no nombra el descriptor duplicado: %q", err)
 	}
 }
+
+// TestClinitPerezosoLlenaLosEstaticosYLeeElMismoVariasVeces: el `<clinit>` no se ejecuta al cargar
+// el dex, sino la primera vez que se toca un estático de la clase. El cuerpo lee `base` de la propia
+// clase (`veces = base + 1`): sin el guardián de reentrada esa lectura volvería a entrar en el
+// `<clinit>` y no terminaría. La segunda lectura desde fuera no debe repetirlo.
+func TestClinitPerezosoLlenaLosEstaticosYLeeElMismoVariasVeces(t *testing.T) {
+	d := dexDeFuentes(t, fuenteJava{nombre: "Estaticos.java", contenido: "package com.ejemplo;\n" +
+		"public class Estaticos {\n" +
+		"  static int base = 1;\n" +
+		"  static int[] grupo = new int[3];\n" +
+		"  static int veces = base + 1;\n" +
+		"}\n"})
+	dex, err := readDex(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := cargaPrograma(dex)
+	if err != nil {
+		t.Fatalf("el programa no carga: %v", err)
+	}
+	cl := prog.clases["Lcom/ejemplo/Estaticos;"]
+	if cl == nil {
+		t.Fatal("la clase Estaticos no está en el dex")
+	}
+	if cl.metodos["<clinit>()V"] == nil || cl.metodos["<clinit>()V"].item == nil {
+		t.Fatal("el dex generado no trae el <clinit> con cuerpo que la prueba necesita")
+	}
+	if cl.clinitEstado != 0 {
+		t.Fatalf("cargaPrograma ya ejecutó el <clinit> (estado %d)", cl.clinitEstado)
+	}
+	m := nuevaMaquina(prog, nil)
+	grupo := dexField{owner: "Lcom/ejemplo/Estaticos;", name: "grupo", typeOf: "[I"}
+	veces := dexField{owner: "Lcom/ejemplo/Estaticos;", name: "veces", typeOf: "I"}
+
+	arr, err := m.leeEstatico(grupo)
+	if err != nil {
+		t.Fatalf("leer grupo: %v", err)
+	}
+	a, ok := arr.(*arregloDalvik)
+	if !ok || len(a.datos) != 3 {
+		t.Fatalf("el <clinit> no dejó el arreglo de tres huecos: %#v", arr)
+	}
+	if cl.clinitEstado != 2 {
+		t.Errorf("tras la primera lectura el estado es %d y debiera ser 2", cl.clinitEstado)
+	}
+	for i := 0; i < 3; i++ {
+		n, err := m.leeEstatico(veces)
+		if err != nil {
+			t.Fatalf("leer veces: %v", err)
+		}
+		if n != int32(2) {
+			t.Fatalf("la lectura %d de veces dio %v y el <clinit> solo debió correr una vez", i, n)
+		}
+	}
+	if len(m.avisos) != 0 {
+		t.Errorf("el <clinit> dejó avisos: %v", m.avisos)
+	}
+}
+
+// TestClinitPerezosoSinCuerpoNoSeReintenta: una clase sin `<clinit>` ejecutable se marca como
+// inicializada en la primera lectura y no deja avisos; no hay cuerpo que pueda cambiar el cero.
+func TestClinitPerezosoSinCuerpoNoSeReintenta(t *testing.T) {
+	d := dexDeFuentes(t, fuenteJava{nombre: "Plano.java", contenido: "package com.ejemplo;\n" +
+		"public class Plano { static int valor = 7; }\n"})
+	dex, err := readDex(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, err := cargaPrograma(dex)
+	if err != nil {
+		t.Fatalf("el programa no carga: %v", err)
+	}
+	cl := prog.clases["Lcom/ejemplo/Plano;"]
+	if cl == nil {
+		t.Fatal("la clase Plano no está en el dex")
+	}
+	m := nuevaMaquina(prog, nil)
+	f := dexField{owner: "Lcom/ejemplo/Plano;", name: "valor", typeOf: "I"}
+	if v, err := m.leeEstatico(f); err != nil || v != int32(7) {
+		t.Fatalf("el valor codificado del estático no se leyó: %v, %v", v, err)
+	}
+	if cl.clinitEstado != 2 {
+		t.Errorf("la clase sin <clinit> quedó en estado %d", cl.clinitEstado)
+	}
+	if len(m.avisos) != 0 {
+		t.Errorf("la clase sin <clinit> dejó avisos: %v", m.avisos)
+	}
+}
+
+// ejecutaFillArrayData arma un método con `new-array` + `fill-array-data` + `return-object` sobre un
+// dex sintético (el emisor del fork no genera este opcode: escribe la cadena dup/astore) y devuelve
+// el arreglo que dejó el payload. El payload empieza en la unidad 6, tres palabras después del
+// opcode, y los literales van en orden little-endian como en un dex de d8.
+func ejecutaFillArrayData(t *testing.T, tipo string, cuenta uint16, payload []uint16) *arregloDalvik {
+	t.Helper()
+	d := &dexFile{types: []string{"", tipo}}
+	insns := append([]uint16{
+		0x0012 | cuenta<<12, // const/4 v0, cuenta
+		0x0023, 1, // new-array v0, v0, tipo
+		0x0026, 3, // fill-array-data v0, +3 (payload en la unidad 6)
+		0x0011, // return-object v0
+	}, payload...)
+	met := &metodoDalvik{nombre: "rellena", retorno: tipo, proto: "()" + tipo, dex: d,
+		item: &codeItem{registersSize: 1, insnsSize: uint32(len(insns)), insns: insns}}
+	m := nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{}}, nil)
+	v, err := m.ejecutaCuerpo("Lcom/ejemplo/A;", met, nil, nil)
+	if err != nil {
+		t.Fatalf("el método con fill-array-data falló: %v", err)
+	}
+	arr, ok := v.(*arregloDalvik)
+	if !ok {
+		t.Fatalf("el método devolvió %T y se esperaba un arreglo", v)
+	}
+	return arr
+}
+
+// TestFillArrayDataLlenaLosArreglosConLosLiteralesDelPayload mide los cuatro anchos sobre los tipos
+// que el intérprete guarda de distinta forma. Los valores son los del payload, sin inventar ninguno.
+func TestFillArrayDataLlenaLosArreglosConLosLiteralesDelPayload(t *testing.T) {
+	casos := []struct {
+		nombre  string
+		tipo    string
+		cuenta  uint16
+		payload []uint16
+		quiero  []any
+	}{
+		{
+			nombre:  "long",
+			tipo:    "[J",
+			cuenta:  2,
+			payload: []uint16{0x0300, 8, 2, 0, 0x0708, 0x0506, 0x0304, 0x0102, 0xffff, 0xffff, 0xffff, 0xffff},
+			quiero:  []any{int64(0x0102030405060708), int64(-1)},
+		},
+		{
+			nombre:  "byte con signo",
+			tipo:    "[B",
+			cuenta:  4,
+			payload: []uint16{0x0300, 1, 4, 0, 0xfe01, 0x807f},
+			quiero:  []any{int32(1), int32(-2), int32(127), int32(-128)},
+		},
+		{
+			nombre:  "int",
+			tipo:    "[I",
+			cuenta:  2,
+			payload: []uint16{0x0300, 4, 2, 0, 0x3344, 0x1122, 0xfff9, 0xffff},
+			quiero:  []any{int32(0x11223344), int32(-7)},
+		},
+		{
+			nombre:  "char sin signo",
+			tipo:    "[C",
+			cuenta:  2,
+			payload: []uint16{0x0300, 2, 2, 0, 0x0061, 0x0062},
+			quiero:  []any{int32('a'), int32('b')},
+		},
+		{
+			nombre:  "boolean",
+			tipo:    "[Z",
+			cuenta:  2,
+			payload: []uint16{0x0300, 1, 2, 0, 0x0100},
+			quiero:  []any{int32(0), int32(1)},
+		},
+	}
+	for _, caso := range casos {
+		t.Run(caso.nombre, func(t *testing.T) {
+			arr := ejecutaFillArrayData(t, caso.tipo, caso.cuenta, caso.payload)
+			if len(arr.datos) != len(caso.quiero) {
+				t.Fatalf("el arreglo tiene %d huecos y se esperaban %d", len(arr.datos), len(caso.quiero))
+			}
+			for i, quiero := range caso.quiero {
+				if arr.datos[i] != quiero {
+					t.Errorf("el elemento %d es %#v (%T) y se esperaba %#v (%T)",
+						i, arr.datos[i], arr.datos[i], quiero, quiero)
+				}
+			}
+		})
+	}
+}
+
+// TestFillArrayDataRechazaUnPayloadMalformado: un ident ajeno, un ancho que no existe, un payload
+// cortado o más elementos que huecos deben fallar sin escribir nada del arreglo.
+func TestFillArrayDataRechazaUnPayloadMalformado(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}, nil)
+	casos := []struct {
+		nombre  string
+		payload []uint16
+		quiere  string
+	}{
+		{"ident de packed-switch", []uint16{0x0100, 8, 2, 0, 0, 0, 0, 0}, "no a 0x0300"},
+		{"ancho imposible", []uint16{0x0300, 3, 2, 0, 0, 0, 0}, "ancho de 3 bytes"},
+		{"payload cortado", []uint16{0x0300, 8, 2, 0, 0, 0, 0, 0}, "truncado"},
+		{"más elementos que huecos", []uint16{0x0300, 1, 3, 0, 0, 0}, "sobre un arreglo de 2"},
+	}
+	for _, caso := range casos {
+		t.Run(caso.nombre, func(t *testing.T) {
+			arr := &arregloDalvik{tipo: "[J", datos: make([]any, 2)}
+			insns := append([]uint16{0x0026, 3, 0x0011}, caso.payload...)
+			err := m.rellenaDesdeArrayData(insns, 0, arr)
+			if err == nil || !strings.Contains(err.Error(), caso.quiere) {
+				t.Fatalf("el payload malformado dio %v y se esperaba «%s»", err, caso.quiere)
+			}
+			for i, v := range arr.datos {
+				if v != nil {
+					t.Errorf("el elemento %d se escribió antes de rechazar el payload: %#v", i, v)
+				}
+			}
+		})
+	}
+}
+
+// TestStubsDeEnteroYMatematicasCalculanLosLiterales: el `<clinit>` de `ScatterMapKt` construye un
+// `MutableScatterMap` vacío y su `loadedCapacity` llama a estas dos funciones puras del JDK. Sus
+// resultados son los de la definición, no un cero inventado para acallar el aviso.
+func TestStubsDeEnteroYMatematicasCalculanLosLiterales(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}, nil)
+	casos := []struct {
+		nombre string
+		proto  string
+		clase  string
+		vals   []any
+		quiero int32
+	}{
+		{"numberOfLeadingZeros", "(I)I", "Ljava/lang/Integer;", []any{int32(1)}, 31},
+		{"numberOfLeadingZeros", "(I)I", "Ljava/lang/Integer;", []any{int32(0)}, 32},
+		{"numberOfLeadingZeros", "(I)I", "Ljava/lang/Integer;", []any{int32(-1)}, 0},
+		{"max", "(II)I", "Ljava/lang/Math;", []any{int32(-3), int32(7)}, 7},
+		{"max", "(II)I", "Ljava/lang/Math;", []any{int32(9), int32(2)}, 9},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{caso.clase}, caso.nombre, caso.proto, caso.vals, nil)
+		if err != nil || !ok {
+			t.Fatalf("%s%v no se resolvió: ok=%v, err=%v", caso.nombre, caso.proto, ok, err)
+		}
+		if v != caso.quiero {
+			t.Errorf("%s%v dio %v y se esperaba %d", caso.nombre, caso.proto, v, caso.quiero)
+		}
+	}
+}
+
+// TestStubArraysFillEscribeSoloElRangoPedido: es el paso que falta para que el `<clinit>` de
+// `ScatterMapKt` termine de inicializar los metadatos del mapa vacío.
+func TestStubArraysFillEscribeSoloElRangoPedido(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}, nil)
+	arr := &arregloDalvik{tipo: "[J", datos: make([]any, 4)}
+	v, ok, err := m.intentaStub([]string{"Ljava/util/Arrays;"}, "fill", "([JIIJ)V",
+		[]any{arr, int32(1), int32(3), int64(-7)}, nil)
+	if err != nil || !ok || v != nil {
+		t.Fatalf("Arrays.fill no se resolvió: ok=%v, err=%v, valor=%v", ok, err, v)
+	}
+	for i, quiero := range []any{nil, int64(-7), int64(-7), nil} {
+		if arr.datos[i] != quiero {
+			t.Errorf("el hueco %d es %#v y se esperaba %#v", i, arr.datos[i], quiero)
+		}
+	}
+	if _, _, err := m.intentaStub([]string{"Ljava/util/Arrays;"}, "fill", "([JIIJ)V",
+		[]any{arr, int32(2), int32(1), int64(0)}, nil); err == nil {
+		t.Error("se aceptó un rango invertido")
+	}
+}

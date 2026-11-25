@@ -23,8 +23,8 @@ package main
 //     orden de emisión y numerada con `secuencia`, que es el panel de consola de la pestaña. Las
 //     escrituras de view siguen en `capturas`, que es el registro del emulador.
 //
-// Lo que NO hace: JNI, bibliotecas `.so`, multidex, `fill-array-data` y cualquier API de framework
-// fuera de los stubs. Las excepciones SÍ se ejecutan cuando las lanza el propio intérprete (un
+// Lo que NO hace: JNI, bibliotecas `.so`, multidex y cualquier API de framework fuera de los stubs.
+// Las excepciones SÍ se ejecutan cuando las lanza el propio intérprete (un
 // `throw` del dex, el `parseInt` que no parsea, una división entera por cero): se busca el handler
 // del `try_item` que cubre la unidad, se respeta el orden de sus filas y el catch-all, y si no hay
 // ninguno el error se propaga con su tipo y su mensaje. Lo que todavía no se mide: el `finally` y el
@@ -38,6 +38,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -401,6 +402,14 @@ type claseDalvik struct {
 	super     string
 	metodos   map[string]*metodoDalvik
 	estaticos map[string]any
+	// clinitEstado: 0 sin ejecutar, 1 en curso, 2 ejecutado (o sin cuerpo que ejecutar). Vive en la
+	// clase y no en la máquina porque los estáticos se comparten entre pantallas, como en el proceso
+	// de Android; el estado 1 corta la recursión cuando el propio `<clinit>` lee un estático suyo.
+	clinitEstado uint8
+	// estaticosIniciales guarda el valor que traía el dex al cargar la clase. Si una sesión ha
+	// movido un estático antes de leerlo (un hot swap que conserva el estado, por ejemplo), la clase
+	// ya está inicializada y el `<clinit>` no debe devolverlo a su valor de partida.
+	estaticosIniciales map[string]any
 }
 
 // programaDalvik es el dex cargado como programa: clases con sus métodos y sus estáticos.
@@ -428,8 +437,9 @@ func cargaPrograma(dxs ...*dexFile) (*programaDalvik, error) {
 			cl := &claseDalvik{
 				nombre:    c.name,
 				super:     c.super,
-				metodos:   map[string]*metodoDalvik{},
-				estaticos: map[string]any{},
+				metodos:            map[string]*metodoDalvik{},
+				estaticos:          map[string]any{},
+				estaticosIniciales: map[string]any{},
 			}
 			cd := datos[c.name]
 			metodos := append(append([]encodedMethod{}, cd.directs...), cd.virtuals...)
@@ -458,7 +468,10 @@ func cargaPrograma(dxs ...*dexFile) (*programaDalvik, error) {
 				if int(f.fieldIdx) >= len(d.fields) {
 					continue
 				}
-				cl.estaticos[claveCampo(d.fields[f.fieldIdx])] = valorCodificado(f.valueType, f.value)
+				clave := claveCampo(d.fields[f.fieldIdx])
+				valor := valorCodificado(f.valueType, f.value)
+				cl.estaticos[clave] = valor
+				cl.estaticosIniciales[clave] = valor
 			}
 			p.clases[c.name] = cl
 		}
@@ -3373,9 +3386,11 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 				resultado = &arregloDalvik{tipo: tipo, datos: datos}
 				hayResultado = true
 				pc += 3
-			case 0x26: // fill-array-data
-				return nil, fmt.Errorf("%s.%s usa fill-array-data y el intérprete MVP no lo ejecuta",
-					claseCorta(clase), met.nombre)
+			case 0x26: // fill-array-data (21c)
+				if err := m.rellenaDesdeArrayData(ins, pc, regs[aa]); err != nil {
+					return nil, err
+				}
+				pc += 2
 			case 0x27: // throw
 				obj, ok := regs[aa].(*objetoDalvik)
 				if !ok {
@@ -3768,6 +3783,94 @@ func (m *maquinaDalvik) saltoDeSwitch(ins []uint16, pc int, compacto bool, valor
 	return 3, nil
 }
 
+// rellenaDesdeArrayData ejecuta `fill-array-data`: lee el payload al que apunta la palabra que
+// sigue a la instrucción (desplazamiento relativo a la propia instrucción, como en los switches) y
+// escribe sus literales en el arreglo del registro. El payload lleva ident 0x0300, ancho de elemento
+// (1/2/4/8 bytes), tamaño en 32 bits y los elementos empaquetados en palabras de 16 bits en orden
+// little-endian; el ident 0x0100 es de packed-switch y 0x0200 de sparse-switch. Los anchos se
+// interpretan según el tipo del arreglo: byte y short con signo, char sin él, float y double como
+// bits IEEE y boolean como 0/1. Un payload truncado, con ancho desconocido o más largo que el
+// arreglo se rechaza antes de escribir nada, para no dejar el arreglo a medias.
+func (m *maquinaDalvik) rellenaDesdeArrayData(ins []uint16, pc int, valor any) error {
+	if pc+1 >= len(ins) {
+		return malformado("código cortado en un fill-array-data: la instrucción en la unidad %d no tiene su desplazamiento", pc)
+	}
+	base := pc + int(int16(ins[pc+1]))
+	if base < 0 || base+4 > len(ins) {
+		return malformado("el payload del fill-array-data de la unidad %d cae fuera del código de %d palabras", pc, len(ins))
+	}
+	if ins[base] != 0x0300 {
+		return malformado("un fill-array-data apunta al payload %#04x y no a 0x0300", ins[base])
+	}
+	ancho := int(ins[base+1])
+	if ancho != 1 && ancho != 2 && ancho != 4 && ancho != 8 {
+		return malformado("un fill-array-data declara un ancho de %d bytes, que no es 1, 2, 4 ni 8", ancho)
+	}
+	n := uint32(ins[base+2]) | uint32(ins[base+3])<<16
+	if n > 1<<20 {
+		return malformado("un fill-array-data declara %d elementos, por encima del límite de %d", n, 1<<20)
+	}
+	palabras := (int(n)*ancho + 1) / 2
+	if base+4+palabras > len(ins) {
+		return malformado("payload de fill-array-data truncado: declara %d elementos de %d bytes y necesita %d palabras, el cuerpo tiene %d",
+			n, ancho, palabras, len(ins))
+	}
+	arr, ok := valor.(*arregloDalvik)
+	if !ok || arr == nil {
+		return fmt.Errorf("fill-array-data sobre un registro que no es arreglo")
+	}
+	if int(n) > len(arr.datos) {
+		return fmt.Errorf("fill-array-data con %d elementos sobre un arreglo de %d", n, len(arr.datos))
+	}
+	// Los elementos se empaquetan en palabras: dos bytes por palabra cuando el ancho es 1. Se
+	// desempaqueta primero a bytes para que las cuatro anchuras compartan la misma lectura.
+	crudos := make([]byte, 2*palabras)
+	for i := 0; i < palabras; i++ {
+		crudos[2*i] = byte(ins[base+4+i])
+		crudos[2*i+1] = byte(ins[base+4+i] >> 8)
+	}
+	for i := 0; i < int(n); i++ {
+		var bits uint64
+		for k := 0; k < ancho; k++ {
+			bits |= uint64(crudos[i*ancho+k]) << (8 * k)
+		}
+		arr.datos[i] = valorDeArrayData(arr.tipo, ancho, bits)
+	}
+	return nil
+}
+
+// valorDeArrayData convierte los bits leídos del payload al valor que el intérprete guarda en el
+// arreglo, con el mismo tipo que usan `aget` y `aput` para esa clase de arreglo.
+func valorDeArrayData(tipo string, ancho int, bits uint64) any {
+	switch ancho {
+	case 1:
+		b := byte(bits)
+		if tipo == "[Z" {
+			if b != 0 {
+				return int32(1)
+			}
+			return int32(0)
+		}
+		return int32(int8(b))
+	case 2:
+		if tipo == "[C" {
+			return int32(uint16(bits))
+		}
+		return int32(int16(uint16(bits)))
+	case 4:
+		if tipo == "[F" {
+			return math.Float32frombits(uint32(bits))
+		}
+		return int32(uint32(bits))
+	case 8:
+		if tipo == "[D" {
+			return math.Float64frombits(bits)
+		}
+		return int64(bits)
+	}
+	return nil
+}
+
 // esDe responde a `instance-of` subiendo por la jerarquía del dex.
 func (m *maquinaDalvik) esDe(obj *objetoDalvik, tipo string) bool {
 	clase := obj.clase
@@ -3813,13 +3916,48 @@ func (m *maquinaDalvik) leeCampo(d *dexFile, idx uint32, receptor any, estatico 
 	return valorCero(f.typeOf), nil
 }
 
+// inicializaClase ejecuta el `<clinit>` de una clase la primera vez que se toca uno de sus
+// estáticos. En Dalvik el virtual machine lo hace al inicializar la clase; aquí no hay carga de
+// clase y, sin esto, los campos que el `<clinit>` llena se leen a cero: `ScatterMapKt.EmptyGroup`
+// y `ContainerHelpersKt.EMPTY_OBJECTS` quedan nulos y `aget` sobre ellos tumba la app. El estado
+// se marca antes de ejecutar para que una lectura dentro del propio `<clinit>` no vuelva a entrar.
+func (m *maquinaDalvik) inicializaClase(cl *claseDalvik) {
+	if cl == nil || cl.clinitEstado != 0 {
+		return
+	}
+	met := cl.metodos["<clinit>()V"]
+	if met == nil || met.item == nil {
+		cl.clinitEstado = 2
+		return
+	}
+	cl.clinitEstado = 1
+	if _, err := m.ejecutaCuerpo(cl.nombre, met, nil, nil); err != nil {
+		// Un `<clinit>` puede llamar a framework que el intérprete no emula. Se avisa y se sigue con
+		// lo que el cuerpo haya dejado escrito: inventar el valor del campo sería peor que leerlo
+		// a cero, y repetir la ejecución en cada lectura no acercaría al estado real.
+		m.avisa("el <clinit> de %s falló: %v; se sigue con los estáticos que dejó",
+			claseCorta(cl.nombre), err)
+	}
+	cl.clinitEstado = 2
+}
+
 func (m *maquinaDalvik) leeEstatico(f dexField) (any, error) {
 	// `System.out` y `System.err` son el destino de println; se representan como el flujo que son
 	if f.owner == "Ljava/lang/System;" && (f.name == "out" || f.name == "err") {
 		return &objetoDalvik{clase: "Ljava/io/PrintStream;", campos: map[string]any{}}, nil
 	}
 	if cl, ok := m.prog.clases[f.owner]; ok {
-		if v, ok := cl.estaticos[claveCampo(f)]; ok {
+		clave := claveCampo(f)
+		if v, hay := cl.estaticos[clave]; hay && cl.clinitEstado == 0 {
+			inicial, conocido := cl.estaticosIniciales[clave]
+			if !conocido || !reflect.DeepEqual(v, inicial) {
+				// la sesión ya movió este estático: la clase está inicializada y el `<clinit>` no
+				// puede devolverlo al valor con el que salió del dex.
+				cl.clinitEstado = 2
+			}
+		}
+		m.inicializaClase(cl)
+		if v, ok := cl.estaticos[clave]; ok {
 			return v, nil
 		}
 	}
@@ -4181,6 +4319,67 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	sinRed := func() { m.avisa("red-sin-peticion: %s", nombre) }
 
 	switch nombre {
+	case "numberOfLeadingZeros":
+		// `Integer.numberOfLeadingZeros` es una función pura del entero: la cuenta de ceros a la
+		// izquierda. `androidx.collection` la llama al calcular capacidades, dentro del `<clinit>`
+		// que ya se ejecuta; devolver cero aquí falsearía esa cuenta sin ninguna medición detrás.
+		if proto == "(I)I" && len(vals) == 1 && es("Ljava/lang/Integer;") {
+			v, err := aInt32(vals[0])
+			if err != nil {
+				return nil, true, err
+			}
+			cuenta := int32(0)
+			for x := uint32(v); x != 0; x >>= 1 {
+				cuenta++
+			}
+			return int32(32) - cuenta, true, nil
+		}
+	case "fill":
+		// `Arrays.fill(long[], desde, hasta, valor)` escribe el valor dado en ese rango. Sin él,
+		// `MutableScatterMap.initializeMetadata` deja los huecos del arreglo vacíos y el `<clinit>`
+		// que ya corre se cae antes de llegar al código de la app.
+		if proto == "([JIIJ)V" && len(vals) == 4 && es("Ljava/util/Arrays;") {
+			arr, ok := vals[0].(*arregloDalvik)
+			if !ok || arr == nil {
+				return nil, true, fmt.Errorf("Arrays.fill sobre un registro que no es arreglo")
+			}
+			desde, err := aInt32(vals[1])
+			if err != nil {
+				return nil, true, err
+			}
+			hasta, err := aInt32(vals[2])
+			if err != nil {
+				return nil, true, err
+			}
+			v, err := aInt64(vals[3])
+			if err != nil {
+				return nil, true, err
+			}
+			if desde < 0 || hasta > int32(len(arr.datos)) || desde > hasta {
+				return nil, true, fmt.Errorf("Arrays.fill con el rango [%d, %d) sobre un arreglo de %d",
+					desde, hasta, len(arr.datos))
+			}
+			for i := int(desde); i < int(hasta); i++ {
+				arr.datos[i] = v
+			}
+			return nil, true, nil
+		}
+	case "max":
+		// `Math.max(int, int)` también es puro: solo dos comparaciones de los argumentos reales.
+		if proto == "(II)I" && len(vals) == 2 && es("Ljava/lang/Math;") {
+			a, err := aInt32(vals[0])
+			if err != nil {
+				return nil, true, err
+			}
+			b, err := aInt32(vals[1])
+			if err != nil {
+				return nil, true, err
+			}
+			if a > b {
+				return a, true, nil
+			}
+			return b, true, nil
+		}
 	case "getMainLooper":
 		// `Looper.getMainLooper()` es estático y devuelve siempre el mismo objeto: el Handler que
 		// se construye con él solo necesita una referencia no nula para existir.
