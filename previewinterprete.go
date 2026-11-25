@@ -604,6 +604,11 @@ type maquinaDalvik struct {
 	// reloj es el tiempo lógico de la app, compartido por todas las pantallas: no hay hilos ni reloj
 	// de pared, y solo el guion (`--avanzar N`) lo mueve
 	reloj *int64
+	// hiloPrincipal es el único Thread de la vista previa. `Thread.currentThread()` y
+	// `Looper.getThread()` tienen que devolver LA MISMA instancia: AndroidX comprueba la identidad
+	// en `enforceMainThreadIfNeeded` y con dos objetos distintos lanza «must be called on the main
+	// thread» (medido en newpipe y libre memory game).
+	hiloPrincipal *objetoDalvik
 	// cola son las tareas diferidas que esta pantalla posteó. Al cubrir una actividad sus tareas
 	// dejan de correr, como el Handler de una pantalla que ya no está delante.
 	cola []tareaReloj
@@ -4061,6 +4066,18 @@ func cadenaObjeto(s string) *objetoDalvik {
 	return &objetoDalvik{clase: "Ljava/lang/String;", campos: map[string]any{}, texto: s}
 }
 
+// hiloPrincipalSintetico devuelve el único Thread de la vista previa, creado la primera vez que se
+// pide. Se guarda en la máquina para que `currentThread()` y `Looper.getThread()` den la misma
+// referencia, igual que en el framework: AndroidX decide si está en el hilo principal comparando
+// los dos objetos por identidad, no por su nombre.
+func (m *maquinaDalvik) hiloPrincipalSintetico() *objetoDalvik {
+	if m.hiloPrincipal == nil {
+		m.hiloPrincipal = &objetoDalvik{clase: "Ljava/lang/Thread;",
+			campos: map[string]any{"thread.nombre": "main"}}
+	}
+	return m.hiloPrincipal
+}
+
 // stubsFrameworkActivos es un interruptor de prueba: a false simula el emulador anterior a estos
 // stubs, para que la falsificación pueda reproducir el error del ejecutor nulo. En producción vale
 // siempre true; ninguna orden del preview lo cambia.
@@ -4073,7 +4090,9 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	if !stubsFrameworkActivos {
 		switch nombre {
 		case "getMainLooper", "getPackageManager", "getApplicationContext",
-			"getInstalledPackages", "newSingleThreadExecutor", "setView", "setCancelable",
+			"getInstalledPackages", "newSingleThreadExecutor", "newFixedThreadPool",
+			"currentThread", "getThread", "getStackTrace", "uptimeMillis",
+			"getObserverConstructorType", "setView", "setCancelable",
 			"checkSelfPermission", "invalidate":
 			return nil, false, nil
 		}
@@ -4168,6 +4187,43 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && es("Landroid/os/Looper;") {
 			return &objetoDalvik{clase: "Landroid/os/Looper;", campos: map[string]any{}}, true, nil
 		}
+	case "currentThread":
+		// `Thread.currentThread()` es estático y devuelve el hilo que ejecuta la app. La vista
+		// previa no tiene hilos reales, pero AndroidX encadena `getStackTrace()` sobre él para
+		// construir el mensaje de un parámetro nulo: un hilo sintético con nombre propio basta
+		// para que esa cadena no reciba el cero (medido en libre memory game).
+		if len(vals) == 0 && es("Ljava/lang/Thread;") {
+			return m.hiloPrincipalSintetico(), true, nil
+		}
+	case "getThread":
+		// `Looper.getThread()` devuelve el hilo dueño del looper. El de la vista previa es el mismo
+		// hilo sintético que `currentThread()`, para que la app pueda compararlos por identidad.
+		if len(vals) == 0 && obj != nil && es("Landroid/os/Looper;") {
+			return m.hiloPrincipalSintetico(), true, nil
+		}
+	case "getStackTrace":
+		// `Thread.getStackTrace()` y `Throwable.getStackTrace()` entregan un arreglo de
+		// StackTraceElement. Kotlin lee la primera casilla para formar el mensaje de un parámetro
+		// nulo, así que hace falta un elemento sintético: con el arreglo vacío la app caía en
+		// «aget con el índice 0 fuera del arreglo de 0». Inventar la traza real no es posible, pero
+		// sí dar una casilla no nula con el nombre del hilo.
+		if len(vals) == 0 && obj != nil && (es("Ljava/lang/Thread;") || esThrowableObj()) {
+			return &arregloDalvik{tipo: "[Ljava/lang/StackTraceElement;", datos: []any{
+				&objetoDalvik{clase: "Ljava/lang/StackTraceElement;", campos: map[string]any{}},
+			}}, true, nil
+		}
+	case "uptimeMillis":
+		// `SystemClock.uptimeMillis()` alimenta los relojes lógicos de la app. Se responde con el
+		// reloj del modelo, que es determinista, en vez del cero: el cero hacía que ciertos cálculos
+		// de temporización tomaran la rama de «ya venció» antes de tiempo (medido en libre memory
+		// game y newpipe).
+		if len(vals) == 0 && es("Landroid/os/SystemClock;") {
+			var t int64
+			if m.reloj != nil {
+				t = *m.reloj
+			}
+			return t, true, nil
+		}
 	case "getPackageName":
 		// el nombre del paquete sale de resources.arsc, que es la misma tabla con la que se
 		// resolvieron los id del layout. Sin tabla no hay nombre que inventar: se devuelve una
@@ -4230,11 +4286,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return &objetoDalvik{clase: "Ljava/util/ArrayList;", campos: map[string]any{},
 				lista: []any{}}, true, nil
 		}
-	case "newSingleThreadExecutor", "newCachedThreadPool":
+	case "newSingleThreadExecutor", "newCachedThreadPool", "newFixedThreadPool":
 		// los ejecutores del framework: un objeto con identidad sobre el que `execute` encola el
 		// Runnable. No hay hilos reales, pero la cola lógica da el mismo orden y es determinista;
-		// el tamaño del pool no cambia ese orden, así que ambos se modelan igual.
-		if len(vals) == 0 && es("Ljava/util/concurrent/Executors;") {
+		// el tamaño del pool no cambia ese orden, así que los tres se modelan igual. `newFixed`
+		// recibe el número de hilos (y, a veces, una fábrica), mientras que los otros dos no
+		// reciben ningún argumento: por eso el mínimo depende del nombre.
+		minArgs := 0
+		if nombre == "newFixedThreadPool" {
+			minArgs = 1
+		}
+		if len(vals) >= minArgs && es("Ljava/util/concurrent/Executors;") {
 			return &objetoDalvik{clase: "Ljava/util/concurrent/ExecutorService;",
 				campos: map[string]any{}}, true, nil
 		}
@@ -5263,6 +5325,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && obj != nil && es("Landroid/app/AlertDialog$Builder;") {
 			return creaDialogo(obj), true, nil
 		}
+		// `SavedStateRegistryController$Companion.create(owner)` es la fábrica de Kotlin que
+		// ComponentActivity usa en su constructor. Sin este stub devolvía el cero y la actividad
+		// seguía con un controlador nulo hasta reventar al registrar su observador (medido en
+		// libre memory game). El owner se guarda para que el controlador pueda devolverlo. Kotlin
+		// emite el `create` del Companion como estático, así que NO se exige receptor: se decide
+		// por la clase declarada en el invoke, que `candidatos` siempre trae.
+		if len(vals) == 1 &&
+			es("Landroidx/savedstate/SavedStateRegistryController$Companion;") {
+			return &objetoDalvik{clase: "Landroidx/savedstate/SavedStateRegistryController;",
+				campos: map[string]any{"savedstate.owner": vals[0]}}, true, nil
+		}
 	case "show":
 		// `show()` sobre el builder crea el diálogo y lo pone delante; sobre un Toast deja su línea
 		// de consola y el aviso efímero; sobre un diálogo ya creado solo lo apila.
@@ -5321,6 +5394,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"Ljava/lang/Class;.$tipo": obj.clase,
 			}}, true, nil
 		}
+	case "getObserverConstructorType":
+		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
+		// lifecycle: 1 es el constructor por reflexión en AndroidX. La app solo usa el entero para
+		// elegir una rama, así que devolver ese tipo evita que siga llamando a `getClass()` sobre
+		// un observador que la vista previa no puede construir (medido en newpipe).
+		if len(vals) == 1 && es("Landroidx/lifecycle/Lifecycling;") {
+			return int32(1), true, nil
+		}
 	case "getPackage":
 		// el Package de una clase: lleva el nombre del paquete del descriptor, para que el
 		// `getName()` que la reflexión ligera de las apps hace a continuación no reciba el cero.
@@ -5343,6 +5424,15 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// caían un paso más adelante (medido en NewPipe: `HashMap.get` sobre un objeto nulo).
 		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") {
 			tipo := claseDeLiteral(obj)
+			// un Class sintético puede llegar sin el campo `$tipo` (por ejemplo, cuando la app
+			// lo recibe de otra biblioteca): se cae a su propio descriptor para que el nombre
+			// nunca sea una cadena vacía, que era lo que hacía caer el siguiente `HashMap.get`.
+			if tipo == "" {
+				tipo, _ = obj.campos["Ljava/lang/Class;.$tipo"].(string)
+			}
+			if tipo == "" {
+				tipo = obj.clase
+			}
 			nombre := strings.TrimSuffix(strings.TrimPrefix(tipo, "L"), ";")
 			nombre = strings.ReplaceAll(nombre, "/", ".")
 			return cadenaObjeto(nombre), true, nil

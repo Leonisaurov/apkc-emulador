@@ -682,3 +682,87 @@ func TestRedSinPeticionSinImportesDeRed(t *testing.T) {
 		}
 	}
 }
+
+// TestLifecycleDelCompanionAlObservador recorre los tres stubs que destaparon las dos APK reales:
+// el Companion crea un controlador no nulo, Lifecycling elige el constructor por reflexión y el
+// nombre canónico de un Class sin descriptor cae a su propia clase. Antes, el cero del primero
+// llegaba como observador nulo a `LifecycleRegistry.addObserver` y reventaba en el `getClass()`
+// de `Lifecycling.getObserverConstructorType`.
+func TestLifecycleDelCompanionAlObservador(t *testing.T) {
+	m := maquinaDeStubs()
+	owner := objDe("Lorg/schabi/newpipe/MainActivity;")
+	companion := objDe("Landroidx/savedstate/SavedStateRegistryController$Companion;")
+
+	controlador, ok, err := m.intentaStub(
+		[]string{"Landroidx/savedstate/SavedStateRegistryController$Companion;"},
+		"create",
+		"(Landroidx/savedstate/SavedStateRegistryOwner;)Landroidx/savedstate/SavedStateRegistryController;",
+		[]any{owner}, companion)
+	if err != nil || !ok {
+		t.Fatalf("create del Companion: ok=%v err=%v", ok, err)
+	}
+	c := esperaObjetoDeStub(t, controlador,
+		"Landroidx/savedstate/SavedStateRegistryController;")
+	if c.campos["savedstate.owner"] != owner {
+		t.Error("el controlador no guardó el owner que recibió en create")
+	}
+	// Kotlin emite el `create` del Companion como estático: sin receptor también tiene que casa.
+	estatico, ok, err := m.intentaStub(
+		[]string{"Landroidx/savedstate/SavedStateRegistryController$Companion;"},
+		"create",
+		"(Landroidx/savedstate/SavedStateRegistryOwner;)Landroidx/savedstate/SavedStateRegistryController;",
+		[]any{owner}, nil)
+	if err != nil || !ok {
+		t.Fatalf("create estático del Companion: ok=%v err=%v", ok, err)
+	}
+	esperaObjetoDeStub(t, estatico, "Landroidx/savedstate/SavedStateRegistryController;")
+
+	tipo, ok, err := m.intentaStub([]string{"Landroidx/lifecycle/Lifecycling;"},
+		"getObserverConstructorType", "(Ljava/lang/Object;)I", []any{owner}, nil)
+	if err != nil || !ok {
+		t.Fatalf("getObserverConstructorType: ok=%v err=%v", ok, err)
+	}
+	if tipo != int32(1) {
+		t.Errorf("getObserverConstructorType devolvió %v y se esperaba 1 (reflexión)", tipo)
+	}
+
+	// un Class sin el campo `$tipo` no debe dejar una cadena vacía: eso era lo que hacía caer el
+	// `HashMap.get` siguiente en NewPipe.
+	clase := objDe("Ljava/lang/Class;")
+	nombre, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "getCanonicalName",
+		"()Ljava/lang/String;", nil, clase)
+	if err != nil || !ok {
+		t.Fatalf("getCanonicalName: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, nombre, "java.lang.Class")
+
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("la cadena de lifecycle cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestLifecycleElPoolFijoDevuelveUnEjecutor añade `newFixedThreadPool` a la familia de ejecutores:
+// recibe argumentos (a diferencia de los otros dos) y por eso la condición de aridad tuvo que
+// ampliarse. Sin esto, NewPipe y Libre Memory Game seguían con un ExecutorService nulo.
+func TestLifecycleElPoolFijoDevuelveUnEjecutor(t *testing.T) {
+	m := maquinaDeStubs()
+	fabrica := objDe("Ljava/util/concurrent/ThreadFactory;")
+	for _, c := range []struct {
+		proto string
+		vals  []any
+	}{
+		{"(I)Ljava/util/concurrent/ExecutorService;", []any{int32(4)}},
+		{"(ILjava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
+			[]any{int32(4), fabrica}},
+	} {
+		v, ok, err := m.intentaStub([]string{"Ljava/util/concurrent/Executors;"},
+			"newFixedThreadPool", c.proto, c.vals, nil)
+		if err != nil || !ok {
+			t.Fatalf("newFixedThreadPool%s: ok=%v err=%v", c.proto, ok, err)
+		}
+		esperaObjetoDeStub(t, v, "Ljava/util/concurrent/ExecutorService;")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("newFixedThreadPool cayó en el aviso de stub ausente: %s", avisos)
+	}
+}

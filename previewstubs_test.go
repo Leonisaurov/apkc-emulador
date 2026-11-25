@@ -27,6 +27,94 @@ func sinAvisoDeStub(t *testing.T, m *modeloVista) {
 	}
 }
 
+// TestHilosSinteticosDelPreview comprueba la cadena que paraba a Libre Memory Game: el guardián de
+// receptor nulo corta antes de cualquier stub, así que `currentThread()` tiene que devolver un
+// Thread no nulo sobre el que `getStackTrace()` pueda responderse. `Looper.getThread()` lleva al
+// mismo hilo sintético y `uptimeMillis()` lee el reloj lógico en vez del cero.
+func TestHilosSinteticosDelPreview(t *testing.T) {
+	m := maquinaDeStubs()
+	hilo, ok, err := m.intentaStub([]string{"Ljava/lang/Thread;"},
+		"currentThread", "()Ljava/lang/Thread;", nil, nil)
+	if err != nil || !ok {
+		t.Fatalf("currentThread: ok=%v err=%v", ok, err)
+	}
+	esperaObjetoDeStub(t, hilo, "Ljava/lang/Thread;")
+
+	traza, ok, err := m.intentaStub([]string{"Ljava/lang/Thread;"},
+		"getStackTrace", "()[Ljava/lang/StackTraceElement;", nil, hilo)
+	if err != nil || !ok {
+		t.Fatalf("getStackTrace: ok=%v err=%v", ok, err)
+	}
+	arreglo, esArreglo := traza.(*arregloDalvik)
+	if !esArreglo || arreglo == nil {
+		t.Fatalf("getStackTrace devolvió %T y se esperaba un arreglo no nulo", traza)
+	}
+	if arreglo.tipo != "[Ljava/lang/StackTraceElement;" {
+		t.Errorf("el arreglo es de %s y se esperaba [Ljava/lang/StackTraceElement;", arreglo.tipo)
+	}
+	// Kotlin lee la primera casilla para formar el mensaje de un parámetro nulo, así que el arreglo
+	// no puede estar vacío: con cero casillas la app caía en «aget con el índice 0 fuera del arreglo».
+	if len(arreglo.datos) != 1 {
+		t.Fatalf("la traza sintética tiene %d elementos y se esperaba 1", len(arreglo.datos))
+	}
+	if elemento, ok := arreglo.datos[0].(*objetoDalvik); !ok || elemento == nil ||
+		elemento.clase != "Ljava/lang/StackTraceElement;" {
+		t.Errorf("la primera casilla es %T y se esperaba un StackTraceElement", arreglo.datos[0])
+	}
+
+	looper := objDe("Landroid/os/Looper;")
+	delLooper, ok, err := m.intentaStub([]string{"Landroid/os/Looper;"},
+		"getThread", "()Ljava/lang/Thread;", nil, looper)
+	if err != nil || !ok {
+		t.Fatalf("getThread: ok=%v err=%v", ok, err)
+	}
+	esperaObjetoDeStub(t, delLooper, "Ljava/lang/Thread;")
+	if delLooper != hilo {
+		t.Error("getThread devolvió un hilo distinto de currentThread: AndroidX lo tomaría por otro hilo")
+	}
+	otroHilo, ok, err := m.intentaStub([]string{"Ljava/lang/Thread;"},
+		"currentThread", "()Ljava/lang/Thread;", nil, nil)
+	if err != nil || !ok || otroHilo != hilo {
+		t.Error("currentThread no devolvió siempre la misma referencia")
+	}
+
+	reloj := int64(1234)
+	m.reloj = &reloj
+	u, ok, err := m.intentaStub([]string{"Landroid/os/SystemClock;"},
+		"uptimeMillis", "()J", nil, nil)
+	if err != nil || !ok {
+		t.Fatalf("uptimeMillis: ok=%v err=%v", ok, err)
+	}
+	if u != reloj {
+		t.Errorf("uptimeMillis devolvió %v y se esperaba el reloj %d", u, reloj)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("algún hilo cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestHilosElGuardianSigueCortandoAntesDelStub: los stubs nuevos no pueden servir para saltarse el
+// guardián de receptor nulo. Con `currentThread()` apagado, el cero llega a `getStackTrace()` y el
+// error sigue siendo el de siempre, no una traza inventada.
+func TestHilosElGuardianSigueCortandoAntesDelStub(t *testing.T) {
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Ljava/lang/Thread;", name: "getStackTrace",
+		proto: dexProto{returnType: "[Ljava/lang/StackTraceElement;"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "")
+	if err == nil {
+		t.Fatal("getStackTrace con receptor nulo no devolvió error")
+	}
+	if !strings.Contains(err.Error(), "se llamó a java.lang.Thread.getStackTrace sobre un objeto nulo") {
+		t.Errorf("el error fue %q y se esperaba el del guardián de receptor nulo", err)
+	}
+}
+
 // mismaEjecucion reejecuta el guion y exige el mismo JSON: el reloj lógico y el estado de los stubs
 // no pueden depender de nada de fuera del guion.
 func mismaEjecucion(t *testing.T, apk []byte, eventos []eventoUsuario) {
