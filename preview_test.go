@@ -797,6 +797,80 @@ func TestListFilesFiltraPorExtension(t *testing.T) {
 	}
 }
 
+// TestListFilesMimeTypeMapNoPierdeLaFilaDelFichero fija el eslabón que la rom del gestor dejó al
+// descubierto: la app consulta el tipo MIME del fichero antes de crear su fila. Sin el singleton de
+// MimeTypeMap, el receptor nulo tira la fila de leeme.txt y solo aparece la carpeta fotos.
+func TestListFilesMimeTypeMapNoPierdeLaFilaDelFichero(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	singleton, ok, err := m.intentaStub([]string{"Landroid/webkit/MimeTypeMap;"},
+		"getSingleton", "()Landroid/webkit/MimeTypeMap;", nil, nil)
+	if err != nil || !ok {
+		t.Fatalf("getSingleton: ok=%v err=%v", ok, err)
+	}
+	mapa, esMapa := singleton.(*objetoDalvik)
+	if !esMapa || mapa.clase != "Landroid/webkit/MimeTypeMap;" {
+		t.Fatalf("getSingleton devolvió %T, se esperaba un MimeTypeMap", singleton)
+	}
+	for extension, esperado := range map[string]string{"txt": "text/plain", "png": "image/png"} {
+		v, ok, err := m.intentaStub([]string{"Landroid/webkit/MimeTypeMap;"},
+			"getMimeTypeFromExtension", "(Ljava/lang/String;)Ljava/lang/String;",
+			[]any{cadenaObjeto(extension)}, mapa)
+		if err != nil || !ok {
+			t.Fatalf("getMimeTypeFromExtension(%s): ok=%v err=%v", extension, ok, err)
+		}
+		if obtenido := textoDe(v); obtenido != esperado {
+			t.Errorf("getMimeTypeFromExtension(%s) dio %q y se esperaba %q", extension, obtenido, esperado)
+		}
+	}
+	// una extensión desconocida devuelve null, no un texto inventado: la app aplica su comodín.
+	v, ok, err := m.intentaStub([]string{"Landroid/webkit/MimeTypeMap;"},
+		"getMimeTypeFromExtension", "(Ljava/lang/String;)Ljava/lang/String;",
+		[]any{cadenaObjeto("eeme.txt")}, mapa)
+	if err != nil || !ok {
+		t.Fatalf("getMimeTypeFromExtension(desconocida): ok=%v err=%v", ok, err)
+	}
+	if v != nil {
+		t.Errorf("una extensión desconocida dio %v y se esperaba null", v)
+	}
+}
+
+// TestListFilesSplitDelMimeSinPerderLaFila fija el segundo eslabón del render: el gestor parte el
+// MIME por «/» para decidir el icono. Sin split, el arreglo nulo hacía fracasar el aget-object y la
+// fila del fichero regular desaparecía aunque listFiles lo hubiera entregado.
+func TestListFilesSplitDelMimeSinPerderLaFila(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	casos := []struct {
+		cadena string
+		regex  string
+		partes []string
+	}{
+		{"text/plain", "/", []string{"text", "plain"}},
+		{"application/octet-stream", "/", []string{"application", "octet-stream"}},
+		{"text/plain/", "/", []string{"text", "plain"}},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "split",
+			"(Ljava/lang/String;)[Ljava/lang/String;",
+			[]any{cadenaObjeto(caso.regex)}, cadenaObjeto(caso.cadena))
+		if err != nil || !ok {
+			t.Fatalf("split(%q, %q): ok=%v err=%v", caso.cadena, caso.regex, ok, err)
+		}
+		arreglo, esArreglo := v.(*arregloDalvik)
+		if !esArreglo || arreglo.tipo != "[Ljava/lang/String;" {
+			t.Fatalf("split devolvió %T y se esperaba [Ljava/lang/String;", v)
+		}
+		if len(arreglo.datos) != len(caso.partes) {
+			t.Errorf("split(%q) dio %d partes y se esperaban %d", caso.cadena, len(arreglo.datos), len(caso.partes))
+			continue
+		}
+		for i, parte := range caso.partes {
+			if obtenido := textoDe(arreglo.datos[i]); obtenido != parte {
+				t.Errorf("split(%q)[%d] dio %q y se esperaba %q", caso.cadena, i, obtenido, parte)
+			}
+		}
+	}
+}
+
 // maquinaContenedorConOyente arma un contenedor con dos botones añadidos por código, sin id, y un
 // único OnClickListener registrado sobre el segundo. El cuerpo del onClick escribe una cadena fija en
 // la vista que recibe, para poder comprobar qué hijo se llevó el clic sin inventar un modelo.

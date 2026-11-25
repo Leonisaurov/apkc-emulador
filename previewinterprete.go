@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +64,19 @@ const (
 	// tarea ejecutada, porque publicar una hora que no corrió sería mentir.
 	tareasMaximas = 100000
 )
+
+// mimePorExtension es el subconjunto de la tabla de Android que una app consulta al decidir el
+// icono de un fichero regular. Una extensión fuera de la tabla no se inventa: el framework devuelve
+// null y la app aplica su propio comodín.
+var mimePorExtension = map[string]string{
+	"txt": "text/plain", "html": "text/html", "htm": "text/html", "css": "text/css",
+	"csv": "text/csv", "json": "application/json", "xml": "application/xml",
+	"pdf": "application/pdf", "zip": "application/zip",
+	"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+	"bmp": "image/bmp", "webp": "image/webp",
+	"mp3": "audio/mpeg", "ogg": "audio/ogg", "wav": "audio/x-wav",
+	"mp4": "video/mp4", "webm": "video/webm",
+}
 
 // eventoUsuario es una orden de entrada del guion —un clic, un texto tecleado, una marca o un
 // avance del reloj lógico— con el nombre del flag que la pidió. Se entregan en el orden de la línea
@@ -5016,6 +5030,24 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && es("Landroid/os/Looper;") {
 			return &objetoDalvik{clase: "Landroid/os/Looper;", campos: map[string]any{}}, true, nil
 		}
+	case "getSingleton":
+		// `MimeTypeMap.getSingleton()` entrega la instancia del framework. Sin ella el
+		// `getMimeTypeFromExtension` siguiente cae en un receptor nulo y la fila del fichero
+		// regular se pierde antes de addView: el gestor de archivos enseñaba las carpetas, pero no
+		// leeme.txt (medido en el APK real de la ROM).
+		if len(vals) == 0 && es("Landroid/webkit/MimeTypeMap;") {
+			return &objetoDalvik{clase: "Landroid/webkit/MimeTypeMap;", campos: map[string]any{}}, true, nil
+		}
+	case "getMimeTypeFromExtension":
+		// La extensión se resuelve contra la tabla de Android; una desconocida devuelve null, como
+		// el framework, y es la app la que elige su tipo comodín. El texto de la fila no se toca:
+		// sigue viniendo de `File.getName()`.
+		if len(vals) == 1 && obj != nil && es("Landroid/webkit/MimeTypeMap;") {
+			if mime, ok := mimePorExtension[strings.ToLower(textoDe(vals[0]))]; ok {
+				return cadenaObjeto(mime), true, nil
+			}
+			return nil, true, nil
+		}
 	case "currentThread":
 		// `Thread.currentThread()` es estático y devuelve el hilo que ejecuta la app. La vista
 		// previa no tiene hilos reales, pero AndroidX encadena `getStackTrace()` sobre él para
@@ -7205,6 +7237,36 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return n, true, nil
 			}
 			return int32(n), true, nil
+		}
+	case "split":
+		// `String.split` parte por una expresión regular y descarta los huecos vacíos del final,
+		// como el JDK con límite cero. Sin este stub el MIME del fichero (`text/plain`) llegaba
+		// como null al `aget-object` siguiente y la fila del fichero regular no se añadía.
+		if len(vals) == 1 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
+			s, ok := cadenaDe(receptor)
+			if !ok {
+				return nil, true, fmt.Errorf("split sobre un receptor que no es una cadena")
+			}
+			patron := textoDe(vals[0])
+			re, err := regexp.Compile(patron)
+			if err != nil {
+				return nil, true, fmt.Errorf("split con el patrón %q: %w", patron, err)
+			}
+			partes := []string{}
+			inicio := 0
+			for _, hueco := range re.FindAllStringIndex(s, -1) {
+				partes = append(partes, s[inicio:hueco[0]])
+				inicio = hueco[1]
+			}
+			partes = append(partes, s[inicio:])
+			for len(partes) > 1 && partes[len(partes)-1] == "" {
+				partes = partes[:len(partes)-1]
+			}
+			datos := make([]any, 0, len(partes))
+			for _, parte := range partes {
+				datos = append(datos, cadenaObjeto(parte))
+			}
+			return &arregloDalvik{tipo: "[Ljava/lang/String;", datos: datos}, true, nil
 		}
 	case "substring":
 		// `String.substring` cuenta unidades de 16 bits, igual que `length` y `charAt`, y devuelve
