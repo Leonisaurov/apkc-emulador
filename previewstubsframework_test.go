@@ -1681,6 +1681,94 @@ func TestPropertiesConClavesDeclaradasSonDeterministas(t *testing.T) {
 	}
 }
 
+// TestSetEntrySetDePropertiesTermux falsifica la frontera de `TerminalColorScheme.updateWith`:
+// Termux recorre `Properties.entrySet()` con `Set.iterator()`, y el cero del stub ausente llegaba
+// como receptor nulo. El conjunto tiene que existir aunque no haya propiedades, y con claves
+// declaradas debe entregar las entradas en el orden determinista de `clavesDelMapa`.
+func TestSetEntrySetDePropertiesTermux(t *testing.T) {
+	m := maquinaDeStubs()
+	props := objDe("Ljava/util/Properties;")
+
+	entradas, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"},
+		"entrySet", "()Ljava/util/Set;", nil, props)
+	if err != nil || !ok || entradas == nil {
+		t.Fatalf("entrySet del Properties vacío: v=%v ok=%v err=%v", entradas, ok, err)
+	}
+	conjunto := esperaObjetoDeStub(t, entradas, "Ljava/util/Set;")
+	if conjunto.conjunto == nil || len(conjunto.conjunto) != 0 {
+		t.Fatalf("el conjunto vacío es %v", conjunto.conjunto)
+	}
+	it, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, conjunto)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator del conjunto vacío: v=%v ok=%v err=%v", it, ok, err)
+	}
+	hasNext, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok || hasNext != int32(0) {
+		t.Fatalf("hasNext del conjunto vacío: v=%v ok=%v err=%v", hasNext, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Fatalf("entrySet cayó en el aviso de stub ausente: %s", avisos)
+	}
+
+	// con propiedades declaradas, cada entrada lleva la clave y el valor que la app escribió, en
+	// orden alfabético, y el cursor del Set recorre exactamente esas entradas.
+	for _, d := range []struct{ clave, valor string }{
+		{"cursor", "rojo"}, {"foreground", "blanco"}, {"background", "negro"},
+	} {
+		if _, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "setProperty",
+			"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+			[]any{cadenaObjeto(d.clave), cadenaObjeto(d.valor)}, props); err != nil || !ok {
+			t.Fatalf("setProperty(%q): ok=%v err=%v", d.clave, ok, err)
+		}
+	}
+	entradas, ok, err = m.intentaStub([]string{"Ljava/util/Properties;"},
+		"entrySet", "()Ljava/util/Set;", nil, props)
+	if err != nil || !ok || entradas == nil {
+		t.Fatalf("entrySet con propiedades: v=%v ok=%v err=%v", entradas, ok, err)
+	}
+	conjunto = esperaObjetoDeStub(t, entradas, "Ljava/util/Set;")
+	if len(conjunto.conjunto) != 3 {
+		t.Fatalf("el conjunto tiene %d entradas y se esperaban 3", len(conjunto.conjunto))
+	}
+	it, ok, err = m.intentaStub([]string{"Ljava/util/Set;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, conjunto)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator con propiedades: v=%v ok=%v err=%v", it, ok, err)
+	}
+	esperadas := []struct{ clave, valor string }{
+		{"background", "negro"}, {"cursor", "rojo"}, {"foreground", "blanco"},
+	}
+	for i, esperada := range esperadas {
+		hasNext, ok, err = m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+		if err != nil || !ok || hasNext != int32(1) {
+			t.Fatalf("hasNext %d: v=%v ok=%v err=%v", i, hasNext, ok, err)
+		}
+		entrada, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "next",
+			"()Ljava/lang/Object;", nil, it)
+		if err != nil || !ok {
+			t.Fatalf("next %d: ok=%v err=%v", i, ok, err)
+		}
+		par := esperaObjetoDeStub(t, entrada, "Ljava/util/Map$Entry;")
+		clave, ok, err := m.intentaStub([]string{"Ljava/util/Map$Entry;"}, "getKey",
+			"()Ljava/lang/Object;", nil, par)
+		if err != nil || !ok {
+			t.Fatalf("getKey %d: ok=%v err=%v", i, ok, err)
+		}
+		esperaCadenaDeStub(t, clave, esperada.clave)
+		valor, ok, err := m.intentaStub([]string{"Ljava/util/Map$Entry;"}, "getValue",
+			"()Ljava/lang/Object;", nil, par)
+		if err != nil || !ok {
+			t.Fatalf("getValue %d: ok=%v err=%v", i, ok, err)
+		}
+		esperaCadenaDeStub(t, valor, esperada.valor)
+	}
+	hasNext, ok, err = m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok || hasNext != int32(0) {
+		t.Fatalf("hasNext al final: v=%v ok=%v err=%v", hasNext, ok, err)
+	}
+}
+
 // TestTermuxArraysToStringEsDeterminista comprueba el quinto aviso de Termux: el texto de un
 // arreglo de Object, con null en los huecos vacíos y sin depender de la dirección del arreglo.
 func TestTermuxArraysToStringEsDeterminista(t *testing.T) {

@@ -5794,6 +5794,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// determinista que `keySet`. Cada entrada es un `Map$Entry` con su clave y su valor, sin
 		// inventar ninguno. Termux recorre este conjunto en `setSessionShortcuts`.
 		if len(vals) == 0 {
+			// `Properties.entrySet()` no usa el respaldo de `datosDelMapa`: su estado está en
+			// `propiedades`. Termux lo recorre en `TerminalColorScheme.updateWith` justo antes de
+			// `Set.iterator()`, así que el cero de antes llegaba como receptor nulo y abortaba. Se
+			// convierte el mapa de texto al mismo formato y se reutiliza `entradasDelMapa`, que
+			// ordena con `clavesDelMapa` y no inventa ninguna clave.
+			if esPropiedades() {
+				datos := map[string]any{}
+				for clave, valor := range propiedadesDe() {
+					datos[clave] = valor
+				}
+				return entradasDelMapa(datos), true, nil
+			}
 			if datos := datosDelMapa(obj); datos != nil {
 				return entradasDelMapa(datos), true, nil
 			}
