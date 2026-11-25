@@ -382,3 +382,32 @@ func TestElModeloTraeElTemaYLasFilasDelAdaptador(t *testing.T) {
 		t.Error("el JSON añadió un campo `tema`: el criterio exige reutilizar color/fondo")
 	}
 }
+
+// TestElModeloNoInventaColorSinTema falsa el respaldo del tema: un apk sin `android:theme` y sin
+// colores declarados en estilos no puede publicar `color` ni `fondo` calculados. El pintor del
+// navegador conserva sus propios defectos, pero el modelo no debe mentir sobre lo que la app declaró.
+func TestElModeloNoInventaColorSinTema(t *testing.T) {
+	modelo, err := modeloVistaDeAPKConPulsos(apkDeListas(t), "", true, nil)
+	if err != nil {
+		t.Fatalf("el apk sin tema no se lee: %v", err)
+	}
+	if modelo.Raiz == nil {
+		t.Fatal("el modelo no trae raíz")
+	}
+	if modelo.Raiz.Fondo != "" {
+		t.Errorf("sin tema la raíz inventó fondo %q", modelo.Raiz.Fondo)
+	}
+	var recorre func(*nodoVista)
+	recorre = func(n *nodoVista) {
+		if n == nil {
+			return
+		}
+		if n.Color != "" {
+			t.Errorf("sin tema el nodo %s inventó color %q", n.Tipo, n.Color)
+		}
+		for _, h := range n.Hijos {
+			recorre(h)
+		}
+	}
+	recorre(modelo.Raiz)
+}
