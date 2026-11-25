@@ -5396,9 +5396,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "getObserverConstructorType":
 		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
-		// lifecycle: 1 es el constructor por reflexión en AndroidX. La app solo usa el entero para
-		// elegir una rama, así que devolver ese tipo evita que siga llamando a `getClass()` sobre
-		// un observador que la vista previa no puede construir (medido en newpipe).
+		// lifecycle: 1 es el constructor por reflexión en AndroidX. Hoy este stub NO intercepta
+		// el cuerpo del invoke de NewPipe: el método está en el dex y se ejecuta antes de llegar
+		// aquí, así que la medición sigue dando el mismo «getClass sobre un objeto nulo» de la
+		// línea base. La frontera sigue abierta; esto solo responde cuando la llamada no tiene
+		// cuerpo en el dex (por ejemplo, en F-Droid).
 		if len(vals) == 1 && es("Landroidx/lifecycle/Lifecycling;") {
 			return int32(1), true, nil
 		}
