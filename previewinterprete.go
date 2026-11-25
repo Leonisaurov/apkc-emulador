@@ -4584,8 +4584,8 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "copyOfRange":
 		// `Arrays.copyOfRange` copia el rango [desde, hasta) del arreglo. Si `hasta` pasa de su
-		// longitud, el framework rellena con null; si el rango va hacia atrás o empieza antes del
-		// principio, lanza ArrayIndexOutOfBoundsException en vez de devolver un arreglo inventado.
+		// longitud, el framework rellena con null; los rangos inválidos lanzan la excepción que
+		// lanza el JDK, no un arreglo inventado.
 		if len(vals) == 3 && es("Ljava/util/Arrays;") {
 			arr, ok := vals[0].(*arregloDalvik)
 			if !ok || arr == nil {
@@ -4599,9 +4599,20 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			if err != nil {
 				return nil, true, err
 			}
-			if desde < 0 || desde > hasta {
+			// los tres rangos inválidos no son el mismo error en el JDK 17: un origen negativo y un
+			// origen más allá del arreglo son ArrayIndexOutOfBoundsException, pero unos límites
+			// invertidos son IllegalArgumentException con el mensaje `desde > hasta`.
+			if desde < 0 {
 				return nil, true, nuevaExcepcion("Ljava/lang/ArrayIndexOutOfBoundsException;",
-					"%d > %d", hasta, desde)
+					"arraycopy: source index %d out of bounds for object array[%d]", desde, len(arr.datos))
+			}
+			if desde > hasta {
+				return nil, true, nuevaExcepcion("Ljava/lang/IllegalArgumentException;",
+					"%d > %d", desde, hasta)
+			}
+			if desde > int32(len(arr.datos)) {
+				return nil, true, nuevaExcepcion("Ljava/lang/ArrayIndexOutOfBoundsException;",
+					"arraycopy: length %d is negative", len(arr.datos)-int(desde))
 			}
 			datos := make([]any, 0, int(hasta-desde))
 			for i := int(desde); i < int(hasta); i++ {

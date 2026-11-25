@@ -1440,17 +1440,36 @@ func TestArraysCopyOfRangeRespetaLimites(t *testing.T) {
 		t.Errorf("el relleno con null salió mal: %v", relleno.datos)
 	}
 
-	for _, vals := range [][]any{{arr, int32(-1), int32(2)}, {arr, int32(2), int32(1)}} {
-		v, ok, err := m.intentaStub(candidatos, "copyOfRange", proto, vals, nil)
+	// Los tipos y los mensajes son los del JDK 17, medidos con CheckRange.java (y CheckNeg.java
+	// para el origen negativo): un rango invertido NO es ArrayIndexOutOfBoundsException.
+	casosMalos := []struct {
+		vals    []any
+		tipo    string
+		mensaje string
+	}{
+		{[]any{arr, int32(-1), int32(2)}, "Ljava/lang/ArrayIndexOutOfBoundsException;",
+			"arraycopy: source index -1 out of bounds for object array[3]"},
+		{[]any{arr, int32(2), int32(1)}, "Ljava/lang/IllegalArgumentException;", "2 > 1"},
+		{[]any{arr, int32(5), int32(6)}, "Ljava/lang/ArrayIndexOutOfBoundsException;",
+			"arraycopy: length -2 is negative"},
+	}
+	for _, c := range casosMalos {
+		v, ok, err := m.intentaStub(candidatos, "copyOfRange", proto, c.vals, nil)
 		if !ok {
-			t.Errorf("copyOfRange(%v) no fue atendido", vals)
+			t.Errorf("copyOfRange(%v) no fue atendido", c.vals)
 			continue
 		}
 		var ex *excepcionDalvik
 		if !errors.As(err, &ex) {
-			t.Errorf("copyOfRange(%v) devolvió v=%v err=%v y se esperaba una excepción", vals, v, err)
-		} else if ex.tipo != "Ljava/lang/ArrayIndexOutOfBoundsException;" {
-			t.Errorf("copyOfRange(%v) lanzó %s y se esperaba ArrayIndexOutOfBoundsException", vals, ex.tipo)
+			t.Errorf("copyOfRange(%v) devolvió v=%v err=%v y se esperaba una excepción", c.vals, v, err)
+			continue
+		}
+		if ex.tipo != c.tipo {
+			t.Errorf("copyOfRange(%v) lanzó %s y se esperaba %s", c.vals, ex.tipo, c.tipo)
+		}
+		if ex.objeto != nil && ex.objeto.mensajeExcepcion != c.mensaje {
+			t.Errorf("copyOfRange(%v) dijo %q y se esperaba %q", c.vals,
+				ex.objeto.mensajeExcepcion, c.mensaje)
 		}
 	}
 	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
