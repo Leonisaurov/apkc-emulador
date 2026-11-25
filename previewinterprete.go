@@ -4216,10 +4216,44 @@ func (m *maquinaDalvik) hiloPrincipalSintetico() *objetoDalvik {
 	return m.hiloPrincipal
 }
 
+// markerInerteNativo y markerInerteWeb son campos que los stubs ponen en los objetos sintéticos
+// para que las llamadas posteriores se atiendan como inertes sin enumerar cada método de la API.
+// No llevan contenido: solo identifican la familia del objeto y permiten no repetir el aviso.
+const (
+	markerInerteNativo = "emulador.inerteNativo"
+	markerInerteWeb    = "emulador.inerteWeb"
+)
+
 // stubsFrameworkActivos es un interruptor de prueba: a false simula el emulador anterior a estos
 // stubs, para que la falsificación pueda reproducir el error del ejecutor nulo. En producción vale
 // siempre true; ninguna orden del preview lo cambia.
 var stubsFrameworkActivos = true
+
+// objetoInerte arma una referencia no nula del tipo dado, marcada como inerte. El emulador no carga
+// bibliotecas, no abre páginas ni inventa contenido: es solo un objeto sobre el que la app puede
+// seguir llamando sin caer en el guardián de receptor nulo.
+func objetoInerte(clase, marca string) *objetoDalvik {
+	return &objetoDalvik{clase: clase, campos: map[string]any{marca: clase}}
+}
+
+// avisaInerte registra un aviso de familia con el nombre con el que la app llamó a la API.
+func (m *maquinaDalvik) avisaInerte(familia, metodo string) {
+	m.avisa("%s: %s", familia, metodo)
+}
+
+// nombreInerte compone el nombre legible de una llamada inerte: la clase del objeto si viene de una
+// instancia, y si no el primer candidato (la clase que declara el método).
+func nombreInerte(candidatos []string, obj *objetoDalvik, nombre string) string {
+	if obj != nil {
+		return claseCorta(obj.clase) + "." + nombre
+	}
+	for _, c := range candidatos {
+		if c != "" {
+			return claseCorta(c) + "." + nombre
+		}
+	}
+	return nombre
+}
 
 // intentaStub resuelve las llamadas de framework que la app toca. `candidatos` son las clases por
 // las que se busca (la del objeto, la que declara el método); los sufijos bastan porque lo que
@@ -4231,7 +4265,9 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			"getInstalledPackages", "newSingleThreadExecutor", "newFixedThreadPool",
 			"currentThread", "getThread", "getStackTrace", "uptimeMillis",
 			"getObserverConstructorType", "setView", "setCancelable",
-			"checkSelfPermission", "invalidate":
+			"checkSelfPermission", "invalidate", "loadLibrary", "load", "Builder",
+			"newSimpleInstance", "build", "getSettings", "loadUrl", "loadData",
+			"loadDataWithBaseURL", "evaluateJavascript":
 			return nil, false, nil
 		}
 	}
@@ -4305,6 +4341,23 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 		return false
 	}
+	// esExoPlayer reconoce las dos generaciones de la API: la de `com.google.android.exoplayer2`
+	// y la de `androidx.media3.exoplayer`, que es la que usa NewPipe hoy. Se comparan sufijos porque
+	// los nombres de paquete de una app reescrita pueden llevar un prefijo delante.
+	esExoPlayer := func() bool {
+		return es("exoplayer2/ExoPlayer;", "exoplayer2/ExoPlayer$Builder;",
+			"exoplayer2/ExoPlayerFactory;", "exoplayer2/SimpleExoPlayer;",
+			"exoplayer2/MediaItem;", "media3/exoplayer/ExoPlayer;",
+			"media3/exoplayer/ExoPlayer$Builder;", "media3/common/MediaItem;")
+	}
+	esMedia3 := func() bool {
+		for _, c := range candidatos {
+			if strings.Contains(c, "media3/exoplayer/") || strings.Contains(c, "media3/common/") {
+				return true
+			}
+		}
+		return false
+	}
 	esOkHttp := func() bool {
 		for _, c := range candidatos {
 			if strings.Contains(c, "Lokhttp3/") {
@@ -4317,6 +4370,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		return &objetoDalvik{clase: clase, campos: map[string]any{}}
 	}
 	sinRed := func() { m.avisa("red-sin-peticion: %s", nombre) }
+	// esWebView reconoce la vista, sus clientes y sus ajustes: todos son objetos del framework sin
+	// motor de navegador detrás en la vista previa.
+	esWebView := func() bool {
+		return es("Landroid/webkit/WebView;", "Landroid/webkit/WebChromeClient;",
+			"Landroid/webkit/WebViewClient;", "Landroid/webkit/WebSettings;")
+	}
 
 	switch nombre {
 	case "numberOfLeadingZeros":
@@ -4599,6 +4658,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// publica si no llama a setColor
 		if obj != nil && es("Landroid/graphics/Paint;") && !obj.paintPuesto {
 			obj.paintColor = 0xff000000
+		}
+		// WebView y sus clientes nacen como objetos inertes: no hay motor de navegador, no se abre
+		// ninguna página y no se pide red. La marca viaja en el objeto que `new-instance` ya creó.
+		if obj != nil && esWebView() && stubsFrameworkActivos {
+			obj.campos[markerInerteWeb] = obj.clase
+			m.avisaInerte("webview-inerte", nombreInerte(candidatos, obj, "<init>"))
+		}
+		// el builder y el reproductor de ExoPlayer/Media3 se marcan igual: son referencias para que
+		// la app siga su flujo, sin descargas ni reproducción real.
+		if obj != nil && esExoPlayer() && stubsFrameworkActivos {
+			obj.campos[markerInerteNativo] = obj.clase
+			m.avisaInerte("nativo-inerte", nombreInerte(candidatos, obj, "<init>"))
 		}
 		return nil, true, nil
 	case "onCreate", "onStart", "onResume", "onPause", "onStop", "onDestroy", "onRestart",
@@ -5880,6 +5951,55 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 1 && es("Ljava/lang/System;") {
 			return cadenaObjeto(""), true, nil
 		}
+	case "loadLibrary", "load":
+		// §4 R9: la carga de una biblioteca nativa se ACEPTA sin cargar nada. Aquí no hay dlopen,
+		// no se abre un fichero .so y no se ejecuta código nativo; solo se registra el aviso. Los
+		// métodos nativos de esa biblioteca caen después en el aviso genérico, que es honesto.
+		if len(vals) == 1 && es("Ljava/lang/System;") && stubsFrameworkActivos {
+			m.avisaInerte("nativo-inerte", nombreInerte(candidatos, nil, nombre))
+			return nil, true, nil
+		}
+	case "Builder", "newSimpleInstance", "fromUri", "build":
+		// ExoPlayer y Media3: las fábricas y el `build()` del builder devuelven objetos sintéticos.
+		// No se reproduce nada, no se descarga nada y no se abre ningún socket; la app recibe una
+		// referencia no nula para que su onCreate pueda continuar y el aviso lo delate.
+		if stubsFrameworkActivos && (esExoPlayer() ||
+			(obj != nil && obj.campos[markerInerteNativo] != nil)) {
+			m.avisaInerte("nativo-inerte", nombreInerte(candidatos, obj, nombre))
+			clase := "Lcom/google/android/exoplayer2/ExoPlayer;"
+			if esMedia3() {
+				clase = "Landroidx/media3/exoplayer/ExoPlayer;"
+			}
+			switch nombre {
+			case "Builder":
+				clase = "Lcom/google/android/exoplayer2/ExoPlayer$Builder;"
+				if esMedia3() {
+					clase = "Landroidx/media3/exoplayer/ExoPlayer$Builder;"
+				}
+			case "fromUri":
+				clase = "Lcom/google/android/exoplayer2/MediaItem;"
+				if esMedia3() {
+					clase = "Landroidx/media3/common/MediaItem;"
+				}
+			}
+			return objetoInerte(clase, markerInerteNativo), true, nil
+		}
+	case "getSettings":
+		// los ajustes de un WebView existen como objeto, pero no hay motor que aplique JavaScript,
+		// caché ni almacenamiento: cada llamada sobre ellos se atiende como inerte más abajo.
+		if len(vals) == 0 && stubsFrameworkActivos &&
+			(esWebView() || (obj != nil && obj.campos[markerInerteWeb] != nil)) {
+			m.avisaInerte("webview-inerte", nombreInerte(candidatos, obj, nombre))
+			return objetoInerte("Landroid/webkit/WebSettings;", markerInerteWeb), true, nil
+		}
+	case "loadUrl", "loadData", "loadDataWithBaseURL", "evaluateJavascript":
+		// las cuatro formas de cargar contenido son las que pedirían red en un motor real. Aquí no
+		// se abre ninguna conexión ni se inventa una página: se acepta la orden y se avisa.
+		if stubsFrameworkActivos && (esWebView() ||
+			(obj != nil && obj.campos[markerInerteWeb] != nil)) {
+			m.avisaInerte("webview-inerte", nombreInerte(candidatos, obj, nombre))
+			return nil, true, nil
+		}
 	case "getAbsoluteFile":
 		// `File.getAbsoluteFile()` devuelve OTRO File con la misma ruta. La vista previa no tiene
 		// sistema de ficheros de la app, pero el objeto debe existir para que el `getPath()` que
@@ -5974,6 +6094,40 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if esOkHttp() && obj != nil {
 			sinRed()
 			return cadenaObjeto(""), true, nil
+		}
+	}
+	// Las API inertes se atienden por la marca del objeto, no por una lista de métodos: cualquier
+	// llamada posterior devuelve el cero del tipo cuando es primitivo, una cadena vacía cuando el
+	// retorno es texto y una referencia sintética del tipo declarado cuando es un objeto. Así una
+	// cadena de ExoPlayer o de WebView sigue viva sin ejecutar código nativo ni pedir red, y cada
+	// familia deja su aviso en vez de caer en el genérico «no está en el dex ni en los stubs».
+	if obj != nil && stubsFrameworkActivos {
+		familia, marca := "", ""
+		switch {
+		case obj.campos[markerInerteWeb] != nil:
+			familia, marca = "webview-inerte", markerInerteWeb
+		case obj.campos[markerInerteNativo] != nil:
+			familia, marca = "nativo-inerte", markerInerteNativo
+		}
+		if familia != "" {
+			m.avisaInerte(familia, nombreInerte(candidatos, obj, nombre))
+			retorno := ""
+			if i := strings.LastIndex(proto, ")"); i >= 0 {
+				retorno = proto[i+1:]
+			}
+			if retorno == "V" {
+				return nil, true, nil
+			}
+			if v := valorCero(retorno); v != nil {
+				return v, true, nil
+			}
+			if retorno == "Ljava/lang/String;" || retorno == "Ljava/lang/CharSequence;" {
+				return cadenaObjeto(""), true, nil
+			}
+			if retorno == "" {
+				return nil, true, nil
+			}
+			return objetoInerte(retorno, marca), true, nil
 		}
 	}
 	return nil, false, nil

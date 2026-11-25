@@ -766,3 +766,201 @@ func TestLifecycleElPoolFijoDevuelveUnEjecutor(t *testing.T) {
 		t.Errorf("newFixedThreadPool cayó en el aviso de stub ausente: %s", avisos)
 	}
 }
+
+// TestInertesLoadLibraryNoCargaNada falsifica §4 R9: System.loadLibrary se acepta sin abrir un .so,
+// sin ejecutar código nativo y sin dejar un objeto que pretenda ser la biblioteca cargada. El único
+// efecto observable es el aviso de la familia.
+func TestInertesLoadLibraryNoCargaNada(t *testing.T) {
+	m := maquinaDeStubs()
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/System;"}, "loadLibrary",
+		"(Ljava/lang/String;)V", []any{cadenaObjeto("godot_android")}, nil)
+	if err != nil || !ok {
+		t.Fatalf("loadLibrary: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != nil {
+		t.Errorf("loadLibrary devolvió %v y es void", v)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "nativo-inerte: java.lang.System.loadLibrary") {
+		t.Errorf("loadLibrary no registró su aviso: %q", m.avisos)
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("loadLibrary cayó en el aviso genérico: %q", m.avisos)
+	}
+	// la forma System.load es la misma familia y tampoco carga nada
+	if v, ok, err := m.intentaStub([]string{"Ljava/lang/System;"}, "load",
+		"(Ljava/lang/String;)V", []any{cadenaObjeto("/sdcard/libgodot_android.so")}, nil); err != nil ||
+		!ok || v != nil {
+		t.Errorf("System.load: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "nativo-inerte: java.lang.System.load") {
+		t.Errorf("System.load no registró su aviso: %q", m.avisos)
+	}
+}
+
+// TestInertesWebViewNoPideRed recorre la cadena WebView → WebSettings → WebChromeClient y comprueba
+// que cada llamada entrega un objeto no nulo o void, con aviso de familia, y sin el aviso genérico.
+// Ningún stub de esta cadena abre una conexión: la garantía de red se falsifica además en el test de
+// importaciones de más abajo.
+func TestInertesWebViewNoPideRed(t *testing.T) {
+	m := maquinaDeStubs()
+	// el `<init>` consulta la jerarquía del dex para decidir si el receptor es un Throwable: sin
+	// programa cargado el mapa tiene que existir, aunque esté vacío
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	vista := objDe("Landroid/webkit/WebView;")
+	if v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, "<init>",
+		"(Landroid/content/Context;)V", []any{objDe("Landroid/app/Activity;")}, vista); err != nil ||
+		!ok || v != nil {
+		t.Fatalf("WebView.<init>: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if vista.campos[markerInerteWeb] == nil {
+		t.Fatal("el WebView no quedó marcado como inerte")
+	}
+	ajustes := esperaObjetoDeStub(t, mustStub(t, m, []string{"Landroid/webkit/WebView;"},
+		"getSettings", "()Landroid/webkit/WebSettings;", nil, vista), "Landroid/webkit/WebSettings;")
+	if ajustes.campos[markerInerteWeb] == nil {
+		t.Error("los WebSettings devueltos no quedaron marcados como inertes")
+	}
+	if v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebSettings;"}, "setJavaScriptEnabled",
+		"(Z)V", []any{int32(1)}, ajustes); err != nil || !ok || v != nil {
+		t.Errorf("setJavaScriptEnabled: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, "loadUrl",
+		"(Ljava/lang/String;)V", []any{cadenaObjeto("https://ejemplo.invalido")}, vista); err != nil ||
+		!ok || v != nil {
+		t.Errorf("loadUrl: v=%v ok=%v err=%v", v, ok, err)
+	}
+	cliente := objDe("Landroid/webkit/WebChromeClient;")
+	if v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebChromeClient;"}, "<init>",
+		"()V", nil, cliente); err != nil || !ok || v != nil {
+		t.Fatalf("WebChromeClient.<init>: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebChromeClient;"}, "onProgressChanged",
+		"(Landroid/webkit/WebView;I)V", []any{vista, int32(100)}, cliente); err != nil || !ok || v != nil {
+		t.Errorf("onProgressChanged: v=%v ok=%v err=%v", v, ok, err)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	for _, esperado := range []string{
+		"webview-inerte: android.webkit.WebView.<init>",
+		"webview-inerte: android.webkit.WebView.getSettings",
+		"webview-inerte: android.webkit.WebSettings.setJavaScriptEnabled",
+		"webview-inerte: android.webkit.WebView.loadUrl",
+		"webview-inerte: android.webkit.WebChromeClient.onProgressChanged",
+	} {
+		if !strings.Contains(avisos, esperado) {
+			t.Errorf("falta el aviso %q en %q", esperado, m.avisos)
+		}
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("la cadena WebView cayó en el aviso genérico: %q", m.avisos)
+	}
+	// sin página cargada, getUrl() y getTitle() son texto vacío, nunca una URL inventada
+	for _, nombre := range []string{"getUrl", "getTitle"} {
+		v, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, nombre,
+			"()Ljava/lang/String;", nil, vista)
+		if err != nil || !ok {
+			t.Errorf("%s: ok=%v err=%v", nombre, ok, err)
+			continue
+		}
+		esperaCadenaDeStub(t, v, "")
+	}
+}
+
+// mustStub es el atajo de las pruebas de inertes cuando el valor devuelto tiene que ser un objeto.
+func mustStub(t *testing.T, m *maquinaDalvik, candidatos []string, nombre, proto string,
+	vals []any, receptor any) any {
+	t.Helper()
+	v, ok, err := m.intentaStub(candidatos, nombre, proto, vals, receptor)
+	if err != nil || !ok {
+		t.Fatalf("%s: v=%v ok=%v err=%v", nombre, v, ok, err)
+	}
+	return v
+}
+
+// TestInertesExoPlayerDevuelveObjetoInerte falsifica la familia de NewPipe: las fábricas de
+// ExoPlayer/Media3 devuelven referencias no nulas, los primitivos devuelven su cero y los objetos
+// encadenados siguen siendo inertes, sin aviso genérico.
+func TestInertesExoPlayerDevuelveObjetoInerte(t *testing.T) {
+	m := maquinaDeStubs()
+	builder := esperaObjetoDeStub(t, mustStub(t, m,
+		[]string{"Landroidx/media3/exoplayer/ExoPlayer$Builder;"}, "Builder",
+		"(Landroid/content/Context;)Landroidx/media3/exoplayer/ExoPlayer$Builder;",
+		[]any{objDe("Landroid/app/Activity;")}, nil), "Landroidx/media3/exoplayer/ExoPlayer$Builder;")
+	if builder.campos[markerInerteNativo] == nil {
+		t.Error("el builder de Media3 no quedó marcado como inerte")
+	}
+	reproductor := esperaObjetoDeStub(t, mustStub(t, m,
+		[]string{"Landroidx/media3/exoplayer/ExoPlayer$Builder;"}, "build",
+		"()Landroidx/media3/exoplayer/ExoPlayer;", nil, builder), "Landroidx/media3/exoplayer/ExoPlayer;")
+	if reproductor.campos[markerInerteNativo] == nil {
+		t.Error("el reproductor devuelto no quedó marcado como inerte")
+	}
+	item := mustStub(t, m, []string{"Landroidx/media3/common/MediaItem;"}, "fromUri",
+		"(Ljava/lang/String;)Landroidx/media3/common/MediaItem;",
+		[]any{cadenaObjeto("https://ejemplo.invalido")}, nil)
+	esperaObjetoDeStub(t, item, "Landroidx/media3/common/MediaItem;")
+	if v, ok, err := m.intentaStub([]string{"Landroidx/media3/common/Player;"}, "setMediaItem",
+		"(Landroidx/media3/common/MediaItem;)V", []any{item}, reproductor); err != nil || !ok || v != nil {
+		t.Errorf("setMediaItem: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v := mustStub(t, m, []string{"Landroidx/media3/common/Player;"}, "getCurrentPosition",
+		"()J", nil, reproductor); v != int64(0) {
+		t.Errorf("getCurrentPosition devolvió %v y se esperaba 0", v)
+	}
+	esperaObjetoDeStub(t, mustStub(t, m, []string{"Landroidx/media3/common/Player;"}, "getMediaItem",
+		"()Landroidx/media3/common/MediaItem;", nil, reproductor), "Landroidx/media3/common/MediaItem;")
+	// la generación anterior (ExoPlayer 2) se atiende con la misma familia
+	antiguo := esperaObjetoDeStub(t, mustStub(t, m,
+		[]string{"Lcom/google/android/exoplayer2/ExoPlayerFactory;"}, "newSimpleInstance",
+		"(Landroid/content/Context;)Lcom/google/android/exoplayer2/ExoPlayer;",
+		[]any{objDe("Landroid/app/Activity;")}, nil), "Lcom/google/android/exoplayer2/ExoPlayer;")
+	if antiguo.campos[markerInerteNativo] == nil {
+		t.Error("el ExoPlayer 2 devuelto no quedó marcado como inerte")
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	for _, esperado := range []string{
+		"nativo-inerte: androidx.media3.exoplayer.ExoPlayer$Builder.Builder",
+		"nativo-inerte: androidx.media3.exoplayer.ExoPlayer$Builder.build",
+		"nativo-inerte: androidx.media3.common.MediaItem.fromUri",
+		"nativo-inerte: androidx.media3.exoplayer.ExoPlayer.setMediaItem",
+		"nativo-inerte: androidx.media3.exoplayer.ExoPlayer.getCurrentPosition",
+		"nativo-inerte: androidx.media3.exoplayer.ExoPlayer.getMediaItem",
+		"nativo-inerte: com.google.android.exoplayer2.ExoPlayerFactory.newSimpleInstance",
+	} {
+		if !strings.Contains(avisos, esperado) {
+			t.Errorf("falta el aviso %q en %q", esperado, m.avisos)
+		}
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("la cadena ExoPlayer cayó en el aviso genérico: %q", m.avisos)
+	}
+}
+
+// TestInertesSinCargaNativaNiRedEnElCodigo garantiza la frontera en el propio origen: el intérprete
+// no importa paquetes de red, procesos, carga dinámica ni cgo, y no contiene llamadas a ellos. Sin
+// esta prueba, un «no pedimos red» sería solo una frase en un comentario.
+func TestInertesSinCargaNativaNiRedEnElCodigo(t *testing.T) {
+	datos, err := os.ReadFile("previewinterprete.go")
+	if err != nil {
+		t.Fatalf("no se pudo leer el intérprete: %v", err)
+	}
+	texto := string(datos)
+	ini := strings.Index(texto, "import (")
+	fin := strings.Index(texto, "\n)")
+	if ini < 0 || fin < ini {
+		t.Fatal("no se encontró el bloque de importaciones del intérprete")
+	}
+	imports := texto[ini:fin]
+	for _, prohibido := range []string{`"os"`, `"net"`, `"net/http"`, `"os/exec"`,
+		`"plugin"`, `"syscall"`, `"unsafe"`, `"C"`} {
+		if strings.Contains(imports, prohibido) {
+			t.Errorf("el intérprete importa %s, fuera de la frontera inerte", prohibido)
+		}
+	}
+	for _, prohibido := range []string{"http.Get", "http.Post", "net.Dial", "exec.Command",
+		"os.Open", "syscall.", "plugin.Open"} {
+		if strings.Contains(texto, prohibido) {
+			t.Errorf("el intérprete contiene %s, que cargaría código o pediría red", prohibido)
+		}
+	}
+}
