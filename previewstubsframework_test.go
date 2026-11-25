@@ -1051,3 +1051,44 @@ func TestInertesRetornoArregloEsVacio(t *testing.T) {
 		t.Errorf("aget sobre el arreglo vacío dio %v y se esperaba el error de rango", err)
 	}
 }
+
+// TestInertesCuentaUnaVezAvisosRecortadosRepetidos falsifica el doble conteo: un aviso distinto que
+// no cupo se marca como visto, así que cien llamadas al mismo método recortado cuentan UNO y no cien.
+func TestInertesCuentaUnaVezAvisosRecortadosRepetidos(t *testing.T) {
+	m := maquinaDeStubs()
+	vista := objDe("Landroid/webkit/WebView;")
+	vista.campos[markerInerteWeb] = vista.clase
+	// se llena el tope con métodos distintos, sin recortar ninguno todavía
+	for i := 0; i < avisosMaximos; i++ {
+		nombre := fmt.Sprintf("metodoInerte%02d", i)
+		if _, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, nombre,
+			"()V", nil, vista); err != nil || !ok {
+			t.Fatalf("%s: ok=%v err=%v", nombre, ok, err)
+		}
+	}
+	if m.avisosRecortados != 0 {
+		t.Fatalf("el tope se recortó antes de tiempo: %d", m.avisosRecortados)
+	}
+	// el mismo método recortado, cien veces: solo la primera cuenta
+	for i := 0; i < 100; i++ {
+		if _, ok, err := m.intentaStub([]string{"Landroid/webkit/WebView;"}, "loadUrl",
+			"(Ljava/lang/String;)V", []any{cadenaObjeto("https://ejemplo.invalido")}, vista); err != nil || !ok {
+			t.Fatalf("loadUrl repetido %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if m.avisosRecortados != 1 {
+		t.Errorf("se contaron %d avisos recortados y se esperaba 1", m.avisosRecortados)
+	}
+	marcadores := 0
+	for _, aviso := range m.avisos {
+		if strings.HasPrefix(aviso, "avisos-recortados: ") {
+			marcadores++
+		}
+	}
+	if marcadores != 1 {
+		t.Errorf("hay %d marcadores y se esperaba uno: %q", marcadores, m.avisos)
+	}
+	if ultimo := m.avisos[len(m.avisos)-1]; ultimo != "avisos-recortados: 1" {
+		t.Errorf("el último aviso es %q y se esperaba el marcador", ultimo)
+	}
+}

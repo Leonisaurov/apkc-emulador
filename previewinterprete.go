@@ -1226,6 +1226,9 @@ func (m *maquinaDalvik) avisa(formato string, args ...any) {
 		return
 	}
 	if len(m.avisos) >= avisosMaximos {
+		// marcar también aquí: un aviso distinto que no cupo sigue siendo un aviso YA VISTO. Sin
+		// esto, cada repetición suya volvía a entrar por el recorte y contaba como uno nuevo.
+		m.vistos[texto] = true
 		m.avisosRecortados++
 		marcador := fmt.Sprintf("avisos-recortados: %d", m.avisosRecortados)
 		// el marcador es del modelo, no un aviso nuevo de la app: se reescribe en su plaza y no
