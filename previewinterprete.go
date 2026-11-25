@@ -4317,6 +4317,30 @@ func clavesDeMapaPreferencias(mapa map[string]any) []any {
 	return clavesDelMapa(mapa)
 }
 
+// datosDelMapa entrega el mapa de un objeto Map del modelo: el de `getAll` o un `HashMap` creado por
+// la propia app. Un HashMap sin estado nace con el mapa vacío; no se inventan claves, solo se leen
+// las que la app guardó con `put` o heredó de `HashMap(Map)`.
+func datosDelMapa(obj *objetoDalvik) map[string]any {
+	if obj == nil {
+		return nil
+	}
+	if datos, ok := obj.campos["preferencias.mapa"].(map[string]any); ok {
+		return datos
+	}
+	if datos, ok := obj.campos["mapa.datos"].(map[string]any); ok {
+		return datos
+	}
+	if strings.HasSuffix(obj.clase, "Ljava/util/HashMap;") || strings.HasSuffix(obj.clase, "Ljava/util/Map;") {
+		if obj.campos == nil {
+			obj.campos = map[string]any{}
+		}
+		datos := map[string]any{}
+		obj.campos["mapa.datos"] = datos
+		return datos
+	}
+	return nil
+}
+
 // clavesModeladasDelObjeto reúne las claves que el intérprete ya guardó en un objeto: las entradas
 // `mapa.*` que lee `Map.get`, el Bundle y el editor de SharedPreferences. No inventa ninguna clave.
 func clavesModeladasDelObjeto(o *objetoDalvik) map[string]any {
@@ -5015,6 +5039,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if obj != nil && es("Ljava/util/Properties;") && obj.propiedades == nil {
 			obj.propiedades = map[string]string{}
 		}
+		// `HashMap(Map)` copia las claves del argumento, sin inventar ninguna. Termux crea un
+		// HashMap vacío a partir de otro antes de pedirle `keySet`.
+		if obj != nil && es("Ljava/util/HashMap;") {
+			datosDestino := datosDelMapa(obj)
+			if proto == "(Ljava/util/Map;)V" && len(vals) == 1 {
+				if origen, ok := vals[0].(*objetoDalvik); ok {
+					for c, v := range datosDelMapa(origen) {
+						datosDestino[c] = v
+					}
+				}
+			}
+		}
 		// un Paint nace negro y sin trazo, como el del framework: es el color que un onDraw
 		// publica si no llama a setColor
 		if obj != nil && es("Landroid/graphics/Paint;") && !obj.paintPuesto {
@@ -5610,18 +5646,19 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 					"radio ni red", retorno)
 		}
 	case "stringPropertyNames", "keySet":
-		// El conjunto de claves de un Properties: SIEMPRE no nulo, aunque no haya leído ningún
-		// fichero. Es el punto donde Termux se detenía: el cero devuelto antes llegaba a
-		// `Set.iterator()` y el intérprete abortaba con «sobre un objeto nulo». Las claves van en
-		// orden determinista, así que el modelo publicado no depende del orden del mapa de Go.
+		// El conjunto de claves es SIEMPRE no nulo, aunque el mapa esté vacío: el cero devuelto
+		// antes llegaba a `Set.iterator()` y el intérprete abortaba con «sobre un objeto nulo».
+		// Properties usa su propio mapa de texto; `getAll` y los HashMap de la app comparten
+		// `clavesDelMapa`, así que las claves salen ordenadas y solo las que realmente hay.
 		if len(vals) == 0 && esPropiedades() {
 			return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
 				conjunto: clavesPropiedades(propiedadesDe())}, true, nil
 		}
-		if len(vals) == 0 && esMapaPreferencias(obj) {
-			datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
-			return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
-				conjunto: clavesDeMapaPreferencias(datos)}, true, nil
+		if len(vals) == 0 {
+			if datos := datosDelMapa(obj); datos != nil {
+				return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
+					conjunto: clavesDelMapa(datos)}, true, nil
+			}
 		}
 	case "setProperty":
 		if len(vals) == 2 && esPropiedades() {
@@ -5644,6 +5681,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 2 && esPropiedades() {
 			propiedadesDe()[textoDe(vals[0])] = textoDe(vals[1])
 			return nil, true, nil
+		}
+		// `HashMap.put` de la app: guarda la clave en el mapa del objeto, que es el mismo que
+		// después ordena `keySet`. No se toca ningún fichero ni se inventa contenido.
+		if obj != nil && es("Ljava/util/HashMap;") && len(vals) == 2 {
+			if datos := datosDelMapa(obj); datos != nil {
+				datos[textoDe(vals[0])] = vals[1]
+				return nil, true, nil
+			}
 		}
 	case "iterator":
 		if len(vals) == 0 {
@@ -5727,13 +5772,15 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 		}
 	case "get":
-		// el `Map` de `getAll` devuelve el valor guardado en la copia del almacén en memoria.
-		if esMapaPreferencias(obj) && len(vals) == 1 {
-			datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
-			if v, ok := datos[textoDe(vals[0])]; ok {
-				return v, true, nil
+		// el `Map` de `getAll` y los `HashMap` de la app leen el valor guardado en el mapa del
+		// objeto, sin ficheros y sin inventar claves.
+		if len(vals) == 1 {
+			if datos := datosDelMapa(obj); datos != nil {
+				if v, ok := datos[textoDe(vals[0])]; ok {
+					return v, true, nil
+				}
+				return nil, true, nil
 			}
-			return nil, true, nil
 		}
 		// `Properties.get(Object)` devuelve el valor guardado, o el cero si la clave no está.
 		if esPropiedades() && len(vals) == 1 {
@@ -5777,8 +5824,7 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "size":
 		if len(vals) == 0 {
-			if esMapaPreferencias(obj) {
-				datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
+			if datos := datosDelMapa(obj); datos != nil {
 				return int32(len(datos)), true, nil
 			}
 			if esPropiedades() {

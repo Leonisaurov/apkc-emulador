@@ -12,9 +12,15 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
+
+// escribirPreferencias es el escribidor que se inyecta en la prueba de `apply`: falla si alguien
+// llega a usarlo. El intérprete no tiene ningún punto de escritura de preferencias —el estado solo
+// vive en memoria—, así que además se comprueba que el directorio de trabajo sigue vacío.
+var escribirPreferencias = func(nombre string, datos map[string]any) {}
 
 // sinAvisoDeStub falla si la ejecución avisó de una API que el intérprete no reconoce: es el síntoma
 // que tenían estas cuatro antes de tener su stub.
@@ -719,9 +725,39 @@ func TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero(t *testing.T) {
 	if len(m.almacen.ficheros["termux"]) != 0 {
 		t.Fatalf("el editor escribió antes de apply: %v", m.almacen.ficheros["termux"])
 	}
+	// escribidor que delata cualquier salida a disco: es el mismo patrón que el transporte de red
+	// prohibido. Si `apply` llegara a usar el único punto de escritura, la bandera se encendería.
+	anterior := escribirPreferencias
+	escribio := false
+	escribirPreferencias = func(nombre string, datos map[string]any) { escribio = true }
+	defer func() { escribirPreferencias = anterior }()
+	// Además se corre en un directorio vacío: si `apply` creara un fichero, el volcado del
+	// directorio lo delataría aunque no pasara por el escribidor anterior.
+	directorio := t.TempDir()
+	anteriorDirectorio, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("el directorio de trabajo: %v", err)
+	}
+	if err := os.Chdir(directorio); err != nil {
+		t.Fatalf("entrar en el directorio de la sonda: %v", err)
+	}
+	defer func() { _ = os.Chdir(anteriorDirectorio) }()
 	if v, ok, err := m.intentaStub([]string{"Landroid/content/SharedPreferences$Editor;"}, "apply",
 		"()V", nil, editor); err != nil || !ok || v != nil {
 		t.Fatalf("apply: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if escribio {
+		t.Fatal("apply intentó escribir las preferencias en disco")
+	}
+	entradas, err := os.ReadDir(directorio)
+	if err != nil {
+		t.Fatalf("leer el directorio de la sonda: %v", err)
+	}
+	if len(entradas) != 0 {
+		t.Fatalf("apply creó %d ficheros en disco: %v", len(entradas), entradas)
+	}
+	if datos := m.almacen.ficheros["termux"]; len(datos) != 3 || datos["fuente"] != "Hola" {
+		t.Errorf("apply no volcó los tres valores al almacén en memoria: %v", datos)
 	}
 
 	lector := []string{"Landroid/content/SharedPreferences;"}
@@ -766,8 +802,87 @@ func TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero(t *testing.T) {
 		t.Fatalf("keySet del mapa: v=%v ok=%v err=%v", v, ok, err)
 	} else if claves := esperaObjetoDeStub(t, v, "Ljava/util/Set;").conjunto; len(claves) != 3 {
 		t.Errorf("el conjunto de claves es %v", claves)
+	} else {
+		ordenadas := make([]string, 0, len(claves))
+		for _, c := range claves {
+			s, _ := cadenaDe(c)
+			ordenadas = append(ordenadas, s)
+		}
+		if strings.Join(ordenadas, ",") != "activo,fuente,tamano" {
+			t.Errorf("las claves del mapa son %v y se esperaban ordenadas", ordenadas)
+		}
 	}
 	if !strings.Contains(strings.Join(m.avisos, "\n"), "preferencias-memoria: getAll(") {
 		t.Errorf("getAll no dejó aviso de familia: %v", m.avisos)
+	}
+}
+
+// TestPreferenciasHashMapKeySetSinClavesInventadas falsifica el receptor real de la frontera de
+// Termux: un `HashMap` creado en el propio dex, no el mapa de getAll. `keySet` tiene que entregar un
+// Set no nulo aunque esté vacío, y después solo las claves que la app puso (en orden fijo). El
+// constructor `HashMap(Map)` copia de la misma fuente.
+func TestPreferenciasHashMapKeySetSinClavesInventadas(t *testing.T) {
+	m := maquinaDeStubs()
+	// el `<init>` consulta la jerarquía del dex para decidir si es un Throwable; sin programa el
+	// guardión de jerarquía panicaría, así que se le da uno vacío como en las pruebas de stubs.
+	m.prog = &programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}
+	candidatos := []string{"Ljava/util/HashMap;"}
+	mapa := objDe("Ljava/util/HashMap;")
+
+	v, ok, err := m.intentaStub(candidatos, "keySet", "()Ljava/util/Set;", nil, mapa)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("keySet del HashMap vacío: v=%v ok=%v err=%v", v, ok, err)
+	}
+	set := esperaObjetoDeStub(t, v, "Ljava/util/Set;")
+	if set.conjunto == nil || len(set.conjunto) != 0 {
+		t.Fatalf("el HashMap vacío entregó las claves %v", set.conjunto)
+	}
+	it, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "iterator", "()Ljava/util/Iterator;", nil, set)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator del Set vacío: v=%v ok=%v err=%v", it, ok, err)
+	}
+	hasNext, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok || hasNext != int32(0) {
+		t.Errorf("hasNext del Set vacío: v=%v ok=%v err=%v", hasNext, ok, err)
+	}
+
+	for _, clave := range []string{"z", "a"} {
+		if v, ok, err := m.intentaStub(candidatos, "put",
+			"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+			[]any{cadenaObjeto(clave), int32(len(clave))}, mapa); err != nil || !ok || v != nil {
+			t.Fatalf("put(%q): v=%v ok=%v err=%v", clave, v, ok, err)
+		}
+	}
+	v, ok, err = m.intentaStub(candidatos, "keySet", "()Ljava/util/Set;", nil, mapa)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("keySet con dos claves: v=%v ok=%v err=%v", v, ok, err)
+	}
+	claves := esperaObjetoDeStub(t, v, "Ljava/util/Set;").conjunto
+	ordenadas := make([]string, 0, len(claves))
+	for _, c := range claves {
+		s, _ := cadenaDe(c)
+		ordenadas = append(ordenadas, s)
+	}
+	if strings.Join(ordenadas, ",") != "a,z" {
+		t.Errorf("las claves son %v y se esperaban a,z", ordenadas)
+	}
+	if v, ok, err := m.intentaStub(candidatos, "get", "(Ljava/lang/Object;)Ljava/lang/Object;",
+		[]any{cadenaObjeto("a")}, mapa); err != nil || !ok || v != int32(1) {
+		t.Errorf("get(a): v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub(candidatos, "size", "()I", nil, mapa); err != nil || !ok || v != int32(2) {
+		t.Errorf("size: v=%v ok=%v err=%v", v, ok, err)
+	}
+
+	copia := objDe("Ljava/util/HashMap;")
+	if _, ok, err := m.intentaStub(candidatos, "<init>", "(Ljava/util/Map;)V", []any{mapa}, copia); err != nil || !ok {
+		t.Fatalf("HashMap(Map): ok=%v err=%v", ok, err)
+	}
+	v, ok, err = m.intentaStub(candidatos, "keySet", "()Ljava/util/Set;", nil, copia)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("keySet de la copia: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if n := len(esperaObjetoDeStub(t, v, "Ljava/util/Set;").conjunto); n != 2 {
+		t.Errorf("la copia tiene %d claves y se esperaban 2", n)
 	}
 }
