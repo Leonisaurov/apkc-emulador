@@ -897,3 +897,135 @@ func TestRomVolcadoEsReleible(t *testing.T) {
 		t.Errorf("el fichero versionable no se puede cargar: %v", err)
 	}
 }
+
+// maquinaFutureTaskCallable arma el encadenamiento que el gestor de archivos construye en
+// MainActivity.k: un Callable del dex dentro de un FutureTask, metido a su vez en otro FutureTask
+// como Runnable. El cuerpo del Callable llama a File.listFiles y guarda el arreglo en un campo de
+// la propia instancia, para que la ejecución diferida deje una huella medible sin depender de la app.
+func maquinaFutureTaskCallable(t *testing.T) (*maquinaDalvik, *objetoDalvik) {
+	t.Helper()
+	rom, err := cargaRom("", []string{"android.permission.READ_EXTERNAL_STORAGE"}, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM con permiso de lectura: %v", err)
+	}
+	d := &dexFile{
+		fields: []dexField{
+			{owner: "Lcall/Lista;", typeOf: "Ljava/io/File;", name: "f"},
+			{owner: "Lcall/Lista;", typeOf: "Ljava/lang/Object;", name: "resultado"},
+		},
+		methods: []dexMethod{
+			{owner: "Ljava/io/File;", proto: dexProto{returnType: "[Ljava/io/File;"}, name: "listFiles"},
+		},
+	}
+	// registersSize 2 e insSize 1: el Callable entra en v1 (this) y v0 guarda el File y el arreglo.
+	cuerpo := []uint16{
+		0x1054, 0x0000, // iget-object v0, v1, Lcall/Lista;.f:Ljava/io/File;
+		0x106e, 0x0000, 0x0000, // invoke-virtual {v0}, File.listFiles:()[Ljava/io/File;
+		0x000c,         // move-result-object v0
+		0x105b, 0x0001, // iput-object v0, v1, Lcall/Lista;.resultado:Ljava/lang/Object;
+		0x0011,         // return-object v0
+	}
+	met := &metodoDalvik{nombre: "call", proto: "()Ljava/lang/Object;", retorno: "Ljava/lang/Object;",
+		dex: d, item: &codeItem{registersSize: 2, insSize: 1,
+			insnsSize: uint32(len(cuerpo)), insns: cuerpo}}
+	p := &programaDalvik{dex: d, clases: map[string]*claseDalvik{
+		"Lcall/Lista;": {nombre: "Lcall/Lista;", super: "Ljava/lang/Object;",
+			metodos: map[string]*metodoDalvik{"call()Ljava/lang/Object;": met}},
+	}}
+	m := nuevaMaquina(p, nil)
+	m.rom = rom
+	callable := &objetoDalvik{clase: "Lcall/Lista;", campos: map[string]any{}}
+	return m, callable
+}
+
+// cadenaFutureTaskCallable reproduce los dos `<init>` de MainActivity.k: un FutureTask(Callable) y
+// después un FutureTask(Runnable, Object) que envuelve al primero, que es el que el ejecutor encola.
+func cadenaFutureTaskCallable(t *testing.T, m *maquinaDalvik, callable *objetoDalvik) *objetoDalvik {
+	t.Helper()
+	primero := &objetoDalvik{clase: "Ljava/util/concurrent/FutureTask;", campos: map[string]any{}}
+	if _, ok, err := m.intentaStub([]string{"Ljava/util/concurrent/FutureTask;"}, "<init>",
+		"(Ljava/util/concurrent/Callable;)V", []any{callable}, primero); err != nil || !ok {
+		t.Fatalf("FutureTask(Callable): ok=%v err=%v", ok, err)
+	}
+	segundo := &objetoDalvik{clase: "Ljava/util/concurrent/FutureTask;", campos: map[string]any{}}
+	if _, ok, err := m.intentaStub([]string{"Ljava/util/concurrent/FutureTask;"}, "<init>",
+		"(Ljava/lang/Runnable;Ljava/lang/Object;)V", []any{primero, nil}, segundo); err != nil || !ok {
+		t.Fatalf("FutureTask(Runnable, Object): ok=%v err=%v", ok, err)
+	}
+	return segundo
+}
+
+// TestFutureTaskEjecutaCallDiferido falsifica la frontera del gestor: hasta ahora el intérprete
+// buscaba `run()V` en el FutureTask y no encontraba nada, así que el `Callable.call` nunca corría
+// y `id/list` salía vacío. Aquí el cuerpo del Callable lista los cuatro directorios de la ROM.
+func TestFutureTaskEjecutaCallDiferido(t *testing.T) {
+	m, callable := maquinaFutureTaskCallable(t)
+	quiero := map[string]bool{
+		"leeme.txt": false, "gato.png": false, "notas.txt": false, "cancion.mp3": false,
+	}
+	for _, dir := range []string{"/sdcard/Download", "/sdcard/Download/fotos",
+		"/sdcard/Documents", "/sdcard/Music"} {
+		callable.campos["Lcall/Lista;.f"] = objetoDeRuta(dir)
+		segundo := cadenaFutureTaskCallable(t, m, callable)
+		if err := m.ejecutaRunnable(segundo, "ExecutorService.execute"); err != nil {
+			t.Fatalf("ejecutar el FutureTask sobre %s: %v", dir, err)
+		}
+		v, hay := callable.campos["Lcall/Lista;.resultado"]
+		if !hay {
+			t.Fatalf("el Callable.call no corrió sobre %s: sin resultado; avisos %v", dir, m.avisos)
+		}
+		for _, nombre := range nombresListados(m, v, "listFiles") {
+			if _, esperado := quiero[nombre]; esperado {
+				quiero[nombre] = true
+			}
+		}
+	}
+	for nombre, visto := range quiero {
+		if !visto {
+			t.Errorf("el Callable.call diferido no listó %s; avisos %v", nombre, m.avisos)
+		}
+	}
+}
+
+// TestFutureTaskNoRompeRunnableRun guarda el camino de §361: un Runnable del dex que no es un
+// FutureTask sigue ejecutando su `run()V`, sin que la envoltura nueva lo desvíe hacia `call()`.
+func TestFutureTaskNoRompeRunnableRun(t *testing.T) {
+	rom, err := cargaRom("", []string{"android.permission.READ_EXTERNAL_STORAGE"}, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM con permiso de lectura: %v", err)
+	}
+	d := &dexFile{
+		fields: []dexField{
+			{owner: "Lrunnable/Plano;", typeOf: "Ljava/io/File;", name: "f"},
+			{owner: "Lrunnable/Plano;", typeOf: "Ljava/lang/Object;", name: "resultado"},
+		},
+		methods: []dexMethod{
+			{owner: "Ljava/io/File;", proto: dexProto{returnType: "[Ljava/io/File;"}, name: "listFiles"},
+		},
+	}
+	cuerpo := []uint16{
+		0x1054, 0x0000, // iget-object v0, v1, Lrunnable/Plano;.f:Ljava/io/File;
+		0x106e, 0x0000, 0x0000, // invoke-virtual {v0}, File.listFiles:()[Ljava/io/File;
+		0x000c,         // move-result-object v0
+		0x105b, 0x0001, // iput-object v0, v1, Lrunnable/Plano;.resultado:Ljava/lang/Object;
+		0x000e,         // return-void
+	}
+	met := &metodoDalvik{nombre: "run", proto: "()V", retorno: "V", dex: d,
+		item: &codeItem{registersSize: 2, insSize: 1,
+			insnsSize: uint32(len(cuerpo)), insns: cuerpo}}
+	p := &programaDalvik{dex: d, clases: map[string]*claseDalvik{
+		"Lrunnable/Plano;": {nombre: "Lrunnable/Plano;", super: "Ljava/lang/Object;",
+			metodos: map[string]*metodoDalvik{"run()V": met}},
+	}}
+	m := nuevaMaquina(p, nil)
+	m.rom = rom
+	runnable := &objetoDalvik{clase: "Lrunnable/Plano;", campos: map[string]any{
+		"Lrunnable/Plano;.f": objetoDeRuta("/sdcard/Download"),
+	}}
+	if err := m.ejecutaRunnable(runnable, "ExecutorService.execute"); err != nil {
+		t.Fatalf("ejecutar el Runnable corriente: %v", err)
+	}
+	if _, hay := runnable.campos["Lrunnable/Plano;.resultado"]; !hay {
+		t.Errorf("el Runnable corriente no ejecutó su run()V; avisos %v", m.avisos)
+	}
+}

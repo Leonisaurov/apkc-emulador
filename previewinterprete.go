@@ -956,14 +956,42 @@ func (m *maquinaDalvik) difiere(origen string, runnable any, espera int64) any {
 }
 
 // ejecutaRunnable llama al `run()V` de un Runnable del dex. Si el objeto no lo declara, se avisa:
-// no se inventa un cuerpo.
+// no se inventa un cuerpo. Un `FutureTask` del framework es la excepción: su `run` está en la
+// biblioteca, no en el dex, y lo que corre es el `Callable.call` o el `Runnable.run` que guardó su
+// constructor; por eso se sigue la cadena de envolturas antes de buscar `run()V`.
 func (m *maquinaDalvik) ejecutaRunnable(r *objetoDalvik, origen string) error {
+	if cuerpo, ok := r.campos["futuretask.cuerpo"].(*objetoDalvik); ok {
+		return m.ejecutaDiferido(cuerpo, origen)
+	}
 	met := m.buscaMetodo(r.clase, "run", "()V")
 	if met == nil {
 		m.avisa("%s con un %s que no declara run()V", origen, claseCorta(r.clase))
 		return nil
 	}
 	_, err := m.ejecutaCuerpo(r.clase, met, []any{r}, []string{r.clase})
+	return err
+}
+
+// ejecutaDiferido corre el cuerpo que un `FutureTask` guardó en su constructor. Sigue las
+// envolturas mientras el objeto sea otro FutureTask —el gestor de archivos mete un FutureTask
+// dentro de otro para poder cancelar el primero— y, al llegar a una clase del dex, prefiere
+// `call()Ljava/lang/Object;` de un Callable sobre `run()V` de un Runnable. Esa preferencia deja
+// intacto el camino de `ExecutorService.execute` de §361: un Runnable corriente sigue corriendo su
+// `run()V`.
+func (m *maquinaDalvik) ejecutaDiferido(cuerpo *objetoDalvik, origen string) error {
+	if interior, ok := cuerpo.campos["futuretask.cuerpo"].(*objetoDalvik); ok {
+		return m.ejecutaDiferido(interior, origen)
+	}
+	if met := m.buscaMetodo(cuerpo.clase, "call", "()Ljava/lang/Object;"); met != nil {
+		_, err := m.ejecutaCuerpo(cuerpo.clase, met, []any{cuerpo}, []string{cuerpo.clase})
+		return err
+	}
+	met := m.buscaMetodo(cuerpo.clase, "run", "()V")
+	if met == nil {
+		m.avisa("%s con un %s que no declara call() ni run()V", origen, claseCorta(cuerpo.clase))
+		return nil
+	}
+	_, err := m.ejecutaCuerpo(cuerpo.clase, met, []any{cuerpo}, []string{cuerpo.clase})
 	return err
 }
 
@@ -5243,6 +5271,16 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// detenía a Termux en `SharedProperties.loadPropertiesFromDisk`.
 		if obj != nil && es("Ljava/util/Properties;") && obj.propiedades == nil {
 			obj.propiedades = map[string]string{}
+		}
+		// `FutureTask` no trae `run()V` en el dex: ese método vive en java.util.concurrent. Lo que
+		// sí trae el dex es el cuerpo que recibe en el constructor —un `Callable` en `(Callable)V`
+		// o un `Runnable` en `(Runnable;Object)V`— y es lo que el ejecutor tiene que correr. Se
+		// guarda en el objeto para que `ejecutaRunnable` lo encuentre al drenar la cola, sin
+		// inventar un `run()V` que no está en ningún dex.
+		if obj != nil && es("Ljava/util/concurrent/FutureTask;") && len(vals) >= 1 {
+			if cuerpo, ok := vals[0].(*objetoDalvik); ok {
+				obj.campos["futuretask.cuerpo"] = cuerpo
+			}
 		}
 		// `HashMap(Map)` copia las claves del argumento, sin inventar ninguna. Termux crea un
 		// HashMap vacío a partir de otro antes de pedirle `keySet`.
