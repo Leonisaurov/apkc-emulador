@@ -944,3 +944,37 @@ func TestPreferenciasContainsSobreClavesDelMapa(t *testing.T) {
 		t.Errorf("containsKey sobre getAll: v=%v ok=%v err=%v", v, ok, err)
 	}
 }
+
+// TestPreviewBooleanValueOfGuardaElBit comprueba la semántica real de `Boolean.valueOf(Z)` y de
+// `booleanValue()`: el primero entrega un objeto no nulo con el bit guardado y el segundo lo lee.
+// Sin estos stubs el cero de `Ljava/lang/Boolean;` llegaba como receptor nulo al `booleanValue()`
+// de `CollectionsKt___CollectionsKt.toBooleanArray` y el guardián de `invoca` cortaba la ejecución.
+func TestPreviewBooleanValueOfGuardaElBit(t *testing.T) {
+	m := maquinaDeStubs()
+	for _, caso := range []struct {
+		bit    int32
+		espera int32
+	}{{0, 0}, {1, 1}} {
+		valor, ok, err := m.intentaStub([]string{"Ljava/lang/Boolean;"}, "valueOf",
+			"(Z)Ljava/lang/Boolean;", []any{caso.bit}, nil)
+		if err != nil || !ok || valor == nil {
+			t.Fatalf("valueOf(%d): v=%v ok=%v err=%v", caso.bit, valor, ok, err)
+		}
+		objeto := esperaObjetoDeStub(t, valor, "Ljava/lang/Boolean;")
+		leido, ok, err := m.intentaStub([]string{"Ljava/lang/Boolean;"}, "booleanValue",
+			"()Z", nil, objeto)
+		if err != nil || !ok {
+			t.Fatalf("booleanValue de %d: ok=%v err=%v", caso.bit, ok, err)
+		}
+		if leido != caso.espera {
+			t.Errorf("booleanValue de %d devolvió %v y se esperaba %d", caso.bit, leido, caso.espera)
+		}
+	}
+	// `intentaStub` no decide sobre el receptor nulo: eso lo hace el guardián de `invoca`, que
+	// rechaza la llamada antes de llegar aquí. Aquí solo se comprueba que el stub no fabrica un
+	// objeto para un receptor que no existe.
+	if _, ok, err := m.intentaStub([]string{"Ljava/lang/Boolean;"}, "booleanValue",
+		"()Z", nil, nil); ok || err != nil {
+		t.Errorf("booleanValue sobre un receptor nulo: ok=%v err=%v", ok, err)
+	}
+}

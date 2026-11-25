@@ -2174,3 +2174,25 @@ func TestStubArraysFillEscribeSoloElRangoPedido(t *testing.T) {
 		t.Error("se aceptó un rango invertido")
 	}
 }
+
+// TestAndIntLit16LeeLosNibblesDeD8 falsifica el opcode 0xd5 con la codificación real de d8: el
+// byte alto de la primera palabra lleva `BB<<4 | AA` y la segunda palabra el literal de 16 bits.
+// Es la forma que detenía a `ImageVector$Builder$GroupParams.<init>` con un `index out of range`.
+func TestAndIntLit16LeeLosNibblesDeD8(t *testing.T) {
+	d := &dexFile{}
+	insns := []uint16{
+		0x0d13, 0x00de, // const/16 v13, #222
+		0xded5, 0x0080, // and-int/lit16 v14, v13, #128  (0xde = 13<<4 | 14)
+		0x0e0f,         // return v14
+	}
+	met := &metodoDalvik{nombre: "and16", retorno: "I", proto: "()I", dex: d,
+		item: &codeItem{registersSize: 15, insnsSize: uint32(len(insns)), insns: insns}}
+	m := nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{}}, nil)
+	v, err := m.ejecutaCuerpo("Lcom/ejemplo/A;", met, nil, nil)
+	if err != nil {
+		t.Fatalf("el método con and-int/lit16 falló: %v", err)
+	}
+	if v != int32(222&128) {
+		t.Errorf("and-int/lit16 dio %v y se esperaba %d", v, 222&128)
+	}
+}

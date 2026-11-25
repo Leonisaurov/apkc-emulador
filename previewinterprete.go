@@ -3768,11 +3768,22 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 					return nil, err
 				}
 				lit := int32(int16(w))
-				v, err := enteraLit(op-0xd0, regs[aa], lit)
+				// El 22s de d8 lleva los dos registros como nibbles en el byte alto de la primera
+				// palabra (`BB<<4 | AA`) y el literal entero en la segunda: medido en el dexdump de
+				// `ImageVector$Builder$GroupParams.<init>`, `d5de 8000` es `and-int/lit16 v14, v13,
+				// #128` (0xde = 13<<4 | 14) y el byte alto 222 no cabe en los 15 registros del
+				// método, que era el `index out of range [222] with length 15` del intérprete.
+				// El emisor del fork escribe un solo registro de un byte en ese alto (`0ad0` para
+				// `add-int/lit16 v10, v10`): si el byte alto cabe en `regs`, se mantiene esa forma.
+				destino, fuente := aa, aa
+				if aa >= len(regs) {
+					destino, fuente = aa&0xf, aa>>4
+				}
+				v, err := enteraLit(op-0xd0, regs[fuente], lit)
 				if err != nil {
 					return nil, err
 				}
-				poner(aa, v)
+				poner(destino, v)
 				pc += 2
 			case 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf, 0xe0, 0xe1, 0xe2: // lit8 (22b)
 				w, err := segunda()
@@ -4701,8 +4712,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		return false
 	}
 	// esEntero y esElementoDeTraza reconocen los objetos que crean estos stubs y que la app encadena
-	// justo después (`Integer.intValue`, los getters de `StackTraceElement`).
+	// justo después (`Integer.intValue`, los getters de `StackTraceElement`). esBooleano reconoce el
+	// objeto que crea `Boolean.valueOf`; el receptor nulo sigue cortando en `invoca`, aquí no se
+	// relaja nada.
 	esEntero := func() bool { return obj != nil && strings.HasSuffix(obj.clase, "Ljava/lang/Integer;") }
+	esBooleano := func() bool { return obj != nil && strings.HasSuffix(obj.clase, "Ljava/lang/Boolean;") }
 	esElementoDeTraza := func() bool {
 		return obj != nil && strings.HasSuffix(obj.clase, "Ljava/lang/StackTraceElement;")
 	}
@@ -7041,6 +7055,16 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"Ljava/lang/Integer;.value": n,
 			}}, true, nil
 		}
+		// `Boolean.valueOf(Z)` entrega el Boolean cacheado por la JVM: un objeto NO nulo con el bit
+		// en su campo. Sin este stub el cero de `Ljava/lang/Boolean;` llegaba como receptor nulo al
+		// `booleanValue()` siguiente y el guardián de `invoca` cortaba la ejecución en
+		// `CollectionsKt___CollectionsKt.toBooleanArray`. El valor se guarda como int32 de Dalvik,
+		// igual que hace `Integer.valueOf`, y el bit sale del propio argumento del dex.
+		if len(vals) == 1 && es("Ljava/lang/Boolean;") {
+			return &objetoDalvik{clase: "Ljava/lang/Boolean;", campos: map[string]any{
+				"Ljava/lang/Boolean;.value": boolAInt(boolDe(vals[0])),
+			}}, true, nil
+		}
 	case "parseInt":
 		if len(vals) >= 1 && es("Ljava/lang/Integer;", "Ljava/lang/Long;") {
 			n, err := strconv.ParseInt(strings.TrimSpace(textoDe(vals[0])), 10, 32)
@@ -7091,6 +7115,13 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return n, true, nil
 			}
 			return int32(0), true, nil
+		}
+	case "booleanValue":
+		// el bit que `Boolean.valueOf` guardó en el objeto. La ausencia del campo es el `false`
+		// de un Boolean recién creado sin valor sembrado; el receptor nulo NO llega aquí: el
+		// guardián de `invoca` lo rechaza antes, igual que antes de este stub.
+		if len(vals) == 0 && esBooleano() {
+			return boolAInt(boolDe(obj.campos["Ljava/lang/Boolean;.value"])), true, nil
 		}
 	case "charAt":
 		if len(vals) == 1 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
