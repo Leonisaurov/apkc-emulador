@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"flag"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -582,5 +584,102 @@ func TestElPreviewConservaLosEspaciosDelTextoEscrito(t *testing.T) {
 	// un valor hecho solo de espacios no es un id y se sigue rechazando al parsear
 	if err := (guionDeEntrada{tipo: "escribir", eventos: &guion}).Set("   "); err == nil {
 		t.Error("--escribir aceptó un valor hecho solo de espacios")
+	}
+}
+
+// rutaDelFicheroRom apunta al fichero versionable desde el directorio donde corre la suite. El
+// intérprete materializado vive en apkc/, así que el submódulo está un nivel por encima.
+func rutaDelFicheroRom() string {
+	return filepath.Join("..", "studio", "apkc-emulador", "rom.json")
+}
+
+// TestRomElFicheroCoincideConElValorSembrado evita que el rom.json versionable y la ROM que viaja
+// dentro del binario se separen: el fichero es la documentación y la constante es lo que corre en
+// la pestaña, donde no hay FS del que leer.
+func TestRomElFicheroCoincideConElValorSembrado(t *testing.T) {
+	datos, err := os.ReadFile(rutaDelFicheroRom())
+	if err != nil {
+		t.Fatalf("leer rom.json: %v", err)
+	}
+	if string(datos) != romPorDefectoJSON {
+		t.Errorf("rom.json y romPorDefectoJSON difieren: el fichero tiene %d bytes y la ROM %d",
+			len(datos), len(romPorDefectoJSON))
+	}
+	var j romJSON
+	if err := json.Unmarshal([]byte(romPorDefectoJSON), &j); err != nil {
+		t.Fatalf("la ROM sembrada no es JSON: %v", err)
+	}
+	if j.Almacenamiento.Ruta != "/storage/emulated/0" {
+		t.Errorf("el almacenamiento es %q y se esperaba /storage/emulated/0", j.Almacenamiento.Ruta)
+	}
+	if len(j.Almacenamiento.Alias) != 1 || j.Almacenamiento.Alias[0] != "/sdcard" {
+		t.Errorf("los alias son %v y se esperaba solo /sdcard", j.Almacenamiento.Alias)
+	}
+}
+
+// TestRomArbolYReglaMasLarga comprueba que el alias se resuelve al único almacenamiento, que el
+// árbol sembrado responde a listFiles y que la regla de prefijo más larga vence a la general.
+func TestRomArbolYReglaMasLarga(t *testing.T) {
+	const escribir = "android.permission.WRITE_EXTERNAL_STORAGE"
+	rom, err := cargaRom("", []string{escribir}, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM: %v", err)
+	}
+	if rom.guardar != "" {
+		t.Errorf("guardar es %q y la persistencia debe estar desactivada por defecto", rom.guardar)
+	}
+	if canonica := rom.canonica("/sdcard/Download/leeme.txt"); canonica != "/storage/emulated/0/Download/leeme.txt" {
+		t.Errorf("el alias dio %q", canonica)
+	}
+	nodo := rom.arbol["/storage/emulated/0/Download"]
+	if nodo == nil || !nodo.directorio {
+		t.Fatalf("Download no está sembrado como directorio: %+v", nodo)
+	}
+	if len(nodo.hijos) != 2 || nodo.hijos[0] != "/storage/emulated/0/Download/leeme.txt" {
+		t.Errorf("los hijos de Download son %v y se esperaban dos en orden de siembra", nodo.hijos)
+	}
+	// sin permiso concedido todo se deniega, incluso bajo el prefijo general
+	sinPermiso, err := cargaRom("", nil, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM sin permisos: %v", err)
+	}
+	if sinPermiso.accesoPermitido("/sdcard/Download", escribir) {
+		t.Error("la ROM concedió acceso sin permiso concedido")
+	}
+	if !rom.accesoPermitido("/sdcard/Download/leeme.txt", escribir) {
+		t.Error("WRITE concedido no da acceso a Download")
+	}
+	if rom.accesoPermitido("/sdcard/Documents/notas.txt", escribir) {
+		t.Error("la regla general concedió acceso a Documents, donde la regla más larga deniega")
+	}
+}
+
+// TestRomVolcadoEsReleible cubre la persistencia opcional sin escribir en disco: el volcado tiene
+// que volver a cargarse con el mismo almacenamiento y los mismos nodos.
+func TestRomVolcadoEsReleible(t *testing.T) {
+	rom, err := cargaRom("", nil, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM: %v", err)
+	}
+	rom.pone("/sdcard/Download/nuevo.txt", false, "sembrado por la app")
+	datos := rom.volcado()
+	var j romJSON
+	if err := json.Unmarshal(datos, &j); err != nil {
+		t.Fatalf("el volcado no es JSON: %v", err)
+	}
+	if j.Almacenamiento.Ruta != "/storage/emulated/0" {
+		t.Errorf("el volcado cambió el almacenamiento a %q", j.Almacenamiento.Ruta)
+	}
+	encontrado := false
+	for _, e := range j.Arbol {
+		if e.Ruta == "/storage/emulated/0/Download/nuevo.txt" && e.Contenido == "sembrado por la app" {
+			encontrado = true
+		}
+	}
+	if !encontrado {
+		t.Errorf("el volcado perdió el fichero creado: %d entradas", len(j.Arbol))
+	}
+	if _, err := cargaRom(rutaDelFicheroRom(), nil, ""); err != nil {
+		t.Errorf("el fichero versionable no se puede cargar: %v", err)
 	}
 }

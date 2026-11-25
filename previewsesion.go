@@ -199,6 +199,7 @@ func (s *sesionPreview) estabilizaSesion() {
 			nueva.registro = m.registro
 			nueva.almacen = m.almacen
 			nueva.reloj = m.reloj
+			nueva.rom = m.rom
 			nueva.intent = m.intentoSaliente
 			if err := nueva.abreActividad(destino, s.preparadorSesion(), true); err != nil {
 				m.avisa("la actividad %s no arrancó: %v", claseCorta(destino), err)

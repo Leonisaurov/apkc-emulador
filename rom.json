@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "usuario": "usuario",
+  "almacenamiento": {
+    "ruta": "/storage/emulated/0",
+    "alias": ["/sdcard"]
+  },
+  "reglas": [
+    {
+      "permiso": "android.permission.READ_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": true
+    },
+    {
+      "permiso": "android.permission.WRITE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0/Download",
+      "conceder": true
+    },
+    {
+      "permiso": "android.permission.WRITE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    },
+    {
+      "permiso": "android.permission.MANAGE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    },
+    {
+      "permiso": "android.permission.REQUEST_INSTALL_PACKAGES",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    }
+  ],
+  "arbol": [
+    { "ruta": "/storage/emulated/0", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download/leeme.txt", "contenido": "Hola desde la ROM" },
+    { "ruta": "/storage/emulated/0/Download/fotos", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download/fotos/gato.png", "contenido": "PNG sembrado" },
+    { "ruta": "/storage/emulated/0/Documents", "directorio": true },
+    { "ruta": "/storage/emulated/0/Documents/notas.txt", "contenido": "Notas de la ROM" },
+    { "ruta": "/storage/emulated/0/Music", "directorio": true },
+    { "ruta": "/storage/emulated/0/Music/cancion.mp3", "contenido": "Audio sembrado" },
+    { "ruta": "/storage/emulated/0/Android", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data/com.martinmimigames.simplefileexplorer", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data/com.martinmimigames.simplefileexplorer/files", "directorio": true }
+  ]
+}

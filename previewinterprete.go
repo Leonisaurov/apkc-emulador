@@ -348,6 +348,9 @@ type objetoDalvik struct {
 	// vistas son las vistas de ESTA instancia inflada, por id: dos filas del mismo layout no
 	// comparten el `findViewById`, como no lo comparten en el aparato.
 	vistas map[uint32]*objetoDalvik
+	// hijosCodigo son las vistas que la app añadió con addView a ESTA instancia, incluso las que no
+	// tienen id. El modelo las publica como filas del contenedor que las recibió.
+	hijosCodigo []*objetoDalvik
 	// mensajeExcepcion es el texto que un `Throwable` recibió en su constructor: es lo que devuelve
 	// `getMessage()` y lo que el aviso de una excepción sin capturar enseña.
 	mensajeExcepcion string
@@ -602,6 +605,16 @@ type maquinaDalvik struct {
 	// almacen es el SharedPreferences de la ejecución: en memoria, sin ficheros, y compartido por
 	// todas las actividades y por la instancia recreada
 	almacen *almacenPreferencias
+	// rom es el árbol fijo de un solo almacenamiento sobre el que se evalúan las operaciones de
+	// java.io.File. Se comparte con las pantallas que se abren y con la actividad recreada.
+	rom *romDalvik
+	// contenedores guarda, por id de vista, los hijos que la app añadió por código: los que no
+	// tienen id también cuentan, porque el modelo los pinta igual que los del adaptador.
+	contenedores map[uint32][]*objetoDalvik
+	// listaRefrescada es el id del contenedor al que la app acaba de llamar removeAllViews. En el
+	// gestor es id/drive_list (0x7f030001), no id/list: el modelo publica sus filas en id/list, que
+	// es el nodo de lista que se enseña, sin confundirlas con los botones de los diálogos.
+	listaRefrescada uint32
 	// bundleInicial es el `savedInstanceState` con el que arranca esta máquina: nil salvo que venga
 	// de una recreación, que es cuando el framework lo entrega no nulo
 	bundleInicial *objetoDalvik
@@ -699,6 +712,64 @@ func (a *almacenPreferencias) volcado() map[string]map[string]any {
 type oyenteItemRegistrado struct {
 	oyente any
 	vista  any
+}
+
+// romActiva devuelve la ROM de la máquina. Las máquinas armadas a mano en las pruebas no traen ROM:
+// en ese caso se siembra la de defecto para que el límite de permisos esté siempre definido.
+func (m *maquinaDalvik) romActiva() *romDalvik {
+	if m == nil {
+		return nil
+	}
+	if m.rom == nil {
+		if r, err := cargaRom("", nil, ""); err == nil {
+			m.rom = r
+		}
+	}
+	return m.rom
+}
+
+// rutaDeFichero lee la ruta sembrada en el constructor de java.io.File. Está vacía solo si nadie
+// la fijó: getPath/getAbsolutePath la devuelven tal cual, sin normalizar el alias del almacenamiento.
+func (m *maquinaDalvik) rutaDeFichero(obj *objetoDalvik) string {
+	if obj == nil {
+		return ""
+	}
+	ruta, _ := obj.campos["file.ruta"].(string)
+	return ruta
+}
+
+// objetoDeRuta construye un File del framework con la ruta ya sembrada.
+func objetoDeRuta(ruta string) *objetoDalvik {
+	return &objetoDalvik{clase: "Ljava/io/File;", campos: map[string]any{"file.ruta": ruta}}
+}
+
+// avisoDenegado deja constancia de que la ROM cerró el paso. El texto no incluye la ruta para que
+// cien ficheros denegados no llenen el JSON de avisos repetidos.
+func (m *maquinaDalvik) avisoDenegado(operacion, permiso, ruta string) {
+	m.avisa("java.io.File.%s: la ROM deniega el acceso sin %s concedido sobre la ruta", operacion, permiso)
+}
+
+// paqueteDeLaApp saca el paquete del primer descriptor propio del dex, para sembrar el directorio
+// de ficheros externos sin inventar un nombre de app.
+func paqueteDeLaApp(m *maquinaDalvik) string {
+	if m == nil || m.prog == nil || len(m.prog.clases) == 0 {
+		return "app"
+	}
+	nombres := make([]string, 0, len(m.prog.clases))
+	for nombre := range m.prog.clases {
+		nombres = append(nombres, nombre)
+	}
+	sort.Strings(nombres)
+	for _, nombre := range nombres {
+		if !strings.HasPrefix(nombre, "L") || !strings.Contains(nombre, "/") {
+			continue
+		}
+		partes := strings.Split(strings.TrimPrefix(nombre, "L"), "/")
+		if len(partes) > 1 {
+			return strings.Join(partes[:len(partes)-1], ".")
+		}
+	}
+	return "app"
 }
 
 func nuevaMaquina(p *programaDalvik, tabla *tablaRecursos) *maquinaDalvik {
@@ -1464,6 +1535,14 @@ func ejecutaOnCreateNavegando(d *dexFile, tabla *tablaRecursos, actividad string
 // se lanza, como en el aparato.
 func ejecutaOnCreateConEventos(dxs []*dexFile, tabla *tablaRecursos, actividad string, eventos []eventoUsuario,
 	preparar func(m *maquinaDalvik), declaradas map[string]bool) (*resultadoEjecucion, uint32, error) {
+	return ejecutaOnCreateConEventosConRom(dxs, tabla, actividad, eventos, preparar, declaradas, nil)
+}
+
+// ejecutaOnCreateConEventosConRom es el mismo cuerpo con la ROM de la corrida. Las máquinas nuevas
+// (navegación y recreación) reciben la misma instancia: los ficheros que la app creó en una pantalla
+// siguen existiendo en la siguiente, como en el aparato.
+func ejecutaOnCreateConEventosConRom(dxs []*dexFile, tabla *tablaRecursos, actividad string, eventos []eventoUsuario,
+	preparar func(m *maquinaDalvik), declaradas map[string]bool, rom *romDalvik) (*resultadoEjecucion, uint32, error) {
 	res := &resultadoEjecucion{Metodo: "onCreate"}
 	prog, err := cargaPrograma(dxs...)
 	if err != nil {
@@ -1472,6 +1551,7 @@ func ejecutaOnCreateConEventos(dxs []*dexFile, tabla *tablaRecursos, actividad s
 	}
 	m := nuevaMaquina(prog, tabla)
 	m.declaradas = declaradas
+	m.rom = rom
 	ciclo := []string{}
 	m.registro = &ciclo
 	clase, conMain := eligeClaseLanzadora(prog, actividad)
@@ -1548,6 +1628,7 @@ func ejecutaOnCreateConEventos(dxs []*dexFile, tabla *tablaRecursos, actividad s
 				nueva.registro = m.registro
 				nueva.almacen = m.almacen
 				nueva.reloj = m.reloj
+				nueva.rom = m.rom
 				nueva.intent = m.intentoSaliente
 				if err := nueva.abreActividad(destino, preparar, true); err != nil {
 					m.avisa("la actividad %s no arrancó: %v", claseCorta(destino), err)
@@ -1592,6 +1673,7 @@ func ejecutaOnCreateConEventos(dxs []*dexFile, tabla *tablaRecursos, actividad s
 		nueva.registro = m.registro
 		nueva.almacen = m.almacen
 		nueva.reloj = m.reloj
+		nueva.rom = m.rom
 		nueva.intent = m.intent
 		nueva.bundleInicial = bundle
 		nueva.estadoGuardado = m.estadoGuardado
@@ -4298,7 +4380,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			"getObserverConstructorType", "setView", "setCancelable",
 			"checkSelfPermission", "invalidate", "loadLibrary", "load", "Builder",
 			"newSimpleInstance", "build", "getSettings", "loadUrl", "loadData",
-			"loadDataWithBaseURL", "evaluateJavascript":
+			"loadDataWithBaseURL", "evaluateJavascript", "requestPermissions",
+			"exists", "isDirectory", "isFile", "canRead", "canWrite", "length",
+			"listFiles", "list", "getAbsolutePath", "getName", "getParent",
+			"mkdir", "mkdirs", "createNewFile", "delete", "renameTo",
+			"removeAllViews", "isShown":
 			return nil, false, nil
 		}
 	}
@@ -4561,12 +4647,30 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				campos: map[string]any{"esContexto": true}}, true, nil
 		}
 	case "checkSelfPermission":
-		// PERMISSION_GRANTED es cero en Android. La vista previa no tiene sistema de permisos;
-		// conceder es lo que ya hacía el cero implícito del intérprete, así que el valor explícito
-		// quita el aviso sin cambiar la rama que hoy se ejecuta. Se atiende tanto la llamada sobre
-		// la actividad (Context) como la estática de ContextCompat.
+		// La ROM tiene un solo usuario y deniega por defecto: PERMISSION_DENIED es -1 en Android y
+		// PERMISSION_GRANTED es cero. Solo `--permiso` concede, y ni así se salta el límite de
+		// prefijos de `accesoPermitido`. Se atiende la llamada sobre la actividad (Context) y la
+		// estática de ContextCompat.
 		if len(vals) == 1 && (esContexto() || es("Landroidx/core/content/ContextCompat;")) {
-			return int32(0), true, nil
+			if m.romActiva().concedido(textoDe(vals[0])) {
+				return int32(0), true, nil
+			}
+			return int32(-1), true, nil
+		}
+	case "requestPermissions":
+		// El emulador registra la petición y devuelve la denegación por defecto del modelo; no hay
+		// diálogo del sistema ni cambio de permisos reales. La petición se anota en `Avisos` y no
+		// crea un campo JSON nuevo.
+		if len(vals) >= 1 && obj != nil && esContexto() {
+			pedidos := []string{}
+			if arr, ok := vals[0].(*arregloDalvik); ok {
+				for _, p := range arr.datos {
+					pedidos = append(pedidos, textoDe(p))
+				}
+			}
+			m.avisa("el emulador registra la petición y devuelve la denegación por defecto del modelo; "+
+				"no hay diálogo del sistema ni cambio de permisos reales: %s", strings.Join(pedidos, ", "))
+			return nil, true, nil
 		}
 	case "getInstalledPackages":
 		// no hay sistema de paquetes en la vista previa: la lista es vacía, pero no nula, para que
@@ -4651,10 +4755,26 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			len(vals) == 1 {
 			obj.campos["intent.accion"] = textoDe(vals[0])
 		}
-		// `new File(String path)` guarda su ruta: la vista previa no abre el fichero, pero sí
-		// puede devolver la ruta que la app le dio cuando pregunta por ella.
+		// `new File(String path)` guarda la ruta sembrada en el objeto. Lo que se evalúa es el árbol
+		// ROM, no el FS del aparato ni el del navegador: la semántica de `java.io.File` se evalúa
+		// sobre un árbol ROM en memoria, fijo, con un único almacenamiento.
 		if obj != nil && es("Ljava/io/File;") && proto == "(Ljava/lang/String;)V" && len(vals) == 1 {
-			obj.campos["file.ruta"] = textoDe(vals[0])
+			ruta := textoDe(vals[0])
+			// `System.getenv` sigue devolviendo la cadena vacía, pero un File construido sin ruta
+			// se siembra en la raíz del único almacenamiento de la ROM. Así la app que pregunta por
+			// el almacenamiento externo recibe una ruta del modelo, no una del FS del aparato.
+			if ruta == "" {
+				if rom := m.romActiva(); rom != nil {
+					ruta = rom.almacen
+				}
+			}
+			obj.campos["file.ruta"] = ruta
+		}
+		// `new File(String padre, String hijo)` compone la ruta con un solo separador.
+		if obj != nil && es("Ljava/io/File;") && proto == "(Ljava/lang/String;Ljava/lang/String;)V" && len(vals) == 2 {
+			padre := strings.TrimSuffix(textoDe(vals[0]), "/")
+			hijo := strings.TrimPrefix(textoDe(vals[1]), "/")
+			obj.campos["file.ruta"] = padre + "/" + hijo
 		}
 		// el constructor de un ArrayAdapter recibe sus elementos: se guardan para el respaldo de
 		// getCount/getItem/getView de una subclase del proyecto que no los reescriba. Un arreglo
@@ -4820,17 +4940,50 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return nil, true, nil
 		}
 	case "addView":
-		// al añadir una vista a un contenedor, el hijo pasa a ser parte de esa instancia: un
-		// `findViewById` posterior sobre el contenedor lo encuentra por su id.
+		// Al añadir una vista a un contenedor, el hijo pasa a ser parte de esa instancia: un
+		// `findViewById` posterior sobre el contenedor lo encuentra por su id. Antes solo se
+		// registraban los hijos con id, así que las filas que la app construye en código —sin id—
+		// desaparecían. Ahora se guardan todos, y el contenedor se registra por su propio id para
+		// que `expandeListas` pueda publicarlos en el modelo.
 		if len(vals) == 1 && obj != nil &&
 			(es("Landroid/view/ViewGroup;", "Landroid/widget/ScrollView;") || esVista()) {
-			if hijo, ok := vals[0].(*objetoDalvik); ok && hijo.id != 0 {
-				if obj.vistas == nil {
-					obj.vistas = map[uint32]*objetoDalvik{}
+			if hijo, ok := vals[0].(*objetoDalvik); ok {
+				obj.hijosCodigo = append(obj.hijosCodigo, hijo)
+				if hijo.id != 0 {
+					if obj.vistas == nil {
+						obj.vistas = map[uint32]*objetoDalvik{}
+					}
+					obj.vistas[hijo.id] = hijo
 				}
-				obj.vistas[hijo.id] = hijo
+				if obj.id != 0 {
+					if m.contenedores == nil {
+						m.contenedores = map[uint32][]*objetoDalvik{}
+					}
+					m.contenedores[obj.id] = append(m.contenedores[obj.id], hijo)
+				}
 			}
 			return nil, true, nil
+		}
+	case "removeAllViews":
+		// Vaciar el contenedor descarta también las filas que se hubieran añadido por código: sin
+		// esto, una refresh de la lista dejaría las filas viejas en el modelo.
+		if len(vals) == 0 && obj != nil &&
+			(es("Landroid/view/ViewGroup;", "Landroid/widget/ScrollView;") || esVista()) {
+			obj.hijosCodigo = nil
+			if obj.vistas != nil {
+				obj.vistas = map[uint32]*objetoDalvik{}
+			}
+			if obj.id != 0 {
+				delete(m.contenedores, obj.id)
+				m.listaRefrescada = obj.id
+			}
+			return nil, true, nil
+		}
+	case "isShown":
+		// Una vista recién añadida a un contenedor que está en pantalla se ve: devolver el cero
+		// aquí hacía que la app saltara el pintado de la fila y el modelo se quedara vacío.
+		if len(vals) == 0 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+			return int32(1), true, nil
 		}
 	case "addRule":
 		// `RelativeLayout$LayoutParams.addRule` solo acumula reglas en los parámetros; el modelo
@@ -5744,6 +5897,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			paquete, _ := obj.campos["Ljava/lang/Package;.name"].(string)
 			return cadenaObjeto(paquete), true, nil
 		}
+		if nombre == "getName" && len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := strings.TrimSuffix(m.rutaDeFichero(obj), "/")
+			return cadenaObjeto(ruta[strings.LastIndex(ruta, "/")+1:]), true, nil
+		}
 	case "toString":
 		// el `toString` de una excepción es su clase con el mensaje: es lo que un catch imprime
 		if len(vals) == 0 && esThrowableObj() {
@@ -5767,6 +5924,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return textoDe(obj), true, nil
 		}
 	case "length":
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := m.rutaDeFichero(obj)
+			rom := m.romActiva()
+			if !rom.accesoPermitido(ruta, "android.permission.READ_EXTERNAL_STORAGE") {
+				m.avisoDenegado("length", "android.permission.READ_EXTERNAL_STORAGE", ruta)
+				return int64(0), true, nil
+			}
+			if n := rom.arbol[rom.canonica(ruta)]; n != nil && !n.directorio {
+				return int64(len(n.contenido)), true, nil
+			}
+			return int64(0), true, nil
+		}
 		if len(vals) == 0 && es("Ljava/lang/StringBuilder;") && obj != nil && obj.cadena != nil {
 			return int32(obj.cadena.Len()), true, nil
 		}
@@ -5796,6 +5965,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			if s, ok := cadenaDe(receptor); ok {
 				otro, esCadena := cadenaDe(vals[0])
 				return boolAInt(esCadena && s == otro), true, nil
+			}
+			if a, ok := receptor.(*objetoDalvik); ok && a.clase == "Ljava/io/File;" {
+				if b, ok := vals[0].(*objetoDalvik); ok && b.clase == "Ljava/io/File;" {
+					rom := m.romActiva()
+					return boolAInt(rom.canonica(m.rutaDeFichero(a)) == rom.canonica(m.rutaDeFichero(b))), true, nil
+				}
 			}
 		}
 	case "setColor":
@@ -6048,6 +6223,140 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
 			ruta, _ := obj.campos["file.ruta"].(string)
 			return cadenaObjeto(ruta), true, nil
+		}
+	case "getAbsolutePath", "getParent":
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := strings.TrimSuffix(m.rutaDeFichero(obj), "/")
+			if nombre == "getAbsolutePath" {
+				return cadenaObjeto(ruta), true, nil
+			}
+			i := strings.LastIndex(ruta, "/")
+			if i <= 0 {
+				return nil, true, nil
+			}
+			return cadenaObjeto(ruta[:i]), true, nil
+		}
+	case "exists", "isDirectory", "isFile", "canRead", "canWrite":
+		// Cada lectura pasa por el límite de permisos. Sin permiso concedido la respuesta es la
+		// denegación (falso o cero) y un aviso; con permiso, el árbol ROM es la única fuente.
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := m.rutaDeFichero(obj)
+			rom := m.romActiva()
+			permiso := "android.permission.READ_EXTERNAL_STORAGE"
+			if nombre == "canWrite" {
+				permiso = "android.permission.WRITE_EXTERNAL_STORAGE"
+			}
+			if !rom.accesoPermitido(ruta, permiso) {
+				m.avisoDenegado(nombre, permiso, ruta)
+				return int32(0), true, nil
+			}
+			n := rom.arbol[rom.canonica(ruta)]
+			switch nombre {
+			case "exists":
+				return boolAInt(n != nil), true, nil
+			case "isDirectory":
+				return boolAInt(n != nil && n.directorio), true, nil
+			case "isFile":
+				return boolAInt(n != nil && !n.directorio), true, nil
+			case "canRead":
+				return boolAInt(n != nil), true, nil
+			case "canWrite":
+				return boolAInt(n != nil && !n.directorio), true, nil
+			default:
+				return boolAInt(n != nil), true, nil
+			}
+		}
+	case "listFiles", "list":
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := m.rutaDeFichero(obj)
+			rom := m.romActiva()
+			permiso := "android.permission.READ_EXTERNAL_STORAGE"
+			if !rom.accesoPermitido(ruta, permiso) {
+				m.avisoDenegado(nombre, permiso, ruta)
+			}
+			tipo := "[Ljava/lang/String;"
+			if nombre == "listFiles" {
+				tipo = "[Ljava/io/File;"
+			}
+			datos := []any{}
+			if rom.accesoPermitido(ruta, permiso) {
+				if n := rom.arbol[rom.canonica(ruta)]; n != nil && n.directorio {
+					for _, hijo := range n.hijos {
+						if nombre == "listFiles" {
+							datos = append(datos, objetoDeRuta(hijo))
+						} else {
+							datos = append(datos, cadenaObjeto(hijo[strings.LastIndex(hijo, "/")+1:]))
+						}
+					}
+				}
+			}
+			return &arregloDalvik{tipo: tipo, datos: datos}, true, nil
+		}
+	case "mkdir", "mkdirs", "createNewFile", "delete":
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta := m.rutaDeFichero(obj)
+			rom := m.romActiva()
+			permiso := "android.permission.WRITE_EXTERNAL_STORAGE"
+			if !rom.accesoPermitido(ruta, permiso) {
+				m.avisoDenegado(nombre, permiso, ruta)
+				return int32(0), true, nil
+			}
+			canonica := rom.canonica(ruta)
+			switch nombre {
+			case "delete":
+				if _, existe := rom.arbol[canonica]; !existe {
+					return int32(0), true, nil
+				}
+				rom.borra(canonica)
+			case "mkdir":
+				if rom.arbol[canonica] != nil {
+					return int32(0), true, nil
+				}
+				rom.pone(canonica, true, "")
+			case "mkdirs":
+				rom.pone(canonica, true, "")
+			default:
+				if n := rom.arbol[canonica]; n == nil || n.directorio {
+					return int32(0), true, nil
+				}
+			}
+			rom.modificada = true
+			return int32(1), true, nil
+		}
+	case "renameTo":
+		if len(vals) == 1 && obj != nil && es("Ljava/io/File;") {
+			destino, ok := vals[0].(*objetoDalvik)
+			if !ok {
+				return int32(0), true, nil
+			}
+			rom := m.romActiva()
+			origen := rom.canonica(m.rutaDeFichero(obj))
+			meta := rom.canonica(m.rutaDeFichero(destino))
+			permiso := "android.permission.WRITE_EXTERNAL_STORAGE"
+			if !rom.accesoPermitido(origen, permiso) || !rom.accesoPermitido(meta, permiso) {
+				m.avisoDenegado(nombre, permiso, m.rutaDeFichero(obj))
+				return int32(0), true, nil
+			}
+			n := rom.arbol[origen]
+			if n == nil {
+				return int32(0), true, nil
+			}
+			rom.borra(origen)
+			rom.pone(meta, n.directorio, n.contenido)
+			rom.modificada = true
+			return int32(1), true, nil
+		}
+	case "getExternalFilesDirs", "getExternalFilesDir":
+		// Un solo almacenamiento: el directorio de ficheros de la app está sembrado en el árbol y
+		// se entrega como File, nunca como una ruta del FS del dispositivo.
+		if esContexto() {
+			rom := m.romActiva()
+			base := rom.almacen + "/Android/data/" + paqueteDeLaApp(m) + "/files"
+			rom.pone(base, true, "")
+			if nombre == "getExternalFilesDirs" {
+				return &arregloDalvik{tipo: "[Ljava/io/File;", datos: []any{objetoDeRuta(base)}}, true, nil
+			}
+			return objetoDeRuta(base), true, nil
 		}
 	case "valueOf":
 		if len(vals) == 1 && es("Ljava/lang/String;") {

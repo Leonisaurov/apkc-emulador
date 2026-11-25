@@ -291,6 +291,353 @@ type opcionesPreview struct {
 	locale      string
 	sinEjecutar bool
 	guion       []eventoUsuario
+	// rom es el fichero de la ROM que se quiere usar; vacío significa la ROM sembrada por defecto.
+	rom string
+	// guardarRom, si no está vacío, vuelca el árbol resultante al terminar. Por defecto no se escribe.
+	guardarRom string
+	// permisos son los permisos que la sesión concede expresamente; denegación es el valor por defecto.
+	permisos []string
+}
+
+// romPorDefectoJSON es la ROM que viaja dentro del binario: no se lee del FS en cada ejecución, para
+// que el mismo comando funcione en la pestaña. rom.json es su copia versionable y la prueba
+// TestRomElFicheroCoincideConElValorSembrado comprueba que siguen siendo byte a byte iguales.
+const romPorDefectoJSON = `{
+  "version": 1,
+  "usuario": "usuario",
+  "almacenamiento": {
+    "ruta": "/storage/emulated/0",
+    "alias": ["/sdcard"]
+  },
+  "reglas": [
+    {
+      "permiso": "android.permission.READ_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": true
+    },
+    {
+      "permiso": "android.permission.WRITE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0/Download",
+      "conceder": true
+    },
+    {
+      "permiso": "android.permission.WRITE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    },
+    {
+      "permiso": "android.permission.MANAGE_EXTERNAL_STORAGE",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    },
+    {
+      "permiso": "android.permission.REQUEST_INSTALL_PACKAGES",
+      "prefijo": "/storage/emulated/0",
+      "conceder": false
+    }
+  ],
+  "arbol": [
+    { "ruta": "/storage/emulated/0", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download/leeme.txt", "contenido": "Hola desde la ROM" },
+    { "ruta": "/storage/emulated/0/Download/fotos", "directorio": true },
+    { "ruta": "/storage/emulated/0/Download/fotos/gato.png", "contenido": "PNG sembrado" },
+    { "ruta": "/storage/emulated/0/Documents", "directorio": true },
+    { "ruta": "/storage/emulated/0/Documents/notas.txt", "contenido": "Notas de la ROM" },
+    { "ruta": "/storage/emulated/0/Music", "directorio": true },
+    { "ruta": "/storage/emulated/0/Music/cancion.mp3", "contenido": "Audio sembrado" },
+    { "ruta": "/storage/emulated/0/Android", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data/com.martinmimigames.simplefileexplorer", "directorio": true },
+    { "ruta": "/storage/emulated/0/Android/data/com.martinmimigames.simplefileexplorer/files", "directorio": true }
+  ]
+}
+`
+
+// romRegla es una regla de permiso por prefijo. La regla más larga que casa con la ruta decide;
+// `conceder: false` es explícita para poder cerrar un subárbol dentro de otro más amplio.
+type romRegla struct {
+	Permiso  string `json:"permiso"`
+	Prefijo  string `json:"prefijo"`
+	Conceder bool   `json:"conceder"`
+}
+
+// romEntrada es un nodo del árbol sembrado. `contenido` solo se usa en los ficheros: la ROM no lee
+// ficheros reales, así que lo que la app lee es exactamente lo que aquí se sembró.
+type romEntrada struct {
+	Ruta       string `json:"ruta"`
+	Directorio bool   `json:"directorio,omitempty"`
+	Contenido  string `json:"contenido,omitempty"`
+}
+
+// romJSON es el formato versionable de rom.json.
+type romJSON struct {
+	Version        int          `json:"version"`
+	Usuario        string       `json:"usuario"`
+	Almacenamiento struct {
+		Ruta  string   `json:"ruta"`
+		Alias []string `json:"alias"`
+	} `json:"almacenamiento"`
+	Reglas []romRegla   `json:"reglas"`
+	Arbol  []romEntrada `json:"arbol"`
+}
+
+// romNodo es un nodo ya normalizado del árbol en memoria. `hijos` conserva el orden de siembra, que
+// es el que `listFiles` entrega a la app: sin orden fijo dos ejecuciones darían modelos distintos.
+type romNodo struct {
+	ruta       string
+	directorio bool
+	contenido  string
+	padre      string
+	hijos      []string
+}
+
+// romDalvik es el estado de la ROM durante una ejecución. No se serializa en el JSON del modelo:
+// el único rastro público son los avisos y las filas que la app decide pintar.
+type romDalvik struct {
+	usuario     string
+	almacen     string
+	alias       []romAlias
+	reglas      map[string][]romRegla
+	reglasOrden []romRegla
+	arbol       map[string]*romNodo
+	orden       []string
+	concedidos  map[string]bool
+	declarados  map[string]bool
+	minSdk      int
+	targetSdk   int
+	guardar     string
+	modificada  bool
+}
+
+type romAlias struct {
+	alias     string
+	canonico  string
+}
+
+// cargaRom convierte el JSON en el árbol en memoria. `ruta` vacía toma la ROM sembrada; con permisos
+// se fija qué concede la sesión, y `guardar` activa el volcado opcional al terminar.
+func cargaRom(ruta string, permisos []string, guardar string) (*romDalvik, error) {
+	datos := []byte(romPorDefectoJSON)
+	if ruta != "" {
+		leidos, err := os.ReadFile(ruta)
+		if err != nil {
+			return nil, fmt.Errorf("--rom %q: %w", ruta, err)
+		}
+		datos = leidos
+	}
+	var j romJSON
+	if err := json.Unmarshal(datos, &j); err != nil {
+		return nil, fmt.Errorf("la ROM %q: %w", ruta, err)
+	}
+	if j.Almacenamiento.Ruta == "" {
+		return nil, fmt.Errorf("la ROM %q no declara almacenamiento", ruta)
+	}
+	r := &romDalvik{usuario: j.Usuario, almacen: j.Almacenamiento.Ruta,
+		reglas: map[string][]romRegla{}, arbol: map[string]*romNodo{},
+		concedidos: map[string]bool{}, declarados: map[string]bool{}, guardar: guardar}
+	for _, a := range j.Almacenamiento.Alias {
+		if a != r.almacen {
+			r.alias = append(r.alias, romAlias{alias: a, canonico: r.almacen})
+		}
+	}
+	for _, regla := range j.Reglas {
+		normalizada := romRegla{Permiso: regla.Permiso, Prefijo: r.canonica(regla.Prefijo), Conceder: regla.Conceder}
+		r.reglas[normalizada.Permiso] = append(r.reglas[normalizada.Permiso], normalizada)
+		r.reglasOrden = append(r.reglasOrden, normalizada)
+	}
+	for _, e := range j.Arbol {
+		r.pone(e.Ruta, e.Directorio, e.Contenido)
+	}
+	for _, p := range permisos {
+		r.concedidos[p] = true
+	}
+	return r, nil
+}
+
+// canonica resuelve el alias del único almacenamiento. Fuera de él la ruta se devuelve tal cual: el
+// árbol solo contiene rutas bajo el almacenamiento, así que una ruta ajena no encuentra ningún nodo.
+func (r *romDalvik) canonica(ruta string) string {
+	if r == nil || ruta == "" {
+		return ruta
+	}
+	for _, a := range r.alias {
+		if ruta == a.alias {
+			return a.canonico
+		}
+		if strings.HasPrefix(ruta, a.alias+"/") {
+			return a.canonico + strings.TrimPrefix(ruta, a.alias)
+		}
+	}
+	return ruta
+}
+
+// pone siembra un nodo y lo enlaza con su padre. Se usa tanto al cargar la ROM como cuando la app
+// crea un fichero con Permiso concedido: la persistencia opcional vuelca exactamente este árbol.
+func (r *romDalvik) pone(ruta string, directorio bool, contenido string) {
+	ruta = r.canonica(ruta)
+	if ruta == "" {
+		return
+	}
+	n := r.arbol[ruta]
+	if n == nil {
+		n = &romNodo{ruta: ruta}
+		r.arbol[ruta] = n
+		r.orden = append(r.orden, ruta)
+		padre := ruta
+		for {
+			i := strings.LastIndex(padre, "/")
+			if i <= 0 {
+				break
+			}
+			padre = padre[:i]
+			if p := r.arbol[padre]; p != nil {
+				n.padre = padre
+				p.hijos = append(p.hijos, ruta)
+				break
+			}
+		}
+	}
+	n.directorio = directorio
+	n.contenido = contenido
+}
+
+// borra quita un nodo y su ruta de la lista de hijos del padre.
+func (r *romDalvik) borra(ruta string) {
+	ruta = r.canonica(ruta)
+	n := r.arbol[ruta]
+	if n == nil {
+		return
+	}
+	if p := r.arbol[n.padre]; p != nil {
+		resto := make([]string, 0, len(p.hijos))
+		for _, h := range p.hijos {
+			if h != ruta {
+				resto = append(resto, h)
+			}
+		}
+		p.hijos = resto
+	}
+	delete(r.arbol, ruta)
+	resto := make([]string, 0, len(r.orden))
+	for _, rutaOrden := range r.orden {
+		if rutaOrden != ruta {
+			resto = append(resto, rutaOrden)
+		}
+	}
+	r.orden = resto
+}
+
+// concedido aplica la herencia legacy de targetSdk 29 o menos: escribir implicaba leer antes de que
+// Android separara los dos permisos. Fuera de ese caso, un permiso no concedido está denegado.
+func (r *romDalvik) concedido(permiso string) bool {
+	if r == nil {
+		return false
+	}
+	if r.concedidos[permiso] {
+		return true
+	}
+	const escribir = "android.permission.WRITE_EXTERNAL_STORAGE"
+	const leer = "android.permission.READ_EXTERNAL_STORAGE"
+	return permiso == leer && r.concedidos[escribir] && r.targetSdk > 0 && r.targetSdk <= 29
+}
+
+// accesoPermitido decide en el límite de cada operación de java.io.File. La regla de prefijo más
+// larga gana; sin regla que case, o sin permiso concedido, la respuesta es denegar.
+func (r *romDalvik) accesoPermitido(ruta string, permisos ...string) bool {
+	if r == nil {
+		return false
+	}
+	canonica := r.canonica(ruta)
+	for _, permiso := range permisos {
+		if !r.concedido(permiso) {
+			continue
+		}
+		mejor := -1
+		conceder := false
+		for _, regla := range r.reglas[permiso] {
+			if canonica != regla.Prefijo && !strings.HasPrefix(canonica, regla.Prefijo+"/") {
+				continue
+			}
+			if len(regla.Prefijo) > mejor {
+				mejor = len(regla.Prefijo)
+				conceder = regla.Conceder
+			}
+		}
+		if mejor >= 0 && conceder {
+			return true
+		}
+	}
+	return false
+}
+
+// volcadoDevuelve el JSON de la ROM tal como quedó tras la ejecución, con el mismo formato que
+// rom.json. Es lo que escribe `--guardar-rom`.
+func (r *romDalvik) volcado() []byte {
+	if r == nil {
+		return nil
+	}
+	j := romJSON{Version: 1, Usuario: r.usuario}
+	j.Almacenamiento.Ruta = r.almacen
+	for _, a := range r.alias {
+		j.Almacenamiento.Alias = append(j.Almacenamiento.Alias, a.alias)
+	}
+	j.Reglas = append(j.Reglas, r.reglasOrden...)
+	for _, ruta := range r.orden {
+		if n := r.arbol[ruta]; n != nil {
+			j.Arbol = append(j.Arbol, romEntrada{Ruta: n.ruta, Directorio: n.directorio, Contenido: n.contenido})
+		}
+	}
+	datos, err := json.MarshalIndent(j, "", "  ")
+	if err != nil {
+		return nil
+	}
+	return append(datos, '\n')
+}
+
+// permisosDelManifiesto lee los `<uses-permission>` y `<uses-sdk>` del manifiesto. Solo informa al
+// modelo de lo que la app pide: pedir un permiso no lo concede en esta ROM.
+func permisosDelManifiesto(arbol *elementoLeido, ctx *contextoVista, r *romDalvik) {
+	if arbol == nil || ctx == nil || r == nil {
+		return
+	}
+	if sdk := arbol.hijo("uses-sdk"); sdk != nil {
+		if v, ok := sdk.atributo(uriDeRecursos, "minSdkVersion"); ok {
+			if n, err := strconv.Atoi(ctx.texto(v)); err == nil {
+				r.minSdk = n
+			}
+		}
+		if v, ok := sdk.atributo(uriDeRecursos, "targetSdkVersion"); ok {
+			if n, err := strconv.Atoi(ctx.texto(v)); err == nil {
+				r.targetSdk = n
+			}
+		}
+	}
+	for _, h := range arbol.hijos {
+		if h.nombre != "uses-permission" {
+			continue
+		}
+		if nombre := ctx.textoDeAtributo(h, uriDeRecursos, "name"); nombre != "" {
+			r.declarados[nombre] = true
+		}
+	}
+}
+
+// listaDePermisos es una bandera repetible: cada `--permiso` añade un permiso concedido a la sesión.
+type listaDePermisos struct {
+	destino *[]string
+}
+
+func (l listaDePermisos) String() string {
+	if l.destino == nil {
+		return ""
+	}
+	return strings.Join(*l.destino, ",")
+}
+
+func (l listaDePermisos) Set(valor string) error {
+	*l.destino = append(*l.destino, valor)
+	return nil
 }
 
 // registrarBanderasPreview registra las banderas comunes del comando y de cada orden de la sesión.
@@ -316,6 +663,10 @@ func registrarBanderasPreview(set *flag.FlagSet, o *opcionesPreview) {
 		"milisegundos que avanza el reloj lógico y ejecuta las tareas vencidas (repetible, en orden)")
 	set.Var(ordenDeIntercambio{eventos: &o.guion}, "intercambiar",
 		"clase/metodo(proto)=fichero.dex: sustituye o añade ese método en la sesión viva (repetible, en orden)")
+	set.StringVar(&o.rom, "rom", "", "fichero JSON de la ROM; sin él se usa la ROM sembrada en el binario")
+	set.StringVar(&o.guardarRom, "guardar-rom", "", "fichero donde volcar la ROM al terminar (desactivado por defecto)")
+	set.Var(listaDePermisos{destino: &o.permisos}, "permiso",
+		"permiso concedido a la sesión (repetible); la denegación es el valor por defecto")
 }
 
 // parsePreview es puro: devuelve opciones, los argumentos posicionales y el error del flag, sin
@@ -353,7 +704,7 @@ func ejecutaPreviewValidado(o opcionesPreview, rutas []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	modelo, err := modeloVistaDeAPKConEventos(datos, o.layout, !o.sinEjecutar, o.guion, o.locale)
+	modelo, err := modeloVistaDeAPKConOpciones(datos, o)
 	if err != nil {
 		return "", err
 	}
@@ -368,7 +719,7 @@ func preview() {
 	set := flag.NewFlagSet("preview", flag.ContinueOnError)
 	set.SetOutput(os.Stderr)
 	set.Usage = func() {
-		fmt.Fprint(os.Stderr, `usage: apkc preview [--layout nombre] [--locale idioma] [--sin-ejecutar] [--pulsar id]… [--recrear]… [--menu]… [--menu-item menu/N]… [--escribir id/texto]… [--marcar id]… [--desmarcar id]… [--avanzar ms]… [--intercambiar clase/metodo(proto)=fichero.dex]… app.apk
+		fmt.Fprint(os.Stderr, `usage: apkc preview [--layout nombre] [--locale idioma] [--sin-ejecutar] [--pulsar id]… [--recrear]… [--menu]… [--menu-item menu/N]… [--escribir id/texto]… [--marcar id]… [--desmarcar id]… [--avanzar ms]… [--intercambiar clase/metodo(proto)=fichero.dex]… [--rom fichero.json] [--guardar-rom fichero.json] [--permiso android.permission.…]… app.apk
 
 Read one apk and print, as one line of JSON on stdout, the model of its first screen: type, id,
 text, children and an approximate rectangle for every node. --locale idioma reads the values from
@@ -441,6 +792,11 @@ process is started and nothing is written, so it runs inside the tab.
 	set.Var(ordenDeIntercambio{eventos: &guion}, "intercambiar",
 		"clase/metodo(proto)=fichero.dex: sustituye o añade ese método en la sesión viva, sin "+
 			"recrear la actividad ni sus objetos; sin /metodo, toda la clase (repetible, en orden)")
+	romFichero := set.String("rom", "", "fichero JSON de la ROM; sin él se usa la ROM sembrada en el binario")
+	guardarRom := set.String("guardar-rom", "", "fichero donde volcar la ROM al terminar (desactivado por defecto)")
+	permisos := []string{}
+	set.Var(listaDePermisos{destino: &permisos}, "permiso",
+		"permiso concedido a la sesión (repetible); la denegación es el valor por defecto")
 	// flag ya imprimió el error; el único os.Exit del comando está aquí al final, para que quien
 	// lee la última línea vea la causa y no el cierre de la ayuda.
 	var salida string
@@ -448,7 +804,8 @@ process is started and nothing is written, so it runs inside the tab.
 	if e := set.Parse(os.Args[2:]); e != nil {
 		err = e
 	} else {
-		o := opcionesPreview{layout: *layout, locale: *locale, sinEjecutar: *sinEjecutar, guion: guion}
+		o := opcionesPreview{layout: *layout, locale: *locale, sinEjecutar: *sinEjecutar, guion: guion,
+			rom: *romFichero, guardarRom: *guardarRom, permisos: permisos}
 		salida, err = ejecutaPreviewValidado(o, set.Args())
 	}
 	if err != nil {
@@ -715,6 +1072,16 @@ func modeloVistaDeAPKConOrdenes(datos []byte, layout string, ejecutar bool, orde
 // a medias. locale es opcional para no cambiar la llamada de las pruebas de la Fase 2: los envoltorios
 // pasan una cadena vacia, que es el contrato de siempre (valores de la configuracion base).
 func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, eventos []eventoUsuario, locale ...string) (*modeloVista, error) {
+	o := opcionesPreview{layout: layout, sinEjecutar: !ejecutar, guion: eventos}
+	if len(locale) > 0 {
+		o.locale = locale[0]
+	}
+	return modeloVistaDeAPKConOpciones(datos, o)
+}
+
+// modeloVistaDeAPKConOpciones es el cuerpo con la ROM y las banderas de la sesión. Las envoltorios
+// de las fases anteriores siguen llamando a modeloVistaDeAPKConEventos y por eso no cambian de forma.
+func modeloVistaDeAPKConOpciones(datos []byte, o opcionesPreview) (*modeloVista, error) {
 	zr, err := zip.NewReader(bytes.NewReader(datos), int64(len(datos)))
 	if err != nil {
 		return nil, fmt.Errorf("el apk no es un zip: %w", err)
@@ -735,8 +1102,8 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 			return nil, fmt.Errorf("el resources.arsc: %w", err)
 		}
 		// el idioma solo cambia los valores: la tabla sigue resolviendo ids y rutas como siempre
-		if len(locale) > 0 {
-			tabla.locale = locale[0]
+		if o.locale != "" {
+			tabla.locale = o.locale
 		}
 	}
 
@@ -744,6 +1111,22 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 	arbolManifiesto, err := ctxManifiesto.arbol()
 	if err != nil {
 		return nil, fmt.Errorf("el AndroidManifest.xml: %w", err)
+	}
+	// La ROM se crea para cada corrida y nunca sale en el JSON: es el árbol sobre el que se evalúan
+	// las operaciones de java.io.File y el límite donde se aplican los permisos por prefijo.
+	rom, err := cargaRom(o.rom, o.permisos, o.guardarRom)
+	if err != nil {
+		return nil, err
+	}
+	permisosDelManifiesto(arbolManifiesto, ctxManifiesto, rom)
+	if o.guardarRom != "" {
+		defer func() {
+			if err := os.WriteFile(o.guardarRom, rom.volcado(), 0o600); err != nil {
+				// el modelo ya está construido: un fallo al volcar se dice en la consola, no se
+				// convierte en un error de la vista previa
+				fmt.Fprintf(os.Stderr, "[apkc] no se pudo guardar la ROM en %q: %v\n", o.guardarRom, err)
+			}
+		}()
 	}
 	modelo := &modeloVista{
 		Aproximado: true,
@@ -769,15 +1152,15 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 	// Si no hay dex o los dex no se dejan cargar, el modelo de la Fase 1 sigue saliendo.
 	var layoutID uint32
 	declaradas := actividadesDeclaradas(arbolManifiesto, ctxManifiesto)
-	if ejecutar {
+	if !o.sinEjecutar {
 		dxs, _, errDex := dexDelApk(zr)
 		if errDex != nil {
 			modelo.Ejecucion = &resultadoEjecucion{Error: "los dex del apk no se dejan cargar: " + errDex.Error()}
 		} else if len(dxs) > 0 {
 			preferida := descriptorDeActividad(modelo.Paquete, nombreActividad)
 			var errEventos error
-			modelo.Ejecucion, layoutID, errEventos = ejecutaOnCreateConEventos(dxs, tabla, preferida, eventos,
-				func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, layout, nombreActividad) }, declaradas)
+			modelo.Ejecucion, layoutID, errEventos = ejecutaOnCreateConEventosConRom(dxs, tabla, preferida, o.guion,
+				func(m *maquinaDalvik) { preparaVistasDelLayout(m, zr, tabla, o.layout, nombreActividad) }, declaradas, rom)
 			if errEventos != nil {
 				return nil, errEventos
 			}
@@ -805,7 +1188,7 @@ func modeloVistaDeAPKConEventos(datos []byte, layout string, ejecutar bool, even
 	if activa == "" {
 		activa = nombreActividad
 	}
-	rutaLayout, err := rutaDelLayoutDeLaActividad(tabla, zr, layout, layoutID, activa)
+	rutaLayout, err := rutaDelLayoutDeLaActividad(tabla, zr, o.layout, layoutID, activa)
 	if err != nil {
 		return nil, err
 	}
@@ -1083,9 +1466,6 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 		return
 	}
 	listas := ejecucion.maquina.listasPintadas()
-	if len(listas) == 0 {
-		return
-	}
 	porID := map[string]*nodoVista{}
 	var recorre func(*nodoVista)
 	recorre = func(n *nodoVista) {
@@ -1126,6 +1506,28 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 			n.orientacion = "vertical"
 		}
 	}
+}
+
+// textoDeFilaCodigo busca el texto de una fila añadida por código: puede estar en la propia vista
+// (un TextView) o en un hijo al que la app llamó setText. Sin texto, la fila se pinta vacía.
+func textoDeFilaCodigo(v *objetoDalvik) string {
+	if v == nil {
+		return ""
+	}
+	if v.texto != "" {
+		return v.texto
+	}
+	for _, h := range v.hijosCodigo {
+		if texto := textoDeFilaCodigo(h); texto != "" {
+			return texto
+		}
+	}
+	for _, h := range v.vistas {
+		if texto := textoDeFilaCodigo(h); texto != "" {
+			return texto
+		}
+	}
+	return ""
 }
 
 // nodoDeFila arma el nodo de una fila a partir del layout que el getView infló, con los textos que

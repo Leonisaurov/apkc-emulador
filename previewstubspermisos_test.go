@@ -2,7 +2,9 @@ package main
 
 // Los dos avisos que destaparon las APK de `chatbt` y `lienzo`, medidos sobre el binario 46a9a792:
 // `checkSelfPermission` devolvía el cero de I sin que nadie lo dijera, e `invalidate` el cero de V.
-// Aquí se comprueba que los dos tienen stub, que el permiso sigue concedido (0) y que invalidar
+// Ahora la ROM tiene un solo usuario y deniega por defecto: `checkSelfPermission` devuelve
+// PERMISSION_DENIED (-1) salvo que la sesión conceda el permiso con `--permiso`. Aquí se comprueba
+// ese valor, que `requestPermissions` solo registra la petición sin cambiar nada, y que `invalidate`
 // no deja huella: el modelo dibuja el `onDraw` una sola vez al construir la pantalla, con una
 // instancia nueva, así que programar un redibujado sería inventar un efecto que no se puede medir.
 // La falsificación apaga los stubs y exige que el aviso aparezca por la vía real de `invoca`.
@@ -30,9 +32,10 @@ func maquinaDePermisos() (*maquinaDalvik, *objetoDalvik, *objetoDalvik) {
 	return m, actividad, vista
 }
 
-// TestStubCheckSelfPermissionConcedido comprueba el valor explícito que evita el aviso sin mover
-// la rama «permiso concedido» que ya seguía la app con el cero implícito.
-func TestStubCheckSelfPermissionConcedido(t *testing.T) {
+// TestPermisosCheckSelfPermissionDeniegaPorDefecto comprueba que la llamada sobre la actividad y la
+// estática de ContextCompat devuelven PERMISSION_DENIED cuando la sesión no concedió nada, y que
+// ninguna de las dos cae en el aviso de stub ausente.
+func TestPermisosCheckSelfPermissionDeniegaPorDefecto(t *testing.T) {
 	m, actividad, _ := maquinaDePermisos()
 	permiso := cadenaObjeto("android.permission.BLUETOOTH_CONNECT")
 	v, ok, err := m.intentaStub([]string{"Lcom/hola/chatbt/MainActivity;"},
@@ -40,8 +43,8 @@ func TestStubCheckSelfPermissionConcedido(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("checkSelfPermission sobre la actividad: v=%v ok=%v err=%v", v, ok, err)
 	}
-	if v != int32(0) {
-		t.Errorf("checkSelfPermission devolvió %v y se esperaba PERMISSION_GRANTED (0)", v)
+	if v != int32(-1) {
+		t.Errorf("checkSelfPermission devolvió %v y se esperaba PERMISSION_DENIED (-1)", v)
 	}
 	// ContextCompat se llama en estático: no hay receptor, pero la clase declarante casa.
 	v, ok, err = m.intentaStub([]string{"Landroidx/core/content/ContextCompat;"},
@@ -49,11 +52,82 @@ func TestStubCheckSelfPermissionConcedido(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("checkSelfPermission de ContextCompat: v=%v ok=%v err=%v", v, ok, err)
 	}
-	if v != int32(0) {
-		t.Errorf("ContextCompat.checkSelfPermission devolvió %v y se esperaba 0", v)
+	if v != int32(-1) {
+		t.Errorf("ContextCompat.checkSelfPermission devolvió %v y se esperaba PERMISSION_DENIED (-1)", v)
 	}
 	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
 		t.Errorf("checkSelfPermission cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestPermisosCheckSelfPermissionConBandera comprueba el otro lado del modelo: `--permiso` concede
+// el permiso a la sesión, el stub devuelve PERMISSION_GRANTED, y la regla de prefijo más larga sigue
+// mandando en el límite de las operaciones de java.io.File.
+func TestPermisosCheckSelfPermissionConBandera(t *testing.T) {
+	m, actividad, _ := maquinaDePermisos()
+	const escribir = "android.permission.WRITE_EXTERNAL_STORAGE"
+	rom, err := cargaRom("", []string{escribir}, "")
+	if err != nil {
+		t.Fatalf("cargar la ROM con WRITE concedido: %v", err)
+	}
+	rom.targetSdk = 29
+	m.rom = rom
+	v, ok, err := m.intentaStub([]string{"Lcom/hola/chatbt/MainActivity;"},
+		"checkSelfPermission", "(Ljava/lang/String;)I", []any{cadenaObjeto(escribir)}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("checkSelfPermission con bandera: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != int32(0) {
+		t.Errorf("checkSelfPermission con bandera devolvió %v y se esperaba PERMISSION_GRANTED (0)", v)
+	}
+	// Con targetSdk 29, WRITE implica READ; sin la bandera, READ está denegado.
+	v, _, _ = m.intentaStub([]string{"Lcom/hola/chatbt/MainActivity;"}, "checkSelfPermission",
+		"(Ljava/lang/String;)I", []any{cadenaObjeto("android.permission.READ_EXTERNAL_STORAGE")}, actividad)
+	if v != int32(0) {
+		t.Errorf("READimplícito devolvió %v y se esperaba 0 con targetSdk 29", v)
+	}
+	if !rom.accesoPermitido("/sdcard/Download/leeme.txt", escribir) {
+		t.Error("WRITE concedido no da acceso a /sdcard/Download por la regla más larga")
+	}
+	if rom.accesoPermitido("/sdcard/Documents/notas.txt", escribir) {
+		t.Error("WRITE concedió acceso a Documents, donde la regla más larga deniega")
+	}
+	// MANAGE_EXTERNAL_STORAGE no tiene ninguna regla que conceda, ni siquiera con la bandera.
+	const gestionar = "android.permission.MANAGE_EXTERNAL_STORAGE"
+	rom.concedidos[gestionar] = true
+	if rom.accesoPermitido("/sdcard/Download", gestionar) {
+		t.Error("MANAGE_EXTERNAL_STORAGE concedió acceso sin regla de prefijo que lo permita")
+	}
+}
+
+// TestPermisosRequestPermissionsSoloRegistra exige que pedir permisos deje el aviso honesto y no
+// cambie el estado: no hay diálogo del sistema ni concesión real.
+func TestPermisosRequestPermissionsSoloRegistra(t *testing.T) {
+	m, actividad, _ := maquinaDePermisos()
+	pedidos := &arregloDalvik{tipo: "[Ljava/lang/String;", datos: []any{
+		cadenaObjeto("android.permission.READ_EXTERNAL_STORAGE"),
+	}}
+	codigo := &arregloDalvik{tipo: "[I", datos: []any{int32(7)}}
+	v, ok, err := m.intentaStub([]string{"Lcom/hola/chatbt/MainActivity;"},
+		"requestPermissions", "([Ljava/lang/String;[I)V", []any{pedidos, codigo}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("requestPermissions: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != nil {
+		t.Errorf("requestPermissions devolvió %v y se esperaba el cero de V", v)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "el emulador registra la petición y devuelve la denegación por defecto del modelo") {
+		t.Errorf("requestPermissions no dejó el aviso del modelo: %v", m.avisos)
+	}
+	if !strings.Contains(avisos, "no hay diálogo del sistema ni cambio de permisos reales") {
+		t.Errorf("el aviso no dice que no hay diálogo del sistema: %v", m.avisos)
+	}
+	if !strings.Contains(avisos, "android.permission.READ_EXTERNAL_STORAGE") {
+		t.Errorf("el aviso no nombra el permiso pedido: %v", m.avisos)
+	}
+	if m.romActiva().concedido("android.permission.READ_EXTERNAL_STORAGE") {
+		t.Error("requestPermissions concedió el permiso: el modelo no puede cambiar permisos reales")
 	}
 }
 
@@ -78,11 +152,14 @@ func TestStubInvalidateSinHuella(t *testing.T) {
 }
 
 // casoPermiso es una llamada tal como llega al intérprete desde las APK reales: el descriptor del
-// method_id, los registros y la clase declarante.
+// method_id, los registros, la clase declarante y el valor que debe dar el stub encendido. Sin stub
+// el intérprete entrega siempre el cero del tipo; con stub, `checkSelfPermission` entrega la
+// denegación (-1) porque la ROM no concede nada por defecto.
 type casoPermiso struct {
 	nombre, proto, retorno, owner string
 	params                        []string
 	palabras                      []int
+	esperadoConStub               any
 	regs                          func(actividad, vista *objetoDalvik) []any
 }
 
@@ -92,15 +169,14 @@ func casosPermisos() []casoPermiso {
 		{
 			nombre: "checkSelfPermission", proto: "(Ljava/lang/String;)I", retorno: "I",
 			owner: "Lcom/hola/chatbt/MainActivity;", params: []string{"Ljava/lang/String;"},
-			palabras: []int{0, 1},
+			palabras: []int{0, 1}, esperadoConStub: int32(-1),
 			regs: func(actividad, _ *objetoDalvik) []any {
 				return []any{actividad, cadenaObjeto("android.permission.BLUETOOTH_CONNECT")}
 			},
 		},
 		{
 			nombre: "invalidate", proto: "()V", retorno: "V",
-			owner:    "Lcom/hola/lienzo/Lienzo;",
-			palabras: []int{0},
+			owner: "Lcom/hola/lienzo/Lienzo;", palabras: []int{0}, esperadoConStub: nil,
 			regs: func(_, vista *objetoDalvik) []any {
 				return []any{vista}
 			},
@@ -118,7 +194,7 @@ func invocaCasoDePermiso(m *maquinaDalvik, actividad, vista *objetoDalvik, c cas
 }
 
 // TestFalsificacionAvisoDeLosDosStubs apaga los stubs y comprueba que `invoca` sí avisa y entrega
-// el cero; después los enciende y exige lo contrario con la misma llamada.
+// el cero; después los enciende y exige el valor de cada caso sin el aviso de stub ausente.
 func TestFalsificacionAvisoDeLosDosStubs(t *testing.T) {
 	stubsFrameworkActivos = false
 	defer func() { stubsFrameworkActivos = true }()
@@ -147,8 +223,8 @@ func TestFalsificacionAvisoDeLosDosStubs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s con stub devolvió error: %v", c.nombre, err)
 		}
-		if esperado := valorCero(c.retorno); v != esperado {
-			t.Errorf("%s con stub devolvió %v y se esperaba %v", c.nombre, v, esperado)
+		if v != c.esperadoConStub {
+			t.Errorf("%s con stub devolvió %v y se esperaba %v", c.nombre, v, c.esperadoConStub)
 		}
 		if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
 			t.Errorf("%s con stub cayó en el aviso de stub ausente: %s", c.nombre, avisos)
