@@ -17,11 +17,6 @@ import (
 	"testing"
 )
 
-// escribirPreferencias es el escribidor que se inyecta en la prueba de `apply`: falla si alguien
-// llega a usarlo. El intérprete no tiene ningún punto de escritura de preferencias —el estado solo
-// vive en memoria—, así que además se comprueba que el directorio de trabajo sigue vacío.
-var escribirPreferencias = func(nombre string, datos map[string]any) {}
-
 // sinAvisoDeStub falla si la ejecución avisó de una API que el intérprete no reconoce: es el síntoma
 // que tenían estas cuatro antes de tener su stub.
 func sinAvisoDeStub(t *testing.T, m *modeloVista) {
@@ -725,14 +720,10 @@ func TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero(t *testing.T) {
 	if len(m.almacen.ficheros["termux"]) != 0 {
 		t.Fatalf("el editor escribió antes de apply: %v", m.almacen.ficheros["termux"])
 	}
-	// escribidor que delata cualquier salida a disco: es el mismo patrón que el transporte de red
-	// prohibido. Si `apply` llegara a usar el único punto de escritura, la bandera se encendería.
-	anterior := escribirPreferencias
-	escribio := false
-	escribirPreferencias = func(nombre string, datos map[string]any) { escribio = true }
-	defer func() { escribirPreferencias = anterior }()
-	// Además se corre en un directorio vacío: si `apply` creara un fichero, el volcado del
-	// directorio lo delataría aunque no pasara por el escribidor anterior.
+	// Cobertura de esta aserción: solo `os.ReadDir` sobre el directorio de trabajo temporal, no
+	// sobre una ruta absoluta. Si `apply` escribiera en el cwd, el directorio dejaría de estar
+	// vacío. No se inyecta un escribidor: el intérprete no tiene ningún punto de escritura de
+	// preferencias y cablear uno para que nunca se use añadiría código muerto.
 	directorio := t.TempDir()
 	anteriorDirectorio, err := os.Getwd()
 	if err != nil {
@@ -745,9 +736,6 @@ func TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero(t *testing.T) {
 	if v, ok, err := m.intentaStub([]string{"Landroid/content/SharedPreferences$Editor;"}, "apply",
 		"()V", nil, editor); err != nil || !ok || v != nil {
 		t.Fatalf("apply: v=%v ok=%v err=%v", v, ok, err)
-	}
-	if escribio {
-		t.Fatal("apply intentó escribir las preferencias en disco")
 	}
 	entradas, err := os.ReadDir(directorio)
 	if err != nil {
@@ -884,5 +872,74 @@ func TestPreferenciasHashMapKeySetSinClavesInventadas(t *testing.T) {
 	}
 	if n := len(esperaObjetoDeStub(t, v, "Ljava/util/Set;").conjunto); n != 2 {
 		t.Errorf("la copia tiene %d claves y se esperaban 2", n)
+	}
+}
+
+// TestPreferenciasContainsSobreClavesDelMapa comprueba que `containsKey` y `contains` consultan la
+// misma fuente que `keySet`: las claves guardadas en el mapa, nunca un valor inventado. Se prueban
+// tanto un HashMap de la app como el Map que devuelve `getAll`.
+func TestPreferenciasContainsSobreClavesDelMapa(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}
+	m.almacen = nuevoAlmacenPreferencias()
+	mapa := objDe("Ljava/util/HashMap;")
+	for _, clave := range []string{"z", "a"} {
+		if _, ok, err := m.intentaStub([]string{"Ljava/util/HashMap;"}, "put",
+			"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+			[]any{cadenaObjeto(clave), int32(1)}, mapa); err != nil || !ok {
+			t.Fatalf("put(%q): ok=%v err=%v", clave, ok, err)
+		}
+	}
+	for _, caso := range []struct {
+		clave    string
+		esperado int32
+	}{
+		{"a", int32(1)}, {"z", int32(1)}, {"ausente", int32(0)},
+	} {
+		v, ok, err := m.intentaStub([]string{"Ljava/util/Map;"}, "containsKey",
+			"(Ljava/lang/Object;)Z", []any{cadenaObjeto(caso.clave)}, mapa)
+		if err != nil || !ok || v != caso.esperado {
+			t.Errorf("containsKey(%q): v=%v ok=%v err=%v", caso.clave, v, ok, err)
+		}
+	}
+
+	v, ok, err := m.intentaStub([]string{"Ljava/util/HashMap;"}, "keySet", "()Ljava/util/Set;", nil, mapa)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("keySet: v=%v ok=%v err=%v", v, ok, err)
+	}
+	conjunto := esperaObjetoDeStub(t, v, "Ljava/util/Set;")
+	for _, caso := range []struct {
+		clave    string
+		esperado int32
+	}{
+		{"a", int32(1)}, {"z", int32(1)}, {"ausente", int32(0)},
+	} {
+		v, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "contains",
+			"(Ljava/lang/Object;)Z", []any{cadenaObjeto(caso.clave)}, conjunto)
+		if err != nil || !ok || v != caso.esperado {
+			t.Errorf("contains(%q): v=%v ok=%v err=%v", caso.clave, v, ok, err)
+		}
+	}
+
+	// el Map de getAll sale de la misma fuente: contiene solo lo que el almacén guardó.
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	prefs, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;", "Landroid/content/Context;"},
+		"getSharedPreferences", "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+		[]any{cadenaObjeto("sonda"), int32(0)}, actividad)
+	if err != nil || !ok || prefs == nil {
+		t.Fatalf("getSharedPreferences: v=%v ok=%v err=%v", prefs, ok, err)
+	}
+	m.almacen.de("sonda")["guardada"] = "valor"
+	v, ok, err = m.intentaStub([]string{"Landroid/content/SharedPreferences;"}, "getAll",
+		"()Ljava/util/Map;", nil, prefs)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("getAll: v=%v ok=%v err=%v", v, ok, err)
+	}
+	mapaPreferencias := v
+	if v, ok, err := m.intentaStub([]string{"Ljava/util/Map;"}, "containsKey",
+		"(Ljava/lang/Object;)Z", []any{cadenaObjeto("guardada")}, mapaPreferencias); err != nil || !ok ||
+		v != int32(1) {
+		t.Errorf("containsKey sobre getAll: v=%v ok=%v err=%v", v, ok, err)
 	}
 }

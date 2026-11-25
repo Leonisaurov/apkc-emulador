@@ -5660,6 +5660,27 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 					conjunto: clavesDelMapa(datos)}, true, nil
 			}
 		}
+	case "containsKey":
+		// `Map.containsKey(Object)` mira las mismas claves que `keySet` publica: el mapa del objeto.
+		// No se inventa contenido; una clave que no se guardó responde falso.
+		if len(vals) == 1 {
+			if datos := datosDelMapa(obj); datos != nil {
+				_, encontrada := datos[textoDe(vals[0])]
+				return boolAInt(encontrada), true, nil
+			}
+		}
+	case "contains":
+		// `Set.contains(Object)` recorre el conjunto ordenado que entregó `keySet` (o el de un
+		// Properties). La comparación es sobre el texto de las claves modeladas, sin inventarlas.
+		if len(vals) == 1 && esConjunto() {
+			buscada := textoDe(vals[0])
+			for _, clave := range obj.conjunto {
+				if textoDe(clave) == buscada {
+					return boolAInt(true), true, nil
+				}
+			}
+			return boolAInt(false), true, nil
+		}
 	case "setProperty":
 		if len(vals) == 2 && esPropiedades() {
 			propiedadesDe()[textoDe(vals[0])] = textoDe(vals[1])
