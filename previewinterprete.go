@@ -4137,6 +4137,29 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		return marcado || strings.HasSuffix(obj.clase, "Landroid/app/Application;") ||
 			strings.HasSuffix(obj.clase, "Landroid/content/Context;")
 	}
+	// Familia 5: las dos APIs de red que la app puede tocar se atienden sin abrir conexión. No hay
+	// transporte, socket ni llamada al navegador detrás: cada método entrega un valor vacío
+	// determinista y deja un aviso `red-sin-peticion: <metodo>` en el registro de la ejecución.
+	esConexionHTTP := func() bool {
+		for _, c := range candidatos {
+			if strings.HasSuffix(c, "URLConnection;") {
+				return true
+			}
+		}
+		return false
+	}
+	esOkHttp := func() bool {
+		for _, c := range candidatos {
+			if strings.Contains(c, "Lokhttp3/") {
+				return true
+			}
+		}
+		return false
+	}
+	objetoVacio := func(clase string) *objetoDalvik {
+		return &objetoDalvik{clase: clase, campos: map[string]any{}}
+	}
+	sinRed := func() { m.avisa("red-sin-peticion: %s", nombre) }
 
 	switch nombre {
 	case "getMainLooper":
@@ -4942,6 +4965,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return nil, true, nil
 		}
 	case "execute":
+		if esOkHttp() {
+			// Call.execute() devuelve una Response sin contenido: ni socket ni lectura de red.
+			sinRed()
+			return objetoVacio("Lokhttp3/Response;"), true, nil
+		}
 		if len(vals) == 1 && obj != nil && es("Landroid/os/AsyncTask;") {
 			m.difiereTarea(obj, vals[0])
 			return obj, true, nil
@@ -5612,6 +5640,49 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return nil, true, fmt.Errorf("charAt con el índice %d fuera de la cadena", i)
 			}
 			return int32(unidades[i]), true, nil
+		}
+	case "connect":
+		if esConexionHTTP() && obj != nil {
+			sinRed()
+			return nil, true, nil
+		}
+	case "disconnect":
+		if esConexionHTTP() && obj != nil {
+			sinRed()
+			return nil, true, nil
+		}
+	case "getResponseCode":
+		if esConexionHTTP() && obj != nil {
+			sinRed()
+			return int32(200), true, nil
+		}
+	case "getHeaderField":
+		if esConexionHTTP() && obj != nil {
+			sinRed()
+			return cadenaObjeto(""), true, nil
+		}
+	case "getInputStream":
+		if esConexionHTTP() && obj != nil {
+			sinRed()
+			// El cuerpo es vacío: el objeto existe para que la app no pare en un receptor nulo,
+			// pero no trae bytes inventados ni cabeceras que no vinieron de ninguna respuesta.
+			return &objetoDalvik{clase: "Ljava/io/ByteArrayInputStream;",
+				campos: map[string]any{"red.cuerpo": ""}, lista: []any{}}, true, nil
+		}
+	case "newCall":
+		if esOkHttp() {
+			sinRed()
+			return objetoVacio("Lokhttp3/Call;"), true, nil
+		}
+	case "body":
+		if esOkHttp() && obj != nil {
+			sinRed()
+			return objetoVacio("Lokhttp3/ResponseBody;"), true, nil
+		}
+	case "string":
+		if esOkHttp() && obj != nil {
+			sinRed()
+			return cadenaObjeto(""), true, nil
 		}
 	}
 	return nil, false, nil

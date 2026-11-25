@@ -11,6 +11,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"go/parser"
+	"go/token"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -530,5 +534,151 @@ func TestLaEvidenciaDelCuartoApk(t *testing.T) {
 	}
 	if modelo.Ejecucion.Error != "" {
 		t.Errorf("ejecucion.error no está ausente: %q", modelo.Ejecucion.Error)
+	}
+}
+
+// --- familia 5: red registrada, sin una sola petición ----------------------------------------
+
+// transportProhibido es la falsación de red: si algo en el intérprete intentara una petición con el
+// cliente por omisión de Go, el bandera se enciende y la petición falla antes de salir del proceso.
+type transportProhibido struct {
+	usado *bool
+}
+
+func (tr transportProhibido) RoundTrip(*http.Request) (*http.Response, error) {
+	*tr.usado = true
+	return nil, errors.New("la vista previa no debe abrir peticiones de red")
+}
+
+// casoRedSinPeticion describe una llamada de la familia 5 y lo que debe devolver sin tocar red.
+type casoRedSinPeticion struct {
+	nombre     string
+	candidatos []string
+	proto      string
+	vals       []any
+	receptor   any
+	comprueba  func(t *testing.T, v any)
+}
+
+// casosRedSinPeticion son los nueve métodos encargados: cinco de HttpURLConnection y cuatro de
+// okhttp3. Comprueban el valor vacío y no nulo que la app necesita para seguir sin datos inventados.
+func casosRedSinPeticion() []casoRedSinPeticion {
+	conexion := objDe("Ljava/net/HttpURLConnection;")
+	cliente := objDe("Lokhttp3/OkHttpClient;")
+	llamada := objDe("Lokhttp3/Call;")
+	respuesta := objDe("Lokhttp3/Response;")
+	cuerpo := objDe("Lokhttp3/ResponseBody;")
+	esperaNulo := func(t *testing.T, v any) {
+		t.Helper()
+		if v != nil {
+			t.Errorf("el método devolvió %v y es void", v)
+		}
+	}
+	return []casoRedSinPeticion{
+		{"connect", []string{"Ljava/net/HttpURLConnection;"}, "()V", nil, conexion, esperaNulo},
+		{"getResponseCode", []string{"Ljava/net/HttpURLConnection;"}, "()I", nil, conexion,
+			func(t *testing.T, v any) {
+				if v != int32(200) {
+					t.Errorf("getResponseCode devolvió %v y se esperaba 200", v)
+				}
+			}},
+		{"getHeaderField", []string{"Ljava/net/URLConnection;"},
+			"(Ljava/lang/String;)Ljava/lang/String;", []any{cadenaObjeto("Content-Type")}, conexion,
+			func(t *testing.T, v any) {
+				esperaCadenaDeStub(t, v, "")
+			}},
+		{"getInputStream", []string{"Ljava/net/HttpURLConnection;"},
+			"()Ljava/io/InputStream;", nil, conexion,
+			func(t *testing.T, v any) {
+				o := esperaObjetoDeStub(t, v, "Ljava/io/ByteArrayInputStream;")
+				if cuerpo := o.campos["red.cuerpo"]; cuerpo != "" {
+					t.Errorf("el cuerpo de la respuesta es %v y se esperaba vacío", cuerpo)
+				}
+				if o.lista == nil || len(o.lista) != 0 {
+					t.Errorf("el cuerpo trae bytes %v y se esperaba vacío", o.lista)
+				}
+			}},
+		{"disconnect", []string{"Ljava/net/URLConnection;"}, "()V", nil, conexion, esperaNulo},
+		{"newCall", []string{"Lokhttp3/OkHttpClient;"},
+			"(Lokhttp3/Request;)Lokhttp3/Call;", []any{objDe("Lokhttp3/Request;")}, cliente,
+			func(t *testing.T, v any) {
+				esperaObjetoDeStub(t, v, "Lokhttp3/Call;")
+			}},
+		{"execute", []string{"Lokhttp3/Call;"}, "()Lokhttp3/Response;", nil, llamada,
+			func(t *testing.T, v any) {
+				esperaObjetoDeStub(t, v, "Lokhttp3/Response;")
+			}},
+		{"body", []string{"Lokhttp3/Response;"}, "()Lokhttp3/ResponseBody;", nil, respuesta,
+			func(t *testing.T, v any) {
+				esperaObjetoDeStub(t, v, "Lokhttp3/ResponseBody;")
+			}},
+		{"string", []string{"Lokhttp3/ResponseBody;"}, "()Ljava/lang/String;", nil, cuerpo,
+			func(t *testing.T, v any) {
+				esperaCadenaDeStub(t, v, "")
+			}},
+	}
+}
+
+// TestRedSinPeticionDevuelveRespuestaVaciaYRegistraAviso falsifica el contrato de la familia 5: los
+// nueve métodos se resuelven, su valor es vacío y determinista y cada uno deja su aviso
+// `red-sin-peticion: <metodo>`. Ninguno cae en el aviso genérico de «no está en el dex ni en los
+// stubs», que es el que delataba antes una llamada sin modelo.
+func TestRedSinPeticionDevuelveRespuestaVaciaYRegistraAviso(t *testing.T) {
+	m := maquinaDeStubs()
+	for _, c := range casosRedSinPeticion() {
+		v, ok, err := m.intentaStub(c.candidatos, c.nombre, c.proto, c.vals, c.receptor)
+		if err != nil || !ok {
+			t.Errorf("%s: v=%v ok=%v err=%v", c.nombre, v, ok, err)
+			continue
+		}
+		c.comprueba(t, v)
+		if aviso := "red-sin-peticion: " + c.nombre; !contieneTexto(m.avisos, aviso) {
+			t.Errorf("%s no registró %q; avisos=%v", c.nombre, aviso, m.avisos)
+		}
+	}
+	for _, aviso := range m.avisos {
+		if strings.Contains(aviso, "no está en el dex ni en los stubs") {
+			t.Errorf("alguna llamada de red cayó en el aviso genérico: %s", aviso)
+		}
+	}
+}
+
+// TestRedSinPeticionNoAbreTransporte inyecta un transporte de Go que falla y enciende un bandera si
+// se usa, y lo deja instalado mientras corren los nueve stubs. Si el intérprete intentase una sola
+// petición con el cliente por omisión, la bandera lo diría; no es una suposición sobre el código.
+func TestRedSinPeticionNoAbreTransporte(t *testing.T) {
+	usado := false
+	anterior := http.DefaultTransport
+	http.DefaultTransport = transportProhibido{usado: &usado}
+	defer func() { http.DefaultTransport = anterior }()
+
+	m := maquinaDeStubs()
+	for _, c := range casosRedSinPeticion() {
+		if _, ok, err := m.intentaStub(c.candidatos, c.nombre, c.proto, c.vals, c.receptor); err != nil || !ok {
+			t.Fatalf("%s: ok=%v err=%v", c.nombre, ok, err)
+		}
+	}
+	if usado {
+		t.Fatal("se intentó una petición de red: el transporte prohibido fue invocado")
+	}
+	if len(m.avisos) == 0 {
+		t.Fatal("las llamadas de red no dejaron ningún aviso registrado")
+	}
+}
+
+// TestRedSinPeticionSinImportesDeRed cierra la otra vía: el intérprete no importa paquetes de red ni
+// el puente de JavaScript, así que no hay socket, cliente HTTP ni llamada al navegador escondida en
+// este fichero. Se analiza la copia materializada en apkc/, que es la que compila el binario.
+func TestRedSinPeticionSinImportesDeRed(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "previewinterprete.go", nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("no se pudo analizar previewinterprete.go: %v", err)
+	}
+	prohibidos := map[string]bool{"net": true, "net/http": true, "syscall/js": true}
+	for _, imp := range f.Imports {
+		ruta := strings.Trim(imp.Path.Value, "\"")
+		if prohibidos[ruta] {
+			t.Errorf("previewinterprete.go importa %s: la familia 5 no debe tener red", ruta)
+		}
 	}
 }
