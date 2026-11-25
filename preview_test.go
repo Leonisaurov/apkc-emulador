@@ -797,6 +797,77 @@ func TestListFilesFiltraPorExtension(t *testing.T) {
 	}
 }
 
+// maquinaContenedorConOyente arma un contenedor con dos botones añadidos por código, sin id, y un
+// único OnClickListener registrado sobre el segundo. El cuerpo del onClick escribe una cadena fija en
+// la vista que recibe, para poder comprobar qué hijo se llevó el clic sin inventar un modelo.
+func maquinaContenedorConOyente(t *testing.T) (*maquinaDalvik, uint32, *objetoDalvik, *objetoDalvik) {
+	t.Helper()
+	d := &dexFile{
+		strings: []string{"FILA-1"},
+		methods: []dexMethod{{owner: "Landroid/widget/Button;",
+			proto: dexProto{params: []string{"Ljava/lang/CharSequence;"}, returnType: "V"}, name: "setText"}},
+	}
+	const claseOyente = "Loyente/Fila;"
+	// registersSize 3 e insSize 2: el listener entra en v1 y la vista pulsada en v2; v0 guarda la
+	// cadena que se escribe en esa vista. El método indexado en 0 es Button.setText.
+	met := &metodoDalvik{nombre: "onClick", proto: "(Landroid/view/View;)V", retorno: "V", dex: d,
+		item: &codeItem{registersSize: 3, insSize: 2, insnsSize: 6,
+			insns: []uint16{0x001a, 0x0000, 0x206e, 0x0000, 0x0002, 0x000e}}}
+	p := &programaDalvik{dex: d, clases: map[string]*claseDalvik{
+		claseOyente: {nombre: claseOyente, super: "Ljava/lang/Object;",
+			metodos: map[string]*metodoDalvik{
+				"onClick(Landroid/view/View;)V": met,
+			}},
+	}}
+	m := nuevaMaquina(p, nil)
+	const id = uint32(0x7f030001) // id/drive_list del gestor de archivos
+	primero := &objetoDalvik{clase: "Landroid/widget/Button;", campos: map[string]any{}}
+	segundo := &objetoDalvik{clase: "Landroid/widget/Button;", campos: map[string]any{}}
+	contenedor := &objetoDalvik{clase: "Landroid/widget/LinearLayout;", id: id,
+		campos: map[string]any{}}
+	contenedor.hijosCodigo = []*objetoDalvik{primero, segundo}
+	m.contenedores = map[uint32][]*objetoDalvik{id: contenedor.hijosCodigo}
+	oyente := &objetoDalvik{clase: claseOyente, campos: map[string]any{}}
+	m.oyentes = []oyenteRegistrado{{oyente: oyente, vista: segundo}}
+	return m, id, primero, segundo
+}
+
+// TestPulsarHijoContenedorSinId comprueba la frontera que faltaba para el gestor de archivos: el id
+// del contenedor no tiene OnItemClickListener, así que `id/contenedor:N` tiene que resolver el clic
+// contra los hijos que la app añadió con addView. El hijo sin listener no se puede pulsar, el que lo
+// tiene recibe el onClick y la posición fuera de rango sigue siendo un error.
+func TestPulsarHijoContenedorSinId(t *testing.T) {
+	m, id, primero, segundo := maquinaContenedorConOyente(t)
+	// sin lista con adaptador ni OnItemClickListener, la ruta antigua no puede entregar el clic
+	if m.pulsaFila(id, 1) {
+		t.Fatal("el contenedor sin OnItemClickListener aceptó un clic de fila")
+	}
+	if m.pulsaHijoContenedor(id, 0) {
+		t.Fatal("se pulsó el hijo 0, que no registró OnClickListener")
+	}
+	if m.interaccion != 0 || primero.texto != "" {
+		t.Errorf("el hijo sin oyente cambió el estado: interacciones=%d texto=%q", m.interaccion, primero.texto)
+	}
+	if !m.pulsaHijoContenedor(id, 1) {
+		t.Fatal("no se pudo pulsar el hijo 1, que sí registró OnClickListener")
+	}
+	if m.interaccion != 1 {
+		t.Errorf("el clic no contó una interacción: %d", m.interaccion)
+	}
+	if segundo.texto != "FILA-1" {
+		t.Errorf("el onClick escribió %q en el hijo 1 y se esperaba «FILA-1»", segundo.texto)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); avisos != "" {
+		t.Errorf("el clic dejó avisos: %s", avisos)
+	}
+	if m.pulsaHijoContenedor(id, 2) {
+		t.Error("se pulsó una posición que no existe en el contenedor")
+	}
+	if m.pulsaHijoContenedor(id, -1) {
+		t.Error("se pulsó una posición negativa del contenedor")
+	}
+}
+
 // TestRomVolcadoEsReleible cubre la persistencia opcional sin escribir en disco: el volcado tiene
 // que volver a cargarse con el mismo almacenamiento y los mismos nodos.
 func TestRomVolcadoEsReleible(t *testing.T) {

@@ -1850,9 +1850,14 @@ func ejecutaOnCreateConEventosConRom(dxs []*dexFile, tabla *tablaRecursos, activ
 					errEventos = err
 					break
 				}
-				if !m.pulsaFila(id, fila) {
+				// Un ListView con adaptador se atiende como antes. Si el id no tiene
+				// OnItemClickListener, el gestor de archivos puede haber construido las filas a mano
+				// con addView y registrado el OnClickListener en cada botón sin id: en ese caso la
+				// posición se resuelve contra el orden de los hijos del contenedor.
+				if !m.pulsaFila(id, fila) && !m.pulsaHijoContenedor(id, fila) {
 					errEventos = fmt.Errorf("no se puede pulsar la fila %d de %q: ninguna lista con ese "+
-						"id registró un OnItemClickListener%s", fila, vista, listaDeOyentesDeItem(m))
+						"id registró un OnItemClickListener ni tiene un hijo con OnClickListener en "+
+						"esa posición%s", fila, vista, listaDeOyentesDeItem(m))
 					break
 				}
 				res.Pulsaciones = append(res.Pulsaciones, pedido)
@@ -2255,6 +2260,33 @@ func partirEscribir(dato string) (string, string) {
 	return dato, ""
 }
 
+// ejecutaOnClick entrega el clic al `onClick` de un oyente registrado. `etiqueta` solo nombra la
+// vista en los avisos, para que el mismo cuerpo sirva al clic por id y al clic en un hijo sin id.
+// Devuelve siempre verdadero porque el listener sí estaba registrado: un cuerpo que falte o falle se
+// anota, pero no se confunde con «no hay a quién pulsar».
+func (m *maquinaDalvik) ejecutaOnClick(reg oyenteRegistrado, etiqueta string) bool {
+	obj, ok := reg.oyente.(*objetoDalvik)
+	if !ok {
+		m.avisa("el listener de %s no es un objeto del dex", etiqueta)
+		return true
+	}
+	nombre := "onClick"
+	if reg.metodo != "" {
+		nombre = reg.metodo
+	}
+	met := m.buscaMetodo(obj.clase, nombre, "(Landroid/view/View;)V")
+	if met == nil {
+		m.avisa("%s se registró como listener y no tiene %s", claseCorta(obj.clase), nombre)
+		return true
+	}
+	m.interaccion++
+	if _, err := m.ejecutaCuerpo(obj.clase, met, []any{obj, reg.vista},
+		[]string{obj.clase, "Landroid/view/View;"}); err != nil {
+		m.avisa("el onClick de %s falló: %v", claseCorta(obj.clase), err)
+	}
+	return true
+}
+
 // pulsa entrega el clic al `onClick` de la última vista con ese id que se registró, como un
 // `setOnClickListener` que sustituye al anterior. Devuelve falso cuando ninguna vista con ese id
 // tiene oyente, que es lo que distingue «no hay a quién pulsar» de «se pulsó y no hizo nada».
@@ -2265,26 +2297,7 @@ func (m *maquinaDalvik) pulsa(id uint32) bool {
 		if !ok || vista.id != id {
 			continue
 		}
-		obj, ok := reg.oyente.(*objetoDalvik)
-		if !ok {
-			m.avisa("el listener de %#08x no es un objeto del dex", id)
-			return true
-		}
-		nombre := "onClick"
-		if reg.metodo != "" {
-			nombre = reg.metodo
-		}
-		met := m.buscaMetodo(obj.clase, nombre, "(Landroid/view/View;)V")
-		if met == nil {
-			m.avisa("%s se registró como listener y no tiene %s", claseCorta(obj.clase), nombre)
-			return true
-		}
-		m.interaccion++
-		if _, err := m.ejecutaCuerpo(obj.clase, met, []any{obj, reg.vista},
-			[]string{obj.clase, "Landroid/view/View;"}); err != nil {
-			m.avisa("el onClick de %s falló: %v", claseCorta(obj.clase), err)
-		}
-		return true
+		return m.ejecutaOnClick(reg, fmt.Sprintf("%#08x", id))
 	}
 	return false
 }
@@ -2364,6 +2377,27 @@ func (m *maquinaDalvik) pulsaFila(id uint32, posicion int) bool {
 			m.avisa("el onItemClick de %s falló: %v", claseCorta(obj.clase), err)
 		}
 		return true
+	}
+	return false
+}
+
+// pulsaHijoContenedor entrega el clic al `OnClickListener` del hijo que la app añadió por código a
+// un contenedor sin `OnItemClickListener`. El gestor de archivos crea un botón por fichero, le pone el
+// listener y lo añade a `id/drive_list` sin id: la posición de `id/contenedor:N` se resuelve contra
+// el orden de `addView`, que es el mismo en que el modelo publica las filas. Devuelve falso si no hay
+// ese hijo o si el hijo no registró listener, para no inventar una pulsación donde no hay destinatario.
+func (m *maquinaDalvik) pulsaHijoContenedor(id uint32, posicion int) bool {
+	hijos := m.contenedores[id]
+	if posicion < 0 || posicion >= len(hijos) {
+		return false
+	}
+	hijo := hijos[posicion]
+	for i := len(m.oyentes) - 1; i >= 0; i-- {
+		reg := m.oyentes[i]
+		if reg.vista != hijo {
+			continue
+		}
+		return m.ejecutaOnClick(reg, fmt.Sprintf("la fila %d de %#08x", posicion, id))
 	}
 	return false
 }
