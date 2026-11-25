@@ -611,3 +611,163 @@ func TestPreviewCapturaIndexOutOfBoundsDeArrayList(t *testing.T) {
 	sinAvisoDeStub(t, m)
 	mismaEjecucion(t, apk, nil)
 }
+
+// TestTermuxLosAvisosQueSePuedenQuitar recorre los seis avisos del JSON de Termux (§368). Cuatro
+// tienen stub propio —createPackageContext, ReportActivity$1.start, Arrays.toString y
+// Properties.stringPropertyNames—; los dos de File quedan como dependencia del frente de ROM y la
+// prueba exige que NO estén implementados aquí, para no invadir ese territorio.
+func TestTermuxLosAvisosQueSePuedenQuitar(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+
+	ctx, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;"},
+		"createPackageContext", "(Ljava/lang/String;I)Landroid/content/Context;",
+		[]any{cadenaObjeto("com.termux"), int32(0)}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("createPackageContext: v=%v ok=%v err=%v", ctx, ok, err)
+	}
+	esperaObjetoDeStub(t, ctx, "Landroid/content/Context;")
+	pm, ok, err := m.intentaStub([]string{"Landroid/content/Context;"},
+		"getPackageManager", "()Landroid/content/pm/PackageManager;", nil, ctx)
+	if err != nil || !ok || pm == nil {
+		t.Fatalf("getPackageManager sobre el contexto devuelto: v=%v ok=%v err=%v", pm, ok, err)
+	}
+
+	informe := objDe("Lcom/termux/shared/activities/ReportActivity$1;")
+	v, ok, err := m.intentaStub([]string{"Lcom/termux/shared/activities/ReportActivity$1;"},
+		"start", "()V", nil, informe)
+	if err != nil || !ok || v != nil {
+		t.Fatalf("start del informe: v=%v ok=%v err=%v", v, ok, err)
+	}
+
+	props := objDe("Ljava/util/Properties;")
+	conjunto, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"},
+		"stringPropertyNames", "()Ljava/util/Set;", nil, props)
+	if err != nil || !ok || conjunto == nil {
+		t.Fatalf("stringPropertyNames: v=%v ok=%v err=%v", conjunto, ok, err)
+	}
+	set := esperaObjetoDeStub(t, conjunto, "Ljava/util/Set;")
+	it, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, set)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator sobre el conjunto de propiedades: v=%v ok=%v err=%v", it, ok, err)
+	}
+
+	// File.exists y File.isFile son del frente de ROM: aquí se comprueba que siguen SIN stub.
+	for _, nombre := range []string{"exists", "isFile"} {
+		v, ok, err := m.intentaStub([]string{"Ljava/io/File;"}, nombre, "()Z", nil,
+			objDe("Ljava/io/File;"))
+		if err != nil || ok || v != nil {
+			t.Errorf("%s se resolvió en este frente: v=%v ok=%v err=%v", nombre, v, ok, err)
+		}
+	}
+
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("alguna llamada cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero recorre la cadena que Termux necesita: pedir el
+// SharedPreferences al Context, abrir el editor, escribir tres tipos, aplicar y volver a leer. Todo
+// el estado vive en el almacén en memoria de la máquina; la prueba falsifica que no aparece el aviso
+// de stub ausente y que el mapa de getAll es consultable sin tocar disco.
+func TestPreferenciasMemoriaTermuxGuardaYLeeSinFichero(t *testing.T) {
+	m := maquinaDeStubs()
+	m.almacen = nuevoAlmacenPreferencias()
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	contexto := []string{"Lcom/termux/app/TermuxActivity;", "Landroid/content/Context;"}
+
+	v, ok, err := m.intentaStub(contexto, "getSharedPreferences",
+		"(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+		[]any{cadenaObjeto("termux"), int32(0)}, actividad)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("getSharedPreferences: v=%v ok=%v err=%v", v, ok, err)
+	}
+	prefs := esperaObjetoDeStub(t, v, "Landroid/content/SharedPreferences;")
+	if prefs.prefsFichero != "termux" {
+		t.Fatalf("el almacén se llamó %q y se esperaba termux", prefs.prefsFichero)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "preferencias-memoria:") {
+		t.Errorf("getSharedPreferences no dejó aviso de familia: %v", m.avisos)
+	}
+
+	v, ok, err = m.intentaStub([]string{"Landroid/content/SharedPreferences;"}, "edit",
+		"()Landroid/content/SharedPreferences$Editor;", nil, prefs)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("edit: v=%v ok=%v err=%v", v, ok, err)
+	}
+	editor := esperaObjetoDeStub(t, v, "Landroid/content/SharedPreferences$Editor;")
+	escrituras := []struct {
+		nombre string
+		valor  any
+	}{
+		{"putString", cadenaObjeto("Hola")},
+		{"putInt", int32(14)},
+		{"putBoolean", boolAInt(true)},
+	}
+	for i, e := range escrituras {
+		clave := []string{"fuente", "tamano", "activo"}[i]
+		v, ok, err := m.intentaStub([]string{"Landroid/content/SharedPreferences$Editor;"}, e.nombre,
+			"(Ljava/lang/String;Ljava/lang/Object;)Landroid/content/SharedPreferences$Editor;",
+			[]any{cadenaObjeto(clave), e.valor}, editor)
+		if err != nil || !ok || v != editor {
+			t.Fatalf("%s(%q): v=%v ok=%v err=%v", e.nombre, clave, v, ok, err)
+		}
+	}
+	if len(m.almacen.ficheros["termux"]) != 0 {
+		t.Fatalf("el editor escribió antes de apply: %v", m.almacen.ficheros["termux"])
+	}
+	if v, ok, err := m.intentaStub([]string{"Landroid/content/SharedPreferences$Editor;"}, "apply",
+		"()V", nil, editor); err != nil || !ok || v != nil {
+		t.Fatalf("apply: v=%v ok=%v err=%v", v, ok, err)
+	}
+
+	lector := []string{"Landroid/content/SharedPreferences;"}
+	texto, ok, err := m.intentaStub(lector, "getString",
+		"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+		[]any{cadenaObjeto("fuente"), cadenaObjeto("por defecto")}, prefs)
+	if err != nil || !ok {
+		t.Fatalf("getString: v=%v ok=%v err=%v", texto, ok, err)
+	}
+	esperaCadenaDeStub(t, texto, "Hola")
+	entero, ok, err := m.intentaStub(lector, "getInt", "(Ljava/lang/String;I)I",
+		[]any{cadenaObjeto("tamano"), int32(-1)}, prefs)
+	if err != nil || !ok || entero != int32(14) {
+		t.Errorf("getInt: v=%v ok=%v err=%v", entero, ok, err)
+	}
+	booleano, ok, err := m.intentaStub(lector, "getBoolean", "(Ljava/lang/String;Z)Z",
+		[]any{cadenaObjeto("activo"), boolAInt(false)}, prefs)
+	if err != nil || !ok || booleano != boolAInt(true) {
+		t.Errorf("getBoolean: v=%v ok=%v err=%v", booleano, ok, err)
+	}
+
+	v, ok, err = m.intentaStub(lector, "getAll", "()Ljava/util/Map;", nil, prefs)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("getAll: v=%v ok=%v err=%v", v, ok, err)
+	}
+	mapa := esperaObjetoDeStub(t, v, "Ljava/util/Map;")
+	datos, _ := mapa.campos["preferencias.mapa"].(map[string]any)
+	if len(datos) != 3 || datos["fuente"] != "Hola" || datos["tamano"] != int32(14) {
+		t.Errorf("el mapa de getAll es %v", datos)
+	}
+	if v, ok, err := m.intentaStub([]string{"Ljava/util/Map;"}, "get",
+		"(Ljava/lang/Object;)Ljava/lang/Object;", []any{cadenaObjeto("activo")}, mapa); err != nil || !ok ||
+		!boolDe(v) {
+		t.Errorf("get sobre el mapa: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub([]string{"Ljava/util/Map;"}, "size", "()I", nil, mapa); err != nil ||
+		!ok || v != int32(3) {
+		t.Errorf("size del mapa: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub([]string{"Ljava/util/Map;"}, "keySet", "()Ljava/util/Set;", nil, mapa); err != nil ||
+		!ok || v == nil {
+		t.Fatalf("keySet del mapa: v=%v ok=%v err=%v", v, ok, err)
+	} else if claves := esperaObjetoDeStub(t, v, "Ljava/util/Set;").conjunto; len(claves) != 3 {
+		t.Errorf("el conjunto de claves es %v", claves)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "preferencias-memoria: getAll(") {
+		t.Errorf("getAll no dejó aviso de familia: %v", m.avisos)
+	}
+}

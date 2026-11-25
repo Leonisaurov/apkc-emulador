@@ -364,6 +364,10 @@ type objetoDalvik struct {
 	conjunto []any
 	iterando []any
 	indice   int
+	// propiedades es el mapa de un `java.util.Properties` del framework: el estado vive en la
+	// instancia y no se lee del disco, porque la vista previa no abre ficheros de la app. Se distingue
+	// de «sin propiedades» por no ser nulo: `clear` lo deja vacío, no nulo.
+	propiedades map[string]string
 	// bluetoothActivo es el estado del adaptador de `getDefaultAdapter`: se modela encendido para
 	// que la UI de la app pueda recorrer su camino completo sin un dispositivo.
 	bluetoothActivo bool
@@ -555,7 +559,7 @@ type maquinaDalvik struct {
 	// parecería completo y una aproximación podría confundirse con una ejecución cubierta.
 	avisosRecortados int
 	layoutID         uint32
-	oyentes  []oyenteRegistrado
+	oyentes          []oyenteRegistrado
 	// las listas que `setAdapter` dejó armadas y los `OnItemClickListener` que se registraron
 	// sobre ellas: es lo que convierte `--pulsar id/lista:fila` en un clic por posición.
 	listas      []*objetoDalvik
@@ -4262,6 +4266,57 @@ func clavesDelMapa(mapa map[string]any) []any {
 	return salida
 }
 
+// recursosSinteticos construye el Resources que devuelve `Context.getResources`: un objeto no nulo
+// enlazado a la tabla del APK. No es el Resources del aparato: solo se atienden las lecturas que se
+// pueden resolver contra esa tabla, y cada entrega deja su aviso de familia.
+func (m *maquinaDalvik) recursosSinteticos() *objetoDalvik {
+	return &objetoDalvik{clase: "Landroid/content/res/Resources;", campos: map[string]any{
+		"recursos.sintetico": true,
+		"recursos.tabla":     m.tabla,
+	}}
+}
+
+// esRecursosSinteticos reconoce el Resources creado arriba, no cualquier objeto con esa clase: el
+// que devuelve `Resources.getSystem()` no está enlazado a la tabla del APK.
+func esRecursosSinteticos(obj *objetoDalvik) bool {
+	return obj != nil && obj.campos["recursos.sintetico"] == true
+}
+
+// tablaDeRecursosSinteticos devuelve la tabla a la que está enlazado el objeto; nil si no la tiene.
+func tablaDeRecursosSinteticos(obj *objetoDalvik) *tablaRecursos {
+	if !esRecursosSinteticos(obj) {
+		return nil
+	}
+	t, _ := obj.campos["recursos.tabla"].(*tablaRecursos)
+	return t
+}
+
+// valorDeRecursosSinteticos resuelve un id contra la tabla enlazada al objeto. Un id que no está en
+// la tabla no se inventa: se distingue del valor cero para que el lector publique el aviso.
+func valorDeRecursosSinteticos(obj *objetoDalvik, id any) (valor, bool) {
+	tabla := tablaDeRecursosSinteticos(obj)
+	if tabla == nil {
+		return valor{}, false
+	}
+	n, err := aInt32(id)
+	if err != nil {
+		return valor{}, false
+	}
+	return tabla.valorDeId(uint32(n))
+}
+
+// esMapaPreferencias reconoce el `Map` que devuelve `SharedPreferences.getAll()`: lleva una copia
+// del almacén en memoria para que la app lo recorra sin tocar ficheros.
+func esMapaPreferencias(obj *objetoDalvik) bool {
+	return obj != nil && obj.campos["preferencias.mapa"] != nil
+}
+
+// clavesDeMapaPreferencias reutiliza el ordenador común: el mapa que publica getAll se recorre con
+// la misma fuente determinista que keySet, sin escribir un segundo ordenador de claves.
+func clavesDeMapaPreferencias(mapa map[string]any) []any {
+	return clavesDelMapa(mapa)
+}
+
 // clavesModeladasDelObjeto reúne las claves que el intérprete ya guardó en un objeto: las entradas
 // `mapa.*` que lee `Map.get`, el Bundle y el editor de SharedPreferences. No inventa ninguna clave.
 func clavesModeladasDelObjeto(o *objetoDalvik) map[string]any {
@@ -4344,6 +4399,22 @@ func enteroDeEstado(v any) int64 {
 		}
 	}
 	return 0
+}
+
+// clavesPropiedades entrega las claves de un Properties en orden determinista, como cadenas del
+// intérprete. Un mapa de Go no tiene orden: sin este sort, dos ejecuciones del mismo guion podían
+// recorrer el conjunto de claves en orden distinto y publicar modelos diferentes.
+func clavesPropiedades(p map[string]string) []any {
+	claves := make([]string, 0, len(p))
+	for c := range p {
+		claves = append(claves, c)
+	}
+	sort.Strings(claves)
+	salida := make([]any, 0, len(claves))
+	for _, c := range claves {
+		salida = append(salida, cadenaObjeto(c))
+	}
+	return salida
 }
 
 // cadenaObjeto arma el String que devuelve una lectura de texto, como el que devuelve `getText`.
@@ -4458,6 +4529,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	}
 	// esConjunto reconoce el conjunto que devolvió `getBondedDevices`: no nulo aunque esté vacío.
 	esConjunto := func() bool { return obj != nil && obj.conjunto != nil }
+	// esPropiedades reconoce un `java.util.Properties` del framework por su clase, no por el estado:
+	// así el conjunto de claves sigue siendo no nulo aunque el dex no haya llamado a `<init>`.
+	esPropiedades := func() bool {
+		return obj != nil && strings.HasSuffix(obj.clase, "Ljava/util/Properties;")
+	}
+	// propiedadesDe garantiza el mapa de la instancia antes de leerlo o escribirlo.
+	propiedadesDe := func() map[string]string {
+		if obj.propiedades == nil {
+			obj.propiedades = map[string]string{}
+		}
+		return obj.propiedades
+	}
 	// esIterador reconoce el cursor que devolvió `iterator()`, que recorre esa misma lista.
 	esIterador := func() bool {
 		return obj != nil && strings.HasSuffix(obj.clase, "Ljava/util/Iterator;")
@@ -4726,10 +4809,20 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return &objetoDalvik{clase: "Landroid/content/res/Resources;",
 				campos: map[string]any{}}, true, nil
 		}
+	case "getResources":
+		// Termux pide los Resources del Context antes de leer el tamaño de letra. El objeto es
+		// sintético y no nulo, y está enlazado a la tabla del APK; el aviso deja claro que no hay
+		// sistema de recursos detrás. Sin esto el receptor de getDisplayMetrics llegaba nulo.
+		if len(vals) == 0 && (esContexto() || es("Landroid/content/Context;")) {
+			m.avisa("recursos-sinteticos: Context.getResources entrega los recursos de la tabla del APK")
+			return m.recursosSinteticos(), true, nil
+		}
 	case "getDisplayMetrics":
 		// las métricas son la pantalla que el modelo publica (360 por 640 dp en la vista previa). Se
-		// ponen como campos del objeto para que un `iget widthPixels` lea el mismo valor.
-		if len(vals) == 0 && obj != nil && es("Landroid/content/res/Resources;") {
+		// ponen como campos del objeto para que un `iget widthPixels` lea el mismo valor. Se atiende
+		// tanto el Resources del sistema como el sintético del Context.
+		if len(vals) == 0 && obj != nil &&
+			(es("Landroid/content/res/Resources;") || esRecursosSinteticos(obj)) {
 			return &objetoDalvik{clase: "Landroid/util/DisplayMetrics;", campos: map[string]any{
 				"Landroid/util/DisplayMetrics;.widthPixels":  int32(360),
 				"Landroid/util/DisplayMetrics;.heightPixels": int32(640),
@@ -4747,6 +4840,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// para que las llamadas posteriores sobre él se reconozcan igual que sobre la actividad.
 		if len(vals) == 0 && esContexto() {
 			return &objetoDalvik{clase: "Landroid/app/Application;",
+				campos: map[string]any{"esContexto": true}}, true, nil
+		}
+	case "createPackageContext":
+		// Termux pide un contexto del paquete para leer sus propiedades. La vista previa no tiene
+		// otros paquetes instalados: se devuelve un Context inerte, marcado como contexto para que
+		// `getSharedPreferences` y compañía sigan reconociéndolo, sin crear ficheros ni paquetes.
+		if len(vals) == 2 && esContexto() {
+			return &objetoDalvik{clase: "Landroid/content/Context;",
 				campos: map[string]any{"esContexto": true}}, true, nil
 		}
 	case "checkSelfPermission":
@@ -4908,6 +5009,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if obj != nil && es("Ljava/util/ArrayList;") && obj.lista == nil {
 			obj.lista = []any{}
 		}
+		// el Properties del framework nace con su mapa vacío: `stringPropertyNames` entrega un
+		// conjunto vacío pero NO nulo, que es lo que evita el `Set.iterator` sobre el cero que
+		// detenía a Termux en `SharedProperties.loadPropertiesFromDisk`.
+		if obj != nil && es("Ljava/util/Properties;") && obj.propiedades == nil {
+			obj.propiedades = map[string]string{}
+		}
 		// un Paint nace negro y sin trazo, como el del framework: es el color que un onDraw
 		// publica si no llama a setColor
 		if obj != nil && es("Landroid/graphics/Paint;") && !obj.paintPuesto {
@@ -4934,9 +5041,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	case "getSharedPreferences":
 		// el SharedPreferences de la app: un almacén en memoria por nombre de fichero, compartido por
 		// todas las pantallas y por la instancia recreada. El fichero no se crea hasta que se escribe,
-		// para que el volcado no publique un almacén que la app solo leyó.
-		if len(vals) == 2 && obj != nil && obj == m.actividad {
+		// para que el volcado no publique un almacén que la app solo leyó. Termux lo pide desde el
+		// Context, no solo desde la actividad, así que se atiende cualquier contexto reconocido.
+		if len(vals) == 2 && (esContexto() || es("Landroid/content/Context;")) {
 			nombre := textoDe(vals[0])
+			m.avisa("preferencias-memoria: getSharedPreferences(%q) usa un almacén en memoria, sin fichero", nombre)
 			return &objetoDalvik{clase: "Landroid/content/SharedPreferences;",
 				campos: map[string]any{}, prefsFichero: nombre}, true, nil
 		}
@@ -4970,6 +5079,21 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				return int32(1), true, nil
 			}
 			return nil, true, nil
+		}
+	case "getAll":
+		// el mapa que publica SharedPreferences: una copia del almacén en memoria, para que la app
+		// pueda recorrerlo sin que un `get` posterior sobre el mapa lea ficheros. La copia evita que
+		// un editor pendiente cambie lo que la app está recorriendo.
+		if len(vals) == 0 && obj != nil && obj.prefsFichero != "" {
+			m.avisa("preferencias-memoria: getAll(%q) lee el mapa en memoria", obj.prefsFichero)
+			datos := map[string]any{}
+			if m.almacen != nil {
+				for c, v := range m.almacen.de(obj.prefsFichero) {
+					datos[c] = v
+				}
+			}
+			return &objetoDalvik{clase: "Ljava/util/Map;", campos: map[string]any{
+				"preferencias.mapa": datos}}, true, nil
 		}
 	case "getInt", "getLong", "getBoolean":
 		if len(vals) >= 1 && len(vals) <= 2 && esAlmacenDeEstado(obj) {
@@ -5457,6 +5581,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
 				conjunto: []any{}}, true, nil
 		}
+	case "start":
+		// `ReportActivity$1.start()` lanza el hilo que Termux usa para tejer el informe de error.
+		// La vista previa no tiene hilos: se acepta en silencio y no se ejecuta nada, que es lo
+		// mismo que el cero que devolvía antes salvo por el aviso de stub ausente. Se acota al
+		// nombre de la clase para no apropiarse de un `Thread.start()` de la app.
+		if len(vals) == 0 && obj != nil && strings.HasSuffix(obj.clase, "ReportActivity$1;") {
+			return nil, true, nil
+		}
 	case "startDiscovery":
 		// el descubrimiento se acepta y devuelve true, pero no entrega resultados: no hay receptor
 		// ni radio. Es la frontera documentada de `chatbt`.
@@ -5477,6 +5609,42 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"los sockets y los dispositivos Bluetooth reales no están en el subconjunto: no hay "+
 					"radio ni red", retorno)
 		}
+	case "stringPropertyNames", "keySet":
+		// El conjunto de claves de un Properties: SIEMPRE no nulo, aunque no haya leído ningún
+		// fichero. Es el punto donde Termux se detenía: el cero devuelto antes llegaba a
+		// `Set.iterator()` y el intérprete abortaba con «sobre un objeto nulo». Las claves van en
+		// orden determinista, así que el modelo publicado no depende del orden del mapa de Go.
+		if len(vals) == 0 && esPropiedades() {
+			return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
+				conjunto: clavesPropiedades(propiedadesDe())}, true, nil
+		}
+		if len(vals) == 0 && esMapaPreferencias(obj) {
+			datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
+			return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{},
+				conjunto: clavesDeMapaPreferencias(datos)}, true, nil
+		}
+	case "setProperty":
+		if len(vals) == 2 && esPropiedades() {
+			propiedadesDe()[textoDe(vals[0])] = textoDe(vals[1])
+			return obj, true, nil
+		}
+	case "getProperty":
+		if len(vals) >= 1 && esPropiedades() {
+			if v, ok := propiedadesDe()[textoDe(vals[0])]; ok {
+				return cadenaObjeto(v), true, nil
+			}
+			if len(vals) == 2 {
+				return vals[1], true, nil
+			}
+			return nil, true, nil
+		}
+	case "put":
+		// `Hashtable.put` de Properties: la clave y el valor son Object, pero el mapa de la
+		// máquina guarda texto determinista para que las claves se puedan ordenar y publicar.
+		if len(vals) == 2 && esPropiedades() {
+			propiedadesDe()[textoDe(vals[0])] = textoDe(vals[1])
+			return nil, true, nil
+		}
 	case "iterator":
 		if len(vals) == 0 {
 			if esConjunto() {
@@ -5492,6 +5660,13 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				// una casilla inventada sería peor, así que solo se entregan las claves modeladas.
 				return &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{},
 					iterando: clavesDelMapa(clavesModeladasDelObjeto(obj))}, true, nil
+			}
+			// un `for (String clave : properties.stringPropertyNames())` recorre el Set devuelto;
+			// un `properties.keySet()` o un `properties.iterator()` directo recorre el propio
+			// Properties. En los dos casos el cursor entrega las mismas claves ordenadas.
+			if esPropiedades() {
+				return &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{},
+					iterando: clavesPropiedades(propiedadesDe())}, true, nil
 			}
 			// el `for (X x : lista)` que emite javac llama a `List.iterator()` aunque el receptor
 			// sea un ArrayList: sin esto el iterador llegaba nulo y el bucle reventaba en hasNext.
@@ -5552,6 +5727,21 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 		}
 	case "get":
+		// el `Map` de `getAll` devuelve el valor guardado en la copia del almacén en memoria.
+		if esMapaPreferencias(obj) && len(vals) == 1 {
+			datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
+			if v, ok := datos[textoDe(vals[0])]; ok {
+				return v, true, nil
+			}
+			return nil, true, nil
+		}
+		// `Properties.get(Object)` devuelve el valor guardado, o el cero si la clave no está.
+		if esPropiedades() && len(vals) == 1 {
+			if v, ok := propiedadesDe()[textoDe(vals[0])]; ok {
+				return cadenaObjeto(v), true, nil
+			}
+			return nil, true, nil
+		}
 		if esLista() && len(vals) == 1 {
 			i, err := aInt32(vals[0])
 			if err != nil {
@@ -5587,6 +5777,13 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "size":
 		if len(vals) == 0 {
+			if esMapaPreferencias(obj) {
+				datos, _ := obj.campos["preferencias.mapa"].(map[string]any)
+				return int32(len(datos)), true, nil
+			}
+			if esPropiedades() {
+				return int32(len(propiedadesDe())), true, nil
+			}
 			if obj != nil && es("Landroid/view/Menu;", "Landroid/view/SubMenu;") {
 				return int32(len(obj.menuItems)), true, nil
 			}
@@ -5598,6 +5795,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 		}
 	case "clear":
+		if len(vals) == 0 && esPropiedades() {
+			obj.propiedades = map[string]string{}
+			return nil, true, nil
+		}
 		if len(vals) == 0 && obj != nil && es("Landroid/view/Menu;", "Landroid/view/SubMenu;") {
 			obj.menuItems = nil
 			return nil, true, nil
@@ -5792,6 +5993,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return int32(-1), true, nil
 		}
 	case "getString":
+		// `Resources.getString(id)` lee la tabla enlazada al objeto sintético; un id que no esté en
+		// ella devuelve el cero con aviso, en vez de inventar un texto.
+		if len(vals) == 1 && esRecursosSinteticos(obj) {
+			if v, ok := valorDeRecursosSinteticos(obj, vals[0]); ok && v.tipo == tipoCadena &&
+				int(v.datos) < len(tablaDeRecursosSinteticos(obj).global.cadenas) {
+				return cadenaObjeto(tablaDeRecursosSinteticos(obj).global.cadenas[v.datos]), true, nil
+			}
+			m.avisa("recursos-sinteticos: getString(%s) no está en la tabla del APK; se devuelve el cero",
+				textoDe(vals[0]))
+			return nil, true, nil
+		}
 		// getString(clave, porDefecto) del Bundle o del SharedPreferences devuelve el texto guardado,
 		// y getString(clave) devuelve null si no está, como el framework
 		if len(vals) == 2 && esAlmacenDeEstado(obj) {
@@ -6108,6 +6320,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return cadenaObjeto(ruta[strings.LastIndex(ruta, "/")+1:]), true, nil
 		}
 	case "toString":
+		// `Arrays.toString(Object[])` es estático: entrega `[a, b]` con el texto de cada hueco y
+		// `null` para los vacíos, como el framework. Termux lo usa al describir las propiedades.
+		if len(vals) == 1 && es("Ljava/util/Arrays;") {
+			if arr, ok := vals[0].(*arregloDalvik); ok {
+				partes := make([]string, len(arr.datos))
+				for i, v := range arr.datos {
+					partes[i] = textoDe(v)
+				}
+				return cadenaObjeto("[" + strings.Join(partes, ", ") + "]"), true, nil
+			}
+			return cadenaObjeto("null"), true, nil
+		}
 		// el `toString` de una excepción es su clase con el mensaje: es lo que un catch imprime
 		if len(vals) == 0 && esThrowableObj() {
 			if obj.mensajeExcepcion == "" {
@@ -6154,6 +6378,9 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "isEmpty":
 		if len(vals) == 0 {
+			if esPropiedades() {
+				return boolAInt(len(propiedadesDe()) == 0), true, nil
+			}
 			if s, ok := cadenaDe(receptor); ok {
 				return boolAInt(s == ""), true, nil
 			}
@@ -6218,8 +6445,34 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 		}
 	case "getColor":
+		if len(vals) == 1 && esRecursosSinteticos(obj) {
+			v, ok := valorDeRecursosSinteticos(obj, vals[0])
+			// un `@color/x` puede ser una referencia a otra entrada de la tabla: se sigue un solo
+			// enlace, que es lo que hace falta para no devolver el id como si fuera un color.
+			if ok && v.tipo == tipoReferencia {
+				v, ok = valorDeRecursosSinteticos(obj, v.datos)
+			}
+			if ok && (v.tipo == tipoColor || v.tipo == tipoColorRGB8 ||
+				v.tipo == tipoEnteroHex || v.tipo == tipoEnteroDec) {
+				return int32(v.datos), true, nil
+			}
+			m.avisa("recursos-sinteticos: getColor(%s) no es un color de la tabla del APK; se devuelve el cero",
+				textoDe(vals[0]))
+			return int32(0), true, nil
+		}
 		if len(vals) == 0 && obj != nil && es("Landroid/graphics/Paint;") {
 			return int32(colorDePaint(obj)), true, nil
+		}
+	case "getDimension":
+		if len(vals) == 1 && esRecursosSinteticos(obj) {
+			if v, ok := valorDeRecursosSinteticos(obj, vals[0]); ok && v.tipo == tipoDimension {
+				if dp, ok := dpDeComplejo(v.datos); ok {
+					return float32(dp * dpiPantalla / 160), true, nil
+				}
+			}
+			m.avisa("recursos-sinteticos: getDimension(%s) no es una dimensión de la tabla del APK; se devuelve el cero",
+				textoDe(vals[0]))
+			return float32(0), true, nil
 		}
 	case "setStrokeWidth":
 		if len(vals) == 1 && obj != nil && es("Landroid/graphics/Paint;") {

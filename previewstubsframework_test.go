@@ -1275,6 +1275,7 @@ func TestStackTraceGetStackTraceYGetters(t *testing.T) {
 func protoReturn(proto string) string {
 	return strings.TrimPrefix(proto, "()")
 }
+
 // TestStackTraceGettersConCamposVacios falsifica la casilla que sembró el frente de lifecycle: un
 // StackTraceElement sin campos debe leerse como cadena vacía y línea cero, nunca como un objeto
 // nulo que reviente el siguiente `equals`, y sin dejar un aviso nuevo.
@@ -1561,5 +1562,266 @@ func TestStackTraceSetStackTraceGuardaLaTraza(t *testing.T) {
 	}
 	if avisos := strings.Join(m.avisos, "\n"); avisos != "" {
 		t.Errorf("el camino set/get registró avisos: %s", avisos)
+	}
+}
+
+// --- familia 6: propiedades deterministas, sin ficheros ni sistema ------------------------------
+
+// TestPropertiesTermuxDevuelveUnSetNoNulo falsifica el error que detenía a Termux: el cero de
+// `stringPropertyNames` llegaba a `Set.iterator()` y el intérprete abortaba con «sobre un objeto
+// nulo». El conjunto tiene que existir aunque la app no haya declarado ninguna clave ni llamado a
+// `<init>`: la vista previa no lee ficheros y no tiene sistema de propiedades.
+func TestPropertiesTermuxDevuelveUnSetNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	props := objDe("Ljava/util/Properties;")
+
+	conjunto, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"},
+		"stringPropertyNames", "()Ljava/util/Set;", nil, props)
+	if err != nil || !ok || conjunto == nil {
+		t.Fatalf("stringPropertyNames: v=%v ok=%v err=%v", conjunto, ok, err)
+	}
+	set := esperaObjetoDeStub(t, conjunto, "Ljava/util/Set;")
+	if set.conjunto == nil {
+		t.Fatal("stringPropertyNames devolvió un Set con el conjunto nulo")
+	}
+	if len(set.conjunto) != 0 {
+		t.Errorf("el conjunto vacío tiene %d claves: %v", len(set.conjunto), set.conjunto)
+	}
+
+	it, ok, err := m.intentaStub([]string{"Ljava/util/Set;"}, "iterator", "()Ljava/util/Iterator;",
+		nil, set)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator del Set: v=%v ok=%v err=%v", it, ok, err)
+	}
+	esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+	hasNext, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok {
+		t.Fatalf("hasNext del Set vacío: ok=%v err=%v", ok, err)
+	}
+	if hasNext != int32(0) {
+		t.Errorf("hasNext devolvió %v y el conjunto está vacío", hasNext)
+	}
+
+	// la iteración directa sobre el Properties también entrega el conjunto de claves, sin receptor
+	// nulo y sin depender de que la app haya ejecutado su constructor.
+	it, ok, err = m.intentaStub([]string{"Ljava/util/Properties;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, props)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator del Properties: v=%v ok=%v err=%v", it, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("alguna llamada cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestPropertiesConClavesDeclaradasSonDeterministas comprueba que las claves que la app escribe con
+// `setProperty` se recorren en orden alfabético, no en el orden azaroso del mapa de Go, y que las
+// lecturas devuelven su valor. Dos ejecuciones del mismo guion tienen que dar el mismo modelo.
+func TestPropertiesConClavesDeclaradasSonDeterministas(t *testing.T) {
+	m := maquinaDeStubs()
+	props := objDe("Ljava/util/Properties;")
+	declaradas := []struct{ clave, valor string }{
+		{"z", "ultima"}, {"a", "primera"}, {"m", "media"},
+	}
+	for _, d := range declaradas {
+		v, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "setProperty",
+			"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+			[]any{cadenaObjeto(d.clave), cadenaObjeto(d.valor)}, props)
+		if err != nil || !ok {
+			t.Fatalf("setProperty(%q): ok=%v err=%v", d.clave, ok, err)
+		}
+		if v != props {
+			t.Errorf("setProperty no devolvió el Properties: %v", v)
+		}
+	}
+
+	conjunto, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "stringPropertyNames",
+		"()Ljava/util/Set;", nil, props)
+	if err != nil || !ok {
+		t.Fatalf("stringPropertyNames: ok=%v err=%v", ok, err)
+	}
+	set := esperaObjetoDeStub(t, conjunto, "Ljava/util/Set;")
+	esperadas := []string{"a", "m", "z"}
+	if len(set.conjunto) != len(esperadas) {
+		t.Fatalf("el conjunto tiene %d claves y se esperaban %d", len(set.conjunto), len(esperadas))
+	}
+	for i, esperada := range esperadas {
+		clave, esCadena := cadenaDe(set.conjunto[i])
+		if !esCadena || clave != esperada {
+			t.Errorf("la clave %d es %v y se esperaba %q", i, set.conjunto[i], esperada)
+		}
+	}
+
+	for _, d := range declaradas {
+		v, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "getProperty",
+			"(Ljava/lang/String;)Ljava/lang/String;", []any{cadenaObjeto(d.clave)}, props)
+		if err != nil || !ok {
+			t.Fatalf("getProperty(%q): ok=%v err=%v", d.clave, ok, err)
+		}
+		esperaCadenaDeStub(t, v, d.valor)
+	}
+	v, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "getProperty",
+		"(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+		[]any{cadenaObjeto("ausente"), cadenaObjeto("por defecto")}, props)
+	if err != nil || !ok {
+		t.Fatalf("getProperty con valor por defecto: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, v, "por defecto")
+
+	// clear deja el mapa vacío, pero no nulo: el Set siguiente sigue siendo recorrible.
+	if _, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "clear", "()V", nil, props); err != nil || !ok {
+		t.Fatalf("clear: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := m.intentaStub([]string{"Ljava/util/Properties;"}, "stringPropertyNames",
+		"()Ljava/util/Set;", nil, props); err != nil || !ok {
+		t.Fatalf("stringPropertyNames tras clear: ok=%v err=%v", ok, err)
+	}
+	if props.propiedades == nil || len(props.propiedades) != 0 {
+		t.Errorf("clear dejó el mapa en %v", props.propiedades)
+	}
+}
+
+// TestTermuxArraysToStringEsDeterminista comprueba el quinto aviso de Termux: el texto de un
+// arreglo de Object, con null en los huecos vacíos y sin depender de la dirección del arreglo.
+func TestTermuxArraysToStringEsDeterminista(t *testing.T) {
+	m := maquinaDeStubs()
+	arreglo := &arregloDalvik{tipo: "[Ljava/lang/Object;",
+		datos: []any{cadenaObjeto("uno"), nil, int32(7)}}
+	v, ok, err := m.intentaStub([]string{"Ljava/util/Arrays;"}, "toString",
+		"([Ljava/lang/Object;)Ljava/lang/String;", []any{arreglo}, nil)
+	if err != nil || !ok {
+		t.Fatalf("Arrays.toString: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, v, "[uno, null, 7]")
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("Arrays.toString cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// tablaDeSondaParaRecursos es un resources.arsc escrito con el mismo escritor del fork y leído con
+// leeTabla: tres tipos (color, dimen y string) con un valor cada uno. Es la tabla a la que se debe
+// enlazar el Resources sintético; no se inventa ningún valor fuera de ella.
+func tablaDeSondaParaRecursos(t *testing.T) *tablaRecursos {
+	t.Helper()
+	tb := tablaEscribir{
+		idPaquete:     0x7f,
+		nombrePaquete: "com.prueba.recursos",
+		global:        []string{"Hola"},
+		globalUTF8:    true,
+		nombresTipo:   []string{"color", "dimen", "string"},
+		claves:        []string{"fondo", "margen", "saludo"},
+		clavesUTF8:    true,
+		tipos: []tipoEscribir{
+			{id: 1, specFlags: []uint32{0x00000001}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 0, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0x00336699}},
+			}}}},
+			{id: 2, specFlags: []uint32{0x00000001}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 1, valor: valorEscribir{tipo: tipoDimension, datos: 0x00001001}}, // 16dp
+			}}}},
+			{id: 3, specFlags: []uint32{0x00000001}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 2, valor: valorEscribir{tipo: tipoCadena, datos: 0}},
+			}}}},
+		},
+	}
+	datos, err := escribeTablaRecursos(tb)
+	if err != nil {
+		t.Fatalf("la tabla de la sonda: %v", err)
+	}
+	tr, err := leeTabla(datos)
+	if err != nil {
+		t.Fatalf("la tabla escrita no se deja leer: %v", err)
+	}
+	return tr
+}
+
+// TestRecursosSinteticosDelContextDesbloqueaTermux falsifica la cadena que detenía a Termux: el cero
+// de `Context.getResources` llegaba a `Resources.getDisplayMetrics` y el intérprete abortaba. El
+// objeto entregado tiene que ser no nulo, estar enlazado a la tabla del APK y resolver solo lo que la
+// tabla contiene.
+func TestRecursosSinteticosDelContextDesbloqueaTermux(t *testing.T) {
+	m := maquinaDeStubs()
+	m.tabla = tablaDeSondaParaRecursos(t)
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	contexto := []string{"Lcom/termux/app/TermuxActivity;", "Landroid/content/Context;"}
+
+	v, ok, err := m.intentaStub(contexto, "getResources", "()Landroid/content/res/Resources;", nil, actividad)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("getResources: v=%v ok=%v err=%v", v, ok, err)
+	}
+	recursos := esperaObjetoDeStub(t, v, "Landroid/content/res/Resources;")
+	if !esRecursosSinteticos(recursos) || tablaDeRecursosSinteticos(recursos) != m.tabla {
+		t.Fatal("el Resources no está enlazado a la tabla del APK")
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "recursos-sinteticos:") {
+		t.Errorf("getResources no dejó aviso de familia: %v", m.avisos)
+	}
+
+	metricas, ok, err := m.intentaStub([]string{"Landroid/content/res/Resources;"}, "getDisplayMetrics",
+		"()Landroid/util/DisplayMetrics;", nil, recursos)
+	if err != nil || !ok || metricas == nil {
+		t.Fatalf("getDisplayMetrics: v=%v ok=%v err=%v", metricas, ok, err)
+	}
+	dm := esperaObjetoDeStub(t, metricas, "Landroid/util/DisplayMetrics;")
+	if dm.campos["Landroid/util/DisplayMetrics;.widthPixels"] != int32(360) ||
+		dm.campos["Landroid/util/DisplayMetrics;.heightPixels"] != int32(640) {
+		t.Errorf("las métricas son %v", dm.campos)
+	}
+
+	casos := []struct {
+		nombre string
+		proto  string
+		id     uint32
+	}{
+		{"getString", "(I)Ljava/lang/String;", 0x7f030000},
+		{"getColor", "(I)I", 0x7f010000},
+		{"getDimension", "(I)F", 0x7f020000},
+	}
+	esperados := []any{"Hola", int32(0x00336699), float32(16)}
+	for i, c := range casos {
+		valor, resuelto, err := m.intentaStub([]string{"Landroid/content/res/Resources;"}, c.nombre,
+			c.proto, []any{int32(c.id)}, recursos)
+		if err != nil || !resuelto {
+			t.Fatalf("%s: v=%v ok=%v err=%v", c.nombre, valor, resuelto, err)
+		}
+		switch c.nombre {
+		case "getString":
+			esperaCadenaDeStub(t, valor, esperados[i].(string))
+		case "getColor", "getDimension":
+			if valor != esperados[i] {
+				t.Errorf("%s devolvió %v y se esperaba %v", c.nombre, valor, esperados[i])
+			}
+		}
+	}
+}
+
+// TestRecursosSinteticosNoInventanRecursos cierra la otra mitad del contrato: un id ausente en la
+// tabla devuelve el cero (null para texto) y deja el aviso de familia, nunca un valor inventado.
+func TestRecursosSinteticosNoInventanRecursos(t *testing.T) {
+	m := maquinaDeStubs()
+	m.tabla = tablaDeSondaParaRecursos(t)
+	recursos := m.recursosSinteticos()
+	const ausente = int32(0x7f990099)
+
+	texto, ok, err := m.intentaStub([]string{"Landroid/content/res/Resources;"}, "getString",
+		"(I)Ljava/lang/String;", []any{ausente}, recursos)
+	if err != nil || !ok || texto != nil {
+		t.Errorf("getString de un id ausente: v=%v ok=%v err=%v", texto, ok, err)
+	}
+	color, ok, err := m.intentaStub([]string{"Landroid/content/res/Resources;"}, "getColor",
+		"(I)I", []any{ausente}, recursos)
+	if err != nil || !ok || color != int32(0) {
+		t.Errorf("getColor de un id ausente: v=%v ok=%v err=%v", color, ok, err)
+	}
+	dimen, ok, err := m.intentaStub([]string{"Landroid/content/res/Resources;"}, "getDimension",
+		"(I)F", []any{ausente}, recursos)
+	if err != nil || !ok || dimen != float32(0) {
+		t.Errorf("getDimension de un id ausente: v=%v ok=%v err=%v", dimen, ok, err)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "recursos-sinteticos: getString(") ||
+		!strings.Contains(avisos, "recursos-sinteticos: getColor(") ||
+		!strings.Contains(avisos, "recursos-sinteticos: getDimension(") {
+		t.Errorf("faltó el aviso de familia para algún id ausente: %v", m.avisos)
 	}
 }
