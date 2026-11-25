@@ -10,6 +10,9 @@ package main
 // corren en el despacho puntual sin calentar el portátil.
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -239,5 +242,293 @@ func TestFalsificacionConLosStubsApagados(t *testing.T) {
 		"execute", "(Ljava/lang/Runnable;)V", []any{objDe("Ljava/lang/Runnable;")}, ejecutor)
 	if err != nil || ok {
 		t.Fatalf("execute sobre el cero se resolvió: v=%v ok=%v err=%v", v, ok, err)
+	}
+}
+
+// esperaObjetoDeStub comprueba el tipo del objeto que devuelve un stub y lo devuelve para poder
+// mirar su estado después.
+func esperaObjetoDeStub(t *testing.T, v any, clase string) *objetoDalvik {
+	t.Helper()
+	o, ok := v.(*objetoDalvik)
+	if !ok || o == nil {
+		t.Fatalf("se esperaba un objeto %s y llegó %T (%v)", clase, v, v)
+	}
+	if o.clase != clase {
+		t.Errorf("el objeto es %s y se esperaba %s", o.clase, clase)
+	}
+	return o
+}
+
+// esperaCadenaDeStub comprueba que el stub devolvió una cadena no nula con el texto esperado.
+func esperaCadenaDeStub(t *testing.T, v any, esperado string) {
+	t.Helper()
+	s, ok := cadenaDe(v)
+	if !ok {
+		t.Fatalf("se esperaba una cadena y llegó %T (%v)", v, v)
+	}
+	if s != esperado {
+		t.Errorf("la cadena es %q y se esperaba %q", s, esperado)
+	}
+}
+
+// TestLosStubsDelCuartoApk falsifica uno a uno los doce métodos de la línea base §366, más los que
+// el flujo real pidió después de que `ejecucion.error` desapareciera. Cada caso comprueba su
+// semántica: los objetos son no nulos, las cadenas llevan el valor plausible y los setters guardan
+// estado en su vista o en su diálogo sin tocar el layout de la pantalla.
+func TestLosStubsDelCuartoApk(t *testing.T) {
+	m := maquinaDeStubs()
+	m.tabla = &tablaRecursos{nombrePaquete: "com.martinmimigames.simplefileexplorer"}
+	actividad := objDe("Lcom/martinmimigames/simplefileexplorer/MainActivity;")
+	m.actividad = actividad
+	m.layoutID = 0x7f050000
+
+	intencion := objDe("Landroid/content/Intent;")
+	parametros := objDe("Landroid/widget/RelativeLayout$LayoutParams;")
+	dialogo := objDe("Landroid/app/Dialog;")
+	vista := objDe("Landroid/view/View;")
+	vista.id = 0x7f030005
+	contenedor := objDe("Landroid/widget/LinearLayout;")
+	recursos := objDe("Landroid/content/res/Resources;")
+	fichero := objDe("Ljava/io/File;")
+	fichero.campos["file.ruta"] = "/sdcard/Download"
+
+	casos := []struct {
+		nombre     string
+		candidatos []string
+		proto      string
+		vals       []any
+		receptor   any
+		comprueba  func(t *testing.T, v any)
+	}{
+		{"newCachedThreadPool", []string{"Ljava/util/concurrent/Executors;"},
+			"()Ljava/util/concurrent/ExecutorService;", nil, nil,
+			func(t *testing.T, v any) {
+				esperaObjetoDeStub(t, v, "Ljava/util/concurrent/ExecutorService;")
+			}},
+		{"getClass", []string{"Ljava/lang/Object;"}, "()Ljava/lang/Class;", nil,
+			cadenaObjeto("android.intent.action.MAIN"),
+			func(t *testing.T, v any) {
+				o := esperaObjetoDeStub(t, v, "Ljava/lang/Class;")
+				if tipo := o.campos["Ljava/lang/Class;.$tipo"]; tipo != "Ljava/lang/String;" {
+					t.Errorf("el Class lleva %v y se esperaba Ljava/lang/String;", tipo)
+				}
+			}},
+		{"getPackageName", []string{"Lcom/martinmimigames/simplefileexplorer/MainActivity;"},
+			"()Ljava/lang/String;", nil, actividad,
+			func(t *testing.T, v any) {
+				esperaCadenaDeStub(t, v, "com.martinmimigames.simplefileexplorer")
+			}},
+		{"setTheme", []string{"Landroid/content/Context;"}, "(I)V", []any{int32(1)}, actividad,
+			func(t *testing.T, v any) {
+				if v != nil {
+					t.Errorf("setTheme devolvió %v y es void", v)
+				}
+			}},
+		{"setCancelable", []string{"Landroid/app/Dialog;"}, "(Z)V", []any{int32(0)}, dialogo,
+			func(t *testing.T, v any) {
+				if v != nil {
+					t.Errorf("setCancelable devolvió %v y es void", v)
+				}
+			}},
+		{"setTitle", []string{"Landroid/app/Dialog;"}, "(Ljava/lang/CharSequence;)V",
+			[]any{cadenaObjeto("Titulo")}, dialogo,
+			func(t *testing.T, v any) {
+				if v != nil {
+					t.Errorf("setTitle devolvió %v y es void", v)
+				}
+				if titulo := dialogo.campos[campoDialogoTitulo]; titulo != "Titulo" {
+					t.Errorf("el título guardado es %v", titulo)
+				}
+			}},
+		{"setLayoutParams", []string{"Landroid/view/View;"},
+			"(Landroid/view/ViewGroup$LayoutParams;)V", []any{parametros}, vista,
+			func(t *testing.T, v any) {
+				if v != nil || vista.campos["vista.layoutParams"] != parametros {
+					t.Errorf("setLayoutParams: v=%v campos=%v", v, vista.campos)
+				}
+			}},
+		{"setId", []string{"Landroid/view/View;"}, "(I)V", []any{int32(0x7f030006)}, vista,
+			func(t *testing.T, v any) {
+				if v != nil || vista.id != 0x7f030006 {
+					t.Errorf("setId: v=%v id=%#08x", v, vista.id)
+				}
+			}},
+		{"addView", []string{"Landroid/view/ViewGroup;"}, "(Landroid/view/View;)V",
+			[]any{vista}, contenedor,
+			func(t *testing.T, v any) {
+				if v != nil || contenedor.vistas[vista.id] != vista {
+					t.Errorf("addView: v=%v hijos=%v", v, contenedor.vistas)
+				}
+			}},
+		{"addRule", []string{"Landroid/widget/RelativeLayout$LayoutParams;"}, "(II)V",
+			[]any{int32(3), int32(0x7f030005)}, parametros,
+			func(t *testing.T, v any) {
+				reglas, _ := parametros.campos["layoutParams.reglas"].([]string)
+				if v != nil || len(reglas) != 1 {
+					t.Errorf("addRule: v=%v reglas=%v", v, reglas)
+				}
+			}},
+		{"setContentView", []string{"Landroid/app/Dialog;"}, "(Landroid/view/View;)V",
+			[]any{vista}, dialogo,
+			func(t *testing.T, v any) {
+				if v != nil || dialogo.campos["dialogo.vista"] != vista {
+					t.Errorf("setContentView del Dialog: v=%v campos=%v", v, dialogo.campos)
+				}
+				if m.layoutID != 0x7f050000 {
+					t.Errorf("setContentView del Dialog cambió el layout a %#08x", m.layoutID)
+				}
+			}},
+		{"getAction", []string{"Landroid/content/Intent;"}, "()Ljava/lang/String;", nil,
+			intencion,
+			func(t *testing.T, v any) {
+				esperaCadenaDeStub(t, v, "android.intent.action.MAIN")
+			}},
+		// los que el cuarto APK pidió después de seguir por su camino real
+		{"getSystem", []string{"Landroid/content/res/Resources;"},
+			"()Landroid/content/res/Resources;", nil, nil,
+			func(t *testing.T, v any) {
+				esperaObjetoDeStub(t, v, "Landroid/content/res/Resources;")
+			}},
+		{"getDisplayMetrics", []string{"Landroid/content/res/Resources;"},
+			"()Landroid/util/DisplayMetrics;", nil, recursos,
+			func(t *testing.T, v any) {
+				o := esperaObjetoDeStub(t, v, "Landroid/util/DisplayMetrics;")
+				if ancho := o.campos["Landroid/util/DisplayMetrics;.widthPixels"]; ancho != int32(360) {
+					t.Errorf("el ancho es %v y se esperaba 360", ancho)
+				}
+			}},
+		{"getAbsoluteFile", []string{"Ljava/io/File;"}, "()Ljava/io/File;", nil, fichero,
+			func(t *testing.T, v any) {
+				o := esperaObjetoDeStub(t, v, "Ljava/io/File;")
+				if o.campos["file.ruta"] != "/sdcard/Download" {
+					t.Errorf("getAbsoluteFile perdió la ruta: %v", o.campos)
+				}
+			}},
+		{"getPath", []string{"Ljava/io/File;"}, "()Ljava/lang/String;", nil, fichero,
+			func(t *testing.T, v any) {
+				esperaCadenaDeStub(t, v, "/sdcard/Download")
+			}},
+	}
+	for _, c := range casos {
+		v, ok, err := m.intentaStub(c.candidatos, c.nombre, c.proto, c.vals, c.receptor)
+		if err != nil || !ok {
+			t.Errorf("%s: v=%v ok=%v err=%v", c.nombre, v, ok, err)
+			continue
+		}
+		c.comprueba(t, v)
+	}
+
+	// un Intent construido con `new Intent(String)` conserva su acción, en vez de recibir siempre
+	// la acción genérica de la actividad lanzadora
+	intencion.campos["intent.accion"] = "android.intent.action.VIEW"
+	v, ok, err := m.intentaStub([]string{"Landroid/content/Intent;"}, "getAction",
+		"()Ljava/lang/String;", nil, intencion)
+	if err != nil || !ok {
+		t.Fatalf("getAction con acción explícita: v=%v ok=%v err=%v", v, ok, err)
+	}
+	esperaCadenaDeStub(t, v, "android.intent.action.VIEW")
+
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("algún stub del cuarto APK cayó en el aviso de familia: %s", avisos)
+	}
+}
+
+// TestElGuardiánDeNuloSigueCortandoAntesDelStub comprueba que el stub de getClass NO relaja el
+// guardián de `invoca`: con receptor nulo el error sigue siendo el de siempre.
+func TestElGuardiánDeNuloSigueCortandoAntesDelStub(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Ljava/lang/Object;", name: "getClass",
+		proto: dexProto{returnType: "Ljava/lang/Class;"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "")
+	if err == nil {
+		t.Fatal("getClass con receptor nulo no devolvió error")
+	}
+	if !strings.Contains(err.Error(), "se llamó a java.lang.Object.getClass sobre un objeto nulo") {
+		t.Errorf("el error fue %q y se esperaba el del guardián de receptor nulo", err)
+	}
+}
+
+// TestLaCadenaRealGetIntentGetActionGetClass recorre los tres invoke del dex del cuarto APK
+// (dexdump 005694..0056a4): el nulo lo producía `getAction()`, no `getClass()`. Los tres pasos
+// tienen que terminar sin error y sin avisos de la familia.
+func TestLaCadenaRealGetIntentGetActionGetClass(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	actividad := objDe("Lcom/martinmimigames/simplefileexplorer/MainActivity;")
+	m.actividad = actividad
+	d := &dexFile{methods: []dexMethod{
+		{owner: "Landroid/app/Activity;", name: "getIntent",
+			proto: dexProto{returnType: "Landroid/content/Intent;"}},
+		{owner: "Landroid/content/Intent;", name: "getAction",
+			proto: dexProto{returnType: "Ljava/lang/String;"}},
+		{owner: "Ljava/lang/Object;", name: "getClass",
+			proto: dexProto{returnType: "Ljava/lang/Class;"}},
+	}}
+
+	intencion, err := m.invoca(0x6e, d, 0, []int{0}, []any{actividad}, "")
+	if err != nil {
+		t.Fatalf("getIntent falló: %v", err)
+	}
+	accion, err := m.invoca(0x6e, d, 1, []int{0}, []any{intencion}, "")
+	if err != nil {
+		t.Fatalf("getAction falló: %v", err)
+	}
+	esperaCadenaDeStub(t, accion, "android.intent.action.MAIN")
+	clase, err := m.invoca(0x6e, d, 2, []int{0}, []any{accion}, "")
+	if err != nil {
+		t.Fatalf("getClass falló: %v", err)
+	}
+	esperaObjetoDeStub(t, clase, "Ljava/lang/Class;")
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("la cadena real dejó avisos de familia: %s", avisos)
+	}
+}
+
+// TestLaEvidenciaDelCuartoApk lee el JSON medido con el binario post-D y exige las dos condiciones
+// que el criterio falsable no puede ver con solo mirar `m.layoutID`: el layout y los nodos siguen
+// siendo los de la línea base §366, y la familia «llamada que no se sabe resolver» está a cero con
+// `ejecucion.error` ausente. El centinela `sin-layout-xml:` de Fase C se excluye del recuento.
+func TestLaEvidenciaDelCuartoApk(t *testing.T) {
+	casa, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("no se pudo resolver el directorio de casa: %v", err)
+	}
+	ruta := filepath.Join(casa, ".cache", "apkc-web", "fase-d-evidencia", "preview-post.json")
+	datos, err := os.ReadFile(ruta)
+	if err != nil {
+		t.Fatalf("no se pudo leer %s: %v", ruta, err)
+	}
+	var modelo struct {
+		Layout    string `json:"layout"`
+		Nodos     int    `json:"nodos"`
+		Ejecucion struct {
+			Avisos []string `json:"avisos"`
+			Error  string   `json:"error"`
+		} `json:"ejecucion"`
+	}
+	if err := json.Unmarshal(datos, &modelo); err != nil {
+		t.Fatalf("%s no es JSON válido: %v", ruta, err)
+	}
+	if modelo.Layout != "res/R5.xml" {
+		t.Errorf("el layout es %q y se esperaba res/R5.xml", modelo.Layout)
+	}
+	if modelo.Nodos != 30 {
+		t.Errorf("los nodos son %d y se esperaban 30", modelo.Nodos)
+	}
+	familia := 0
+	for _, aviso := range modelo.Ejecucion.Avisos {
+		if strings.Contains(aviso, "no está en el dex ni en los stubs") &&
+			!strings.Contains(aviso, "sin-layout-xml:") {
+			familia++
+		}
+	}
+	if familia != 0 {
+		t.Errorf("queda %d aviso(s) de la familia: %v", familia, modelo.Ejecucion.Avisos)
+	}
+	if modelo.Ejecucion.Error != "" {
+		t.Errorf("ejecucion.error no está ausente: %q", modelo.Ejecucion.Error)
 	}
 }

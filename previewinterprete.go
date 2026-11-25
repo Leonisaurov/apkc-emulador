@@ -1321,6 +1321,31 @@ func cadenaDe(v any) (string, bool) {
 // `charAt()`: ni bytes ni runes. «á» es una unidad y dos bytes, y un emoji son dos unidades.
 func unidadesDeCadena(s string) []uint16 { return utf16.Encode([]rune(s)) }
 
+// subcadenaDe recorta las unidades de 16 bits de un CharSequence entre dos índices, que es lo que
+// `StringBuilder.append(CharSequence, start, end)` hace en el framework.
+func subcadenaDe(v, inicio, fin any) string {
+	s, ok := cadenaDe(v)
+	if !ok {
+		s = textoDe(v)
+	}
+	i, err := aInt32(inicio)
+	if err != nil {
+		return ""
+	}
+	j, err := aInt32(fin)
+	if err != nil {
+		return ""
+	}
+	unidades := unidadesDeCadena(s)
+	if i < 0 || j < i || int(i) > len(unidades) {
+		return ""
+	}
+	if int(j) > len(unidades) {
+		j = int32(len(unidades))
+	}
+	return string(utf16.Decode(unidades[int(i):int(j)]))
+}
+
 // claseDeLiteral lee el descriptor de un `X.class`: el `const-class` del intérprete guarda el tipo
 // en el campo `$tipo` del objeto de `java.lang.Class`, que es lo que el constructor de `Intent`
 // necesita para saber a qué actividad apunta.
@@ -4120,6 +4145,39 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 0 && es("Landroid/os/Looper;") {
 			return &objetoDalvik{clase: "Landroid/os/Looper;", campos: map[string]any{}}, true, nil
 		}
+	case "getPackageName":
+		// el nombre del paquete sale de resources.arsc, que es la misma tabla con la que se
+		// resolvieron los id del layout. Sin tabla no hay nombre que inventar: se devuelve una
+		// cadena vacía, pero no el cero, porque el framework nunca devuelve null aquí.
+		if len(vals) == 0 && (esContexto() || es("Landroid/content/Context;")) {
+			paquete := ""
+			if m.tabla != nil {
+				paquete = m.tabla.nombrePaquete
+			}
+			return cadenaObjeto(paquete), true, nil
+		}
+	case "setTheme":
+		// el tema lo elige el manifiesto o la configuración; en el modelo no hay estilos que
+		// aplicar, así que se acepta el id sin cambiar nada ni publicar un aviso.
+		if len(vals) == 1 && (esContexto() || es("Landroid/content/Context;")) {
+			return nil, true, nil
+		}
+	case "getSystem":
+		// los Resources del sistema: el intérprete no tiene gestor de recursos, pero la app
+		// necesita un objeto sobre el que pedir las métricas de la pantalla del modelo.
+		if len(vals) == 0 && es("Landroid/content/res/Resources;") {
+			return &objetoDalvik{clase: "Landroid/content/res/Resources;",
+				campos: map[string]any{}}, true, nil
+		}
+	case "getDisplayMetrics":
+		// las métricas son la pantalla que el modelo publica (360 por 640 dp en la vista previa). Se
+		// ponen como campos del objeto para que un `iget widthPixels` lea el mismo valor.
+		if len(vals) == 0 && obj != nil && es("Landroid/content/res/Resources;") {
+			return &objetoDalvik{clase: "Landroid/util/DisplayMetrics;", campos: map[string]any{
+				"Landroid/util/DisplayMetrics;.widthPixels":  int32(360),
+				"Landroid/util/DisplayMetrics;.heightPixels": int32(640),
+			}}, true, nil
+		}
 	case "getPackageManager":
 		// el PackageManager de la app: un objeto con identidad que se pasa a los adaptadores y desde
 		// el que se piden los paquetes instalados (una lista vacía, sin sistema, más abajo).
@@ -4149,9 +4207,10 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return &objetoDalvik{clase: "Ljava/util/ArrayList;", campos: map[string]any{},
 				lista: []any{}}, true, nil
 		}
-	case "newSingleThreadExecutor":
-		// el ejecutor de un solo hilo: un objeto con identidad sobre el que `execute` encola el
-		// Runnable. No hay hilos reales, pero la cola lógica da el mismo orden y es determinista.
+	case "newSingleThreadExecutor", "newCachedThreadPool":
+		// los ejecutores del framework: un objeto con identidad sobre el que `execute` encola el
+		// Runnable. No hay hilos reales, pero la cola lógica da el mismo orden y es determinista;
+		// el tamaño del pool no cambia ese orden, así que ambos se modelan igual.
 		if len(vals) == 0 && es("Ljava/util/concurrent/Executors;") {
 			return &objetoDalvik{clase: "Ljava/util/concurrent/ExecutorService;",
 				campos: map[string]any{}}, true, nil
@@ -4183,6 +4242,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			return &objetoDalvik{clase: "Landroid/content/Intent;", campos: map[string]any{}}, true, nil
 		}
+	case "getAction":
+		// el Intent con el que se abrió la actividad lanzadora no tiene acción explícita: en el
+		// aparato es `android.intent.action.MAIN`. Devolver el cero aquí era lo que hacía caer el
+		// `getClass()` siguiente en el guardián de receptor nulo. Si la app construyó un Intent
+		// con `new Intent(String)`, su acción se guardó en el constructor y es la que se lee.
+		if len(vals) == 0 && obj != nil && es("Landroid/content/Intent;") {
+			if accion, ok := obj.campos["intent.accion"].(string); ok {
+				return cadenaObjeto(accion), true, nil
+			}
+			return cadenaObjeto("android.intent.action.MAIN"), true, nil
+		}
 	case "setClass":
 		if len(vals) == 2 && es("Landroid/content/Intent;") && obj != nil {
 			obj.intentClase = claseDeLiteral(vals[1])
@@ -4200,6 +4270,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if obj != nil && es("Landroid/content/Intent;") &&
 			proto == "(Landroid/content/Context;Ljava/lang/Class;)V" && len(vals) == 2 {
 			obj.intentClase = claseDeLiteral(vals[1])
+		}
+		// `new Intent(String action)` guarda la acción para que `getAction()` la devuelva en vez
+		// de la acción genérica de la actividad lanzadora.
+		if obj != nil && es("Landroid/content/Intent;") && proto == "(Ljava/lang/String;)V" &&
+			len(vals) == 1 {
+			obj.campos["intent.accion"] = textoDe(vals[0])
+		}
+		// `new File(String path)` guarda su ruta: la vista previa no abre el fichero, pero sí
+		// puede devolver la ruta que la app le dio cuando pregunta por ella.
+		if obj != nil && es("Ljava/io/File;") && proto == "(Ljava/lang/String;)V" && len(vals) == 1 {
+			obj.campos["file.ruta"] = textoDe(vals[0])
 		}
 		// el constructor de un ArrayAdapter recibe sus elementos: se guardan para el respaldo de
 		// getCount/getItem/getView de una subclase del proyecto que no los reescriba. Un arreglo
@@ -4311,6 +4392,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "setContentView":
 		if len(vals) == 1 {
+			// un Dialog infla su propia vista: guardarla en el diálogo NO cambia el layout de la
+			// pantalla, que sigue siendo el que pidió la actividad con `setContentView(R.layout…)`.
+			if obj != nil && es("Landroid/app/Dialog;") {
+				obj.campos["dialogo.vista"] = vals[0]
+				return nil, true, nil
+			}
 			if id, err := aInt32(vals[0]); err == nil {
 				m.layoutID = uint32(id)
 				return nil, true, nil
@@ -4329,6 +4416,67 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			// dentro de una vista inflada, el findViewById es el de esa instancia: dos filas del
 			// mismo layout no comparten sus vistas, como no las comparten en el aparato
 			return m.vistaDeInstancia(obj, uint32(id)), true, nil
+		}
+	case "setLayoutParams":
+		// los parámetros que la app pone a una vista creada en código se guardan en esa vista; el
+		// modelo los ignora porque mide desde el XML, pero la app puede volver a leerlos.
+		if len(vals) == 1 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+			obj.campos["vista.layoutParams"] = vals[0]
+			return nil, true, nil
+		}
+	case "setId":
+		// el id lo pone la app sobre la vista que acaba de crear. No se registra en el mapa global
+		// del layout: esa vista no viene del XML y el modelo no la pinta.
+		if len(vals) == 1 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+			if id, err := aInt32(vals[0]); err == nil {
+				obj.id = uint32(id)
+			}
+			return nil, true, nil
+		}
+	case "addView":
+		// al añadir una vista a un contenedor, el hijo pasa a ser parte de esa instancia: un
+		// `findViewById` posterior sobre el contenedor lo encuentra por su id.
+		if len(vals) == 1 && obj != nil &&
+			(es("Landroid/view/ViewGroup;", "Landroid/widget/ScrollView;") || esVista()) {
+			if hijo, ok := vals[0].(*objetoDalvik); ok && hijo.id != 0 {
+				if obj.vistas == nil {
+					obj.vistas = map[uint32]*objetoDalvik{}
+				}
+				obj.vistas[hijo.id] = hijo
+			}
+			return nil, true, nil
+		}
+	case "addRule":
+		// `RelativeLayout$LayoutParams.addRule` solo acumula reglas en los parámetros; el modelo
+		// coloca las vistas desde el XML, así que no hay posición que recalcular.
+		if len(vals) == 2 && obj != nil && es("Landroid/widget/RelativeLayout$LayoutParams;") {
+			reglas, _ := obj.campos["layoutParams.reglas"].([]string)
+			reglas = append(reglas, fmt.Sprintf("%v=%v", vals[0], vals[1]))
+			obj.campos["layoutParams.reglas"] = reglas
+			return nil, true, nil
+		}
+	case "setMargins":
+		// los márgenes se guardan en los parámetros por si la app vuelve a leerlos; el modelo
+		// sigue midiendo desde el layout.
+		if len(vals) == 4 && obj != nil && es("Landroid/view/ViewGroup$MarginLayoutParams;") {
+			obj.campos["layoutParams.margenes"] = append([]any(nil), vals...)
+			return nil, true, nil
+		}
+	case "setVisibility":
+		if len(vals) == 1 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+			obj.campos["vista.visibilidad"] = vals[0]
+			return nil, true, nil
+		}
+	case "setPadding":
+		if len(vals) == 4 && obj != nil && (es("Landroid/view/View;") || esVista()) {
+			obj.campos["vista.padding"] = append([]any(nil), vals...)
+			return nil, true, nil
+		}
+	case "setOrientation", "setGravity", "setForegroundGravity":
+		// propiedades de los contenedores que no alteran el modelo: se guardan en la vista.
+		if len(vals) == 1 && obj != nil && (esVista() || es("Landroid/view/View;")) {
+			obj.campos["vista."+nombre] = vals[0]
+			return nil, true, nil
 		}
 	case "setAdapter":
 		// la lista guarda el adaptador y se registra para que el modelo le pida sus filas después
@@ -4400,6 +4548,11 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return int64(i), true, nil
 		}
 	case "getChildCount":
+		// sin adaptador, los hijos del contenedor son las vistas que la app añadió con `addView`
+		if len(vals) == 0 && obj != nil && obj.adaptador == nil &&
+			(es("Landroid/view/ViewGroup;") || esVista()) {
+			return int32(len(obj.vistas)), true, nil
+		}
 		// la aproximación documentada: los hijos de la lista son las filas del adaptador
 		if len(vals) == 0 && obj != nil && obj.adaptador != nil {
 			n, err := m.cuentaDelAdaptador(obj.adaptador)
@@ -4908,6 +5061,50 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			return obj, true, nil
 		}
+		// `append(CharSequence, start, end)` añade ese trozo al StringBuilder; la firma de tres
+		// argumentos llega desde el código ofuscado de las apps reales.
+		if len(vals) == 3 && obj != nil && es("Ljava/lang/StringBuilder;") {
+			if obj.cadena == nil {
+				obj.cadena = &strings.Builder{}
+			}
+			obj.cadena.WriteString(subcadenaDe(vals[0], vals[1], vals[2]))
+			return obj, true, nil
+		}
+	case "indexOf":
+		// `String.indexOf(String, fromIndex)` busca desde un desplazamiento en unidades de 16
+		// bits, como el índice que la propia cadena cuenta.
+		if len(vals) == 2 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
+			s, ok := cadenaDe(receptor)
+			if !ok {
+				return nil, true, fmt.Errorf("indexOf sobre un receptor que no es una cadena")
+			}
+			desde, err := aInt32(vals[1])
+			if err != nil {
+				return nil, true, err
+			}
+			unidades := unidadesDeCadena(s)
+			aguja := unidadesDeCadena(textoDe(vals[0]))
+			inicio := int(desde)
+			if inicio < 0 {
+				inicio = 0
+			}
+			if inicio > len(unidades) {
+				inicio = len(unidades)
+			}
+			for i := inicio; i+len(aguja) <= len(unidades); i++ {
+				iguales := true
+				for j, u := range aguja {
+					if unidades[i+j] != u {
+						iguales = false
+						break
+					}
+				}
+				if iguales {
+					return int32(i), true, nil
+				}
+			}
+			return int32(-1), true, nil
+		}
 	case "getString":
 		// getString(clave, porDefecto) del Bundle o del SharedPreferences devuelve el texto guardado,
 		// y getString(clave) devuelve null si no está, como el framework
@@ -4986,6 +5183,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			return obj, true, nil
 		}
+		// `Dialog.setCancelable(boolean)` es void y se llama sobre el diálogo ya creado, no sobre
+		// el builder: se acepta sin devolver el receptor.
+		if nombre == "setCancelable" && len(vals) == 1 && obj != nil && es("Landroid/app/Dialog;") {
+			return nil, true, nil
+		}
+	case "setOnCancelListener":
+		// el oyente de cancelación se guarda en el diálogo: el modelo no tiene cancelación
+		// externa, pero la app necesita que la llamada exista y devuelva void.
+		if len(vals) == 1 && obj != nil && es("Landroid/app/Dialog;") {
+			obj.campos["dialogo.oyenteCancelacion"] = vals[0]
+			return nil, true, nil
+		}
 	case "setTitle", "setMessage":
 		// el título y el mensaje de un `AlertDialog.Builder`: se guardan para publicarlos como capa.
 		// El `setTitle` de la actividad sigue siendo otro: lo distingue la clase del receptor.
@@ -5002,6 +5211,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			obj.campos[clave] = m.textoDeArgumento(vals[0])
 			return obj, true, nil
+		}
+		// el título del Dialog ya creado se guarda en el mismo campo que el del builder; devuelve
+		// void, a diferencia de la cadena fluida del builder.
+		if nombre == "setTitle" && len(vals) == 1 && obj != nil && es("Landroid/app/Dialog;") {
+			obj.campos[campoDialogoTitulo] = m.textoDeArgumento(vals[0])
+			return nil, true, nil
 		}
 		if nombre == "setTitle" && len(vals) == 1 && es("Landroid/app/Activity;") {
 			m.captura("Activity.setTitle", obj, textoDe(vals[0]))
@@ -5067,6 +5282,46 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	case "printStackTrace":
 		if len(vals) == 0 && esThrowableObj() {
 			return nil, true, nil
+		}
+	case "getClass":
+		// `Object.getClass()` devuelve un java.lang.Class no nulo con el descriptor del receptor.
+		// El cero de este tipo era el segundo aviso del cuarto APK y, si el receptor venía de un
+		// `getAction()` sin stub, era también el receptor nulo que paraba la ejecución en el
+		// guardián de `invoca` (ese nulo lo quita `getAction`, no este stub).
+		if len(vals) == 0 && obj != nil {
+			return &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+				"Ljava/lang/Class;.$tipo": obj.clase,
+			}}, true, nil
+		}
+	case "getPackage":
+		// el Package de una clase: lleva el nombre del paquete del descriptor, para que el
+		// `getName()` que la reflexión ligera de las apps hace a continuación no reciba el cero.
+		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") {
+			tipo := claseDeLiteral(obj)
+			nombre := strings.TrimSuffix(strings.TrimPrefix(tipo, "L"), ";")
+			nombre = strings.ReplaceAll(nombre, "/", ".")
+			if i := strings.LastIndex(nombre, "."); i >= 0 {
+				nombre = nombre[:i]
+			} else {
+				nombre = ""
+			}
+			return &objetoDalvik{clase: "Ljava/lang/Package;", campos: map[string]any{
+				"Ljava/lang/Package;.name": nombre,
+			}}, true, nil
+		}
+	case "getCanonicalName", "getName", "getSimpleName":
+		// los nombres de un Class salen del descriptor que `getClass` guardó. Sin esto, las apps
+		// que comprueban el tipo de un objeto antes de registrarlo seguían con un nombre nulo y
+		// caían un paso más adelante (medido en NewPipe: `HashMap.get` sobre un objeto nulo).
+		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") {
+			tipo := claseDeLiteral(obj)
+			nombre := strings.TrimSuffix(strings.TrimPrefix(tipo, "L"), ";")
+			nombre = strings.ReplaceAll(nombre, "/", ".")
+			return cadenaObjeto(nombre), true, nil
+		}
+		if nombre == "getName" && len(vals) == 0 && obj != nil && es("Ljava/lang/Package;") {
+			paquete, _ := obj.campos["Ljava/lang/Package;.name"].(string)
+			return cadenaObjeto(paquete), true, nil
 		}
 	case "toString":
 		// el `toString` de una excepción es su clase con el mensaje: es lo que un catch imprime
@@ -5178,6 +5433,12 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// caía al stub genérico, el aviso lo delataba y el modelo dibujaba sin tamaño ninguno.
 		if len(vals) == 1 && obj != nil && es("Landroid/graphics/Paint;") {
 			obj.paintTamano = flotanteDeDibujo(vals[0])
+			return nil, true, nil
+		}
+		// `TextView.setTextSize(int, float)` NO redefine el texto: fija su tamaño en unidades. Se
+		// guarda en la vista; el modelo toma el tamaño del XML porque es lo que puede medir.
+		if len(vals) == 2 && obj != nil && es("Landroid/widget/TextView;") {
+			obj.campos["vista.tamTexto"] = vals[1]
 			return nil, true, nil
 		}
 	case "getTextSize":
@@ -5293,6 +5554,30 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				m.captura("println", nil, textoDe(vals[0]))
 			}
 			return nil, true, nil
+		}
+	case "getenv":
+		// la vista previa no tiene entorno del proceso: una variable no definida se lee como
+		// cadena vacía, que es la respuesta sin inventar un valor de una máquina ajena.
+		if len(vals) == 1 && es("Ljava/lang/System;") {
+			return cadenaObjeto(""), true, nil
+		}
+	case "getAbsoluteFile":
+		// `File.getAbsoluteFile()` devuelve OTRO File con la misma ruta. La vista previa no tiene
+		// sistema de ficheros de la app, pero el objeto debe existir para que el `getPath()` que
+		// sigue no caiga en el guardián de receptor nulo.
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			campos := map[string]any{}
+			for k, v := range obj.campos {
+				campos[k] = v
+			}
+			return &objetoDalvik{clase: "Ljava/io/File;", campos: campos}, true, nil
+		}
+	case "getPath":
+		// la ruta que se guardó al construir el File. Sin ruta conocida se devuelve la cadena
+		// vacía, nunca el cero: la app encadena `equals` sobre este resultado.
+		if len(vals) == 0 && obj != nil && es("Ljava/io/File;") {
+			ruta, _ := obj.campos["file.ruta"].(string)
+			return cadenaObjeto(ruta), true, nil
 		}
 	case "valueOf":
 		if len(vals) == 1 && es("Ljava/lang/String;") {
