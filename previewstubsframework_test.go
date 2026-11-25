@@ -1876,3 +1876,90 @@ func TestRecursosEstaticosDeTermuxNoNulos(t *testing.T) {
 		}
 	}
 }
+
+// TestRecursosMapaInmutableDeTermux falsifica el `sget-object` que detenía a Termux en
+// `setSessionShortcuts`: el campo MAP_SESSION_SHORTCUTS debe ser un ImmutableBiMap no nulo con
+// entrySet/keySet/get sobre las claves literals del dex, sin inventar contenido.
+func TestRecursosMapaInmutableDeTermux(t *testing.T) {
+	m := maquinaDeStubs()
+	const dueño = "Lcom/termux/shared/settings/properties/TermuxPropertyConstants;"
+	m.prog = &programaDalvik{dex: &dexFile{strings: []string{
+		"shortcut.create-session", "shortcut.next-session",
+		"shortcut.previous-session", "shortcut.rename-session",
+	}}, clases: map[string]*claseDalvik{}}
+	m.prog.clases[dueño] = &claseDalvik{estaticos: map[string]any{}}
+	campo := dexField{owner: dueño, name: "MAP_SESSION_SHORTCUTS",
+		typeOf: "Lcom/google/common/collect/ImmutableBiMap;"}
+
+	v, err := m.leeEstatico(campo)
+	if err != nil || v == nil {
+		t.Fatalf("leeEstatico(MAP_SESSION_SHORTCUTS): v=%v err=%v", v, err)
+	}
+	mapa := esperaObjetoDeStub(t, v, "Lcom/google/common/collect/ImmutableBiMap;")
+	datos, _ := mapa.campos["mapa.datos"].(map[string]any)
+	if len(datos) != 4 || datos["shortcut.next-session"] != int32(2) {
+		t.Fatalf("el mapa del dex es %v", datos)
+	}
+	if !strings.Contains(strings.Join(m.avisos, "\n"), "aproximación-estática:") {
+		t.Errorf("el mapa no dejó aviso de aproximación: %v", m.avisos)
+	}
+
+	entradas, ok, err := m.intentaStub([]string{"Lcom/google/common/collect/ImmutableBiMap;"},
+		"entrySet", "()Lcom/google/common/collect/ImmutableSet;", nil, mapa)
+	if err != nil || !ok || entradas == nil {
+		t.Fatalf("entrySet: v=%v ok=%v err=%v", entradas, ok, err)
+	}
+	conjunto := esperaObjetoDeStub(t, entradas, "Ljava/util/Set;")
+	if len(conjunto.conjunto) != 4 {
+		t.Fatalf("entrySet entregó %d entradas y se esperaban 4", len(conjunto.conjunto))
+	}
+	// el dex de Guava llama a createEntrySet, que no tiene cuerpo: su puente debe entregar el
+	// mismo conjunto para que el `ImmutableSet.iterator()` siguiente no reciba un receptor nulo.
+	puente, err := m.stubSinCuerpo("Lcom/google/common/collect/ImmutableBiMap;",
+		&metodoDalvik{nombre: "createEntrySet", retorno: "Lcom/google/common/collect/ImmutableSet;"},
+		[]any{mapa})
+	if err != nil || puente == nil {
+		t.Fatalf("createEntrySet sin cuerpo: v=%v err=%v", puente, err)
+	}
+	if n := len(esperaObjetoDeStub(t, puente, "Ljava/util/Set;").conjunto); n != 4 {
+		t.Errorf("createEntrySet entregó %d entradas y se esperaban 4", n)
+	}
+	primera := esperaObjetoDeStub(t, conjunto.conjunto[0], "Ljava/util/Map$Entry;")
+	clave, ok, err := m.intentaStub([]string{"Ljava/util/Map$Entry;"}, "getKey",
+		"()Ljava/lang/Object;", nil, primera)
+	if err != nil || !ok {
+		t.Fatalf("getKey: v=%v ok=%v err=%v", clave, ok, err)
+	}
+	esperaCadenaDeStub(t, clave, "shortcut.create-session")
+	valor, ok, err := m.intentaStub([]string{"Ljava/util/Map$Entry;"}, "getValue",
+		"()Ljava/lang/Object;", nil, primera)
+	if err != nil || !ok || valor != int32(1) {
+		t.Errorf("getValue: v=%v ok=%v err=%v", valor, ok, err)
+	}
+	claves, ok, err := m.intentaStub([]string{"Lcom/google/common/collect/ImmutableBiMap;"},
+		"keySet", "()Ljava/util/Set;", nil, mapa)
+	if err != nil || !ok || claves == nil {
+		t.Fatalf("keySet: v=%v ok=%v err=%v", claves, ok, err)
+	}
+	if n := len(esperaObjetoDeStub(t, claves, "Ljava/util/Set;").conjunto); n != 4 {
+		t.Errorf("keySet entregó %d claves y se esperaban 4", n)
+	}
+	leido, ok, err := m.intentaStub([]string{"Lcom/google/common/collect/ImmutableBiMap;"}, "get",
+		"(Ljava/lang/Object;)Ljava/lang/Object;", []any{cadenaObjeto("shortcut.next-session")}, mapa)
+	if err != nil || !ok || leido != int32(2) {
+		t.Errorf("get: v=%v ok=%v err=%v", leido, ok, err)
+	}
+
+	// una clave que no esté en el dex no se modela: no se inventa contenido.
+	filtrado := maquinaDeStubs()
+	filtrado.prog = &programaDalvik{dex: &dexFile{strings: []string{"shortcut.create-session"}},
+		clases: map[string]*claseDalvik{dueño: {estaticos: map[string]any{}}}}
+	v, err = filtrado.leeEstatico(campo)
+	if err != nil || v == nil {
+		t.Fatalf("leeEstatico filtrado: v=%v err=%v", v, err)
+	}
+	datos, _ = esperaObjetoDeStub(t, v, "Lcom/google/common/collect/ImmutableBiMap;").campos["mapa.datos"].(map[string]any)
+	if len(datos) != 1 || datos["shortcut.create-session"] != int32(1) {
+		t.Errorf("el mapa filtrado es %v", datos)
+	}
+}

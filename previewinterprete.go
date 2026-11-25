@@ -4096,6 +4096,36 @@ func (m *maquinaDalvik) leeEstatico(f dexField) (any, error) {
 		}
 		return conjunto, nil
 	}
+	// Termux recorre `MAP_SESSION_SHORTCUTS` con `ImmutableBiMap.entrySet()`. Sin `<clinit>` el
+	// campo llega null y el intérprete aborta. Se entrega un mapa no nulo cuyas claves son solo los
+	// literales del dex que el escritor del `<clinit>` puso en el builder (medido en classes6.dex);
+	// una clave que no aparezca en el programa no se modela.
+	if f.owner == "Lcom/termux/shared/settings/properties/TermuxPropertyConstants;" &&
+		f.name == "MAP_SESSION_SHORTCUTS" {
+		literales := []struct {
+			clave string
+			valor int32
+		}{
+			{"shortcut.create-session", 1},
+			{"shortcut.next-session", 2},
+			{"shortcut.previous-session", 3},
+			{"shortcut.rename-session", 4},
+		}
+		datos := map[string]any{}
+		for _, par := range literales {
+			if m.claveEnDex(par.clave) {
+				datos[par.clave] = par.valor
+			}
+		}
+		m.avisa("aproximación-estática: %s.%s es un mapa no nulo con %d claves del dex, sin contenido inventado",
+			claseCorta(f.owner), f.name, len(datos))
+		mapa := &objetoDalvik{clase: "Lcom/google/common/collect/ImmutableBiMap;",
+			campos: map[string]any{"mapa.datos": datos}}
+		if cl, ok := m.prog.clases[f.owner]; ok {
+			cl.estaticos[claveCampo(f)] = mapa
+		}
+		return mapa, nil
+	}
 	return valorCero(f.typeOf), nil
 }
 
@@ -4225,6 +4255,16 @@ func (m *maquinaDalvik) stubSinCuerpo(clase string, met *metodoDalvik, args []an
 			m.captura(met.nombre, nil, textoDe(args[len(args)-1]))
 		}
 		return valorCero(met.retorno), nil
+	case "createentryset":
+		// `ImmutableBiMap.entrySet()` llama a este método sin cuerpo y su cero llegaba al
+		// `ImmutableSet.iterator()` siguiente como receptor nulo. Se devuelve el mismo conjunto de
+		// entradas que el `entrySet` modelado, sin claves inventadas.
+		if len(args) > 0 {
+			receptor, _ := args[0].(*objetoDalvik)
+			if datos := datosDelMapa(receptor); datos != nil {
+				return entradasDelMapa(datos), nil
+			}
+		}
 	}
 	m.avisa("%s.%s no tiene cuerpo y no es un stub conocido", claseCorta(clase), met.nombre)
 	return valorCero(met.retorno), nil
@@ -4323,6 +4363,34 @@ func valorDeRecursosSinteticos(obj *objetoDalvik, id any) (valor, bool) {
 	return tabla.valorDeId(uint32(n))
 }
 
+// claveEnDex dice si un literal aparece en algún pool de cadenas del programa cargado. Se usa para
+// no inventar claves de los mapas inmutables de Termux: solo se modelan las que el dex trae.
+func (m *maquinaDalvik) claveEnDex(clave string) bool {
+	if m.prog == nil {
+		return false
+	}
+	if m.prog.dex != nil {
+		for _, s := range m.prog.dex.strings {
+			if s == clave {
+				return true
+			}
+		}
+	}
+	for _, cl := range m.prog.clases {
+		for _, met := range cl.metodos {
+			if met.dex == nil {
+				continue
+			}
+			for _, s := range met.dex.strings {
+				if s == clave {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // esMapaPreferencias reconoce el `Map` que devuelve `SharedPreferences.getAll()`: lleva una copia
 // del almacén en memoria para que la app lo recorra sin tocar ficheros.
 func esMapaPreferencias(obj *objetoDalvik) bool {
@@ -4375,6 +4443,21 @@ func clavesModeladasDelObjeto(o *objetoDalvik) map[string]any {
 		datos[k] = v
 	}
 	return datos
+}
+
+// entradasDelMapa convierte el mapa del modelo en un conjunto de `Map$Entry` con claves ordenadas.
+// Lo comparten `entrySet` y el `createEntrySet` sin cuerpo que el dex de Guava llama por dentro.
+func entradasDelMapa(datos map[string]any) *objetoDalvik {
+	entradas := make([]any, 0, len(datos))
+	for _, c := range clavesDelMapa(datos) {
+		clave, _ := cadenaDe(c)
+		entradas = append(entradas, &objetoDalvik{clase: "Ljava/util/Map$Entry;",
+			campos: map[string]any{
+				"entrada.clave": clave,
+				"entrada.valor": datos[clave],
+			}})
+	}
+	return &objetoDalvik{clase: "Ljava/util/Set;", campos: map[string]any{}, conjunto: entradas}
 }
 
 // guardaValor pone un valor con clave en el Bundle o en el editor del SharedPreferences, ya
@@ -5698,6 +5781,24 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				}
 			}
 			return boolAInt(false), true, nil
+		}
+	case "entrySet":
+		// `ImmutableBiMap.entrySet()` entrega las entradas del mapa del objeto, en el mismo orden
+		// determinista que `keySet`. Cada entrada es un `Map$Entry` con su clave y su valor, sin
+		// inventar ninguno. Termux recorre este conjunto en `setSessionShortcuts`.
+		if len(vals) == 0 {
+			if datos := datosDelMapa(obj); datos != nil {
+				return entradasDelMapa(datos), true, nil
+			}
+		}
+	case "getKey":
+		if len(vals) == 0 && obj != nil && es("Ljava/util/Map$Entry;") {
+			clave, _ := obj.campos["entrada.clave"].(string)
+			return cadenaObjeto(clave), true, nil
+		}
+	case "getValue":
+		if len(vals) == 0 && obj != nil && es("Ljava/util/Map$Entry;") {
+			return obj.campos["entrada.valor"], true, nil
 		}
 	case "setProperty":
 		if len(vals) == 2 && esPropiedades() {
