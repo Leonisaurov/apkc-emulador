@@ -3127,6 +3127,24 @@ func (m *maquinaDalvik) jerarquiaDelDex(clase string) []string {
 	return cadena
 }
 
+// esVistaDelProyecto dice si una clase del dex hereda de una vista del framework antes de salir
+// del dex. `TermuxActivityRootView` hereda de `LinearLayout` y el dex no trae a su padre, así que
+// `jerarquiaDelDex` se queda en la clase de la app: sin esto, un `getViewTreeObserver` llamado
+// sobre esa raíz no se reconoce como método de View.
+func (m *maquinaDalvik) esVistaDelProyecto(clase string) bool {
+	for i := 0; i < 32; i++ {
+		cl, ok := m.prog.clases[clase]
+		if !ok || cl.super == "" || cl.super == clase {
+			return false
+		}
+		if strings.HasPrefix(cl.super, "Landroid/view/") || strings.HasPrefix(cl.super, "Landroid/widget/") {
+			return true
+		}
+		clase = cl.super
+	}
+	return false
+}
+
 // buscaMetodo sube por la jerarquía de clases del dex hasta encontrar nombre+firma.
 func (m *maquinaDalvik) buscaMetodo(clase, nombre, proto string) *metodoDalvik {
 	for i := 0; i < 32; i++ {
@@ -4053,6 +4071,12 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 				lit := int32(int8(w >> 8))
 				// El formato 22b toma el registro fuente de los ocho bits bajos de la segunda
 				// palabra, no de un nibble: con &0xf un registro mayor que 15 se leía como v1.
+				// NewPipe 0.29.3 se detenía aquí en `MutableScatterMap.findInsertIndex`: la unidad
+				// 0x56 es `shr-int/lit8 v17, v17, #3` y el byte bajo del operando vale 0x11; al
+				// leer solo el nibble se tomaba v1, que guarda el observador del modelo, y
+				// `aInt32` decía «el registro guarda *main.objetoDalvik y se esperaba un entero».
+				// El cuerpo de `set`/`findInsertIndex` sí está en el dex: no se modela la scatter
+				// map ni se inventa una clave, se lee el registro que el dex indica.
 				v, err := enteraLit(op-0xd8, regs[int(w)&0xff], lit)
 				if err != nil {
 					return nil, err
@@ -5185,9 +5209,11 @@ func (m *maquinaDalvik) hiloPrincipalSintetico() *objetoDalvik {
 // para que las llamadas posteriores se atiendan como inertes sin enumerar cada método de la API.
 // No llevan contenido: solo identifican la familia del objeto y permiten no repetir el aviso.
 const (
-	markerInerteNativo     = "emulador.inerteNativo"
-	markerInerteWeb        = "emulador.inerteWeb"
-	markerServicioCargador = "emulador.serviceLoader"
+	markerInerteNativo        = "emulador.inerteNativo"
+	markerInerteWeb           = "emulador.inerteWeb"
+	markerServicioCargador    = "emulador.serviceLoader"
+	markerInerteAudio         = "emulador.inerteAudio"
+	markerInerteAccesibilidad = "emulador.inerteAccesibilidad"
 )
 
 // stubsFrameworkActivos es un interruptor de prueba: a false simula el emulador anterior a estos
@@ -5445,6 +5471,21 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	if nombre != "split" && proto == "(Ljava/lang/String;I)[Ljava/lang/String;" &&
 		es("Ljava/lang/String;") {
 		nombre = "split"
+	}
+	// esReceptorBuilderAudio reconoce el builder de AudioAttributes por su descriptor exacto sobre
+	// el receptor. Termux lo crea con `new-instance` y el framework no trae cuerpo ni para su
+	// constructor ni para sus setters: sin esto, `setContentType` devuelve el cero, el
+	// `move-result-object` siguiente deja el registro nulo y `setUsage` corta en `invoca`.
+	esReceptorBuilderAudio := func() bool {
+		return obj != nil && strings.HasSuffix(obj.clase, "Landroid/media/AudioAttributes$Builder;")
+	}
+	// esReceptorBuilderSoundPool reconoce el builder de SoundPool por su descriptor exacto sobre
+	// el receptor. Termux lo crea con `new-instance` y, como el de AudioAttributes, el framework no
+	// trae cuerpo para su constructor ni para sus setters: sin esto, `setMaxStreams` devuelve el
+	// cero, el `move-result-object` siguiente deja el registro nulo y `setAudioAttributes` corta en
+	// `invoca` (frontera de los 7130 pasos de getBellSoundPool).
+	esReceptorBuilderSoundPool := func() bool {
+		return obj != nil && strings.HasSuffix(obj.clase, "Landroid/media/SoundPool$Builder;")
 	}
 
 	switch nombre {
@@ -5723,6 +5764,23 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return &objetoDalvik{clase: "Landroid/app/Application;",
 				campos: map[string]any{"esContexto": true}}, true, nil
 		}
+	case "getSystemService":
+		// dexdump de classes14.dex, call site 013cf0-013d08 del constructor de TerminalView:
+		// `const-string "accessibility"` → `getSystemService(Ljava/lang/String;)Ljava/lang/Object;`
+		// → `check-cast` a AccessibilityManager → `isEnabled:()Z` → `iput-boolean
+		// mAccessibilityEnabled`. En Android el servicio existe aunque no haya servicios de
+		// accesibilidad; el cero que devolvía antes dejaba nulo el receptor y cortaba la
+		// construcción de la vista. Se modela SOLO ese nombre con la firma exacta del dex;
+		// cualquier otro servicio sigue cayendo al cero de su tipo.
+		if len(vals) == 1 && esContexto() && stubsFrameworkActivos &&
+			proto == "(Ljava/lang/String;)Ljava/lang/Object;" {
+			if nombreServicio, ok := cadenaDe(vals[0]); ok && nombreServicio == "accessibility" {
+				m.avisa("getSystemService(accessibility): gestor inerte, sin servicios de " +
+					"accesibilidad reales (aproximación)")
+				return objetoInerte("Landroid/view/accessibility/AccessibilityManager;",
+					markerInerteAccesibilidad), true, nil
+			}
+		}
 	case "createPackageContext":
 		// Termux pide un contexto del paquete para leer sus propiedades. La vista previa no tiene
 		// otros paquetes instalados: se devuelve un Context inerte, marcado como contexto para que
@@ -5983,7 +6041,45 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			obj.campos[markerInerteNativo] = obj.clase
 			m.avisaInerte("nativo-inerte", nombreInerte(candidatos, obj, "<init>"))
 		}
+		// `AudioAttributes$Builder.<init>` no tiene cuerpo en el dex de Termux. Se devuelve la
+		// referencia modelada del propio builder, marcada como inerte: no se inicializa ningún
+		// atributo de audio ni se crea sonido, solo se mantiene un objeto no nulo sobre el que la
+		// app puede encadenar sus setters.
+		if esReceptorBuilderAudio() && proto == "()V" && stubsFrameworkActivos {
+			obj.campos[markerInerteAudio] = obj.clase
+			m.avisa("AudioAttributes.Builder.<init>: constructor inerte, sin audio real (aproximación)")
+			return obj, true, nil
+		}
+		// `SoundPool$Builder.<init>` tampoco tiene cuerpo en el dex de Termux. Se devuelve la
+		// referencia modelada del propio builder, marcada como inerte: no se inicializa ningún
+		// parámetro de sonido ni se crea sonido, solo se mantiene un objeto no nulo sobre el que la
+		// app puede encadenar sus setters.
+		if esReceptorBuilderSoundPool() && proto == "()V" && stubsFrameworkActivos {
+			obj.campos[markerInerteAudio] = obj.clase
+			m.avisa("SoundPool.Builder.<init>: constructor inerte, sin audio real (aproximación)")
+			return obj, true, nil
+		}
 		return nil, true, nil
+	case "setUsage", "setContentType", "setFlags", "setLegacyStreamType",
+		"setAudioAttributes", "setMaxStreams":
+		// Los setters del builder de AudioAttributes son inertes: devuelven el MISMO builder para
+		// que la cadena encadenada del dex siga viva, sin aplicar ningún atributo ni invertir en
+		// reproducir sonido. El receptor tiene que ser el builder; si es el cero, `invoca` ya cortó
+		// antes de llegar aquí y su guardián queda intacto.
+		if esReceptorBuilderAudio() && stubsFrameworkActivos &&
+			strings.HasSuffix(proto, ")Landroid/media/AudioAttributes$Builder;") {
+			m.avisa("AudioAttributes.Builder.%s: setter inerte, sin audio real (aproximación)", nombre)
+			return obj, true, nil
+		}
+		// Los setters del builder de SoundPool son inertes por la misma razón: devuelven el MISMO
+		// builder para que la cadena del dex siga viva, sin aplicar atributos, sin contar streams y
+		// sin reproducir sonido. El receptor tiene que ser el builder; si es el cero, `invoca` ya
+		// cortó antes de llegar aquí y su guardián queda intacto.
+		if esReceptorBuilderSoundPool() && stubsFrameworkActivos &&
+			strings.HasSuffix(proto, ")Landroid/media/SoundPool$Builder;") {
+			m.avisa("SoundPool.Builder.%s: setter inerte, sin audio real (aproximación)", nombre)
+			return obj, true, nil
+		}
 	case "onCreate", "onStart", "onResume", "onPause", "onStop", "onDestroy", "onRestart",
 		"onSaveInstanceState", "onRestoreInstanceState", "onPostCreate", "onPostResume":
 		if es("Landroid/app/Activity;", "Landroid/app/ListActivity;", "Landroid/app/ActivityGroup;") {
@@ -6127,6 +6223,31 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				}}
 			obj.campos["vista.layoutParams"] = params
 			return params, true, nil
+		}
+	case "getViewTreeObserver":
+		// `View.getViewTreeObserver()` es un método del framework sin cuerpo en el dex: su cero
+		// llegaba como receptor nulo al `addOnGlobalLayoutListener` de Termux y cortaba la
+		// ejecución. Se devuelve un observador inerte, ligado a ESA vista y reutilizado en las
+		// llamadas posteriores, sin medidas ni ciclo de layout inventados.
+		if len(vals) == 0 && obj != nil && strings.HasSuffix(proto, ")Landroid/view/ViewTreeObserver;") &&
+			(esVista() || esPortadorDeParametros() || (m.prog != nil && m.esVistaDelProyecto(obj.clase))) {
+			obs, _ := obj.campos["vista.viewTreeObserver"].(*objetoDalvik)
+			if obs == nil {
+				obs = objetoInerte("Landroid/view/ViewTreeObserver;", "vista.observador")
+				obj.campos["vista.viewTreeObserver"] = obs
+			}
+			m.avisa("getViewTreeObserver%s: observador inerte ligado a la vista; no hay ciclo de "+
+				"layout ni medidas reales (aproximación)", proto)
+			return obs, true, nil
+		}
+	case "addOnGlobalLayoutListener", "removeOnGlobalLayoutListener":
+		// El observer de Termux recibe al propio `TermuxActivityRootView` como listener. El modelo
+		// no mide la pantalla ni dispara `onGlobalLayout`: registra la llamada, avisa de la
+		// aproximación y deja el oyente inerte en vez de ejecutar un callback falso.
+		if len(vals) == 1 && obj != nil && strings.HasSuffix(obj.clase, "Landroid/view/ViewTreeObserver;") &&
+			strings.HasSuffix(proto, "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V") {
+			m.avisa("ViewTreeObserver.%s: listener inerte, sin callbacks de layout (aproximación)", nombre)
+			return nil, true, nil
 		}
 	case "setId":
 		// el id lo pone la app sobre la vista que acaba de crear. No se registra en el mapa global
@@ -6560,6 +6681,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 		if len(vals) == 0 && obj != nil && es("Landroid/bluetooth/BluetoothAdapter;") {
 			return boolAInt(obj.bluetoothActivo), true, nil
+		}
+		// El gestor inerte no tiene servicios que consultar: `isEnabled:()Z` devuelve el cero
+		// de `Z` como int32, que es lo que el `move-result` de TerminalView guarda en
+		// `mAccessibilityEnabled`. Solo responde el objeto que marcó `getSystemService`;
+		// un receptor nulo sigue cortando en `invoca` antes de llegar aquí.
+		if len(vals) == 0 && proto == "()Z" && obj != nil && stubsFrameworkActivos &&
+			strings.HasSuffix(obj.clase, "Landroid/view/accessibility/AccessibilityManager;") &&
+			obj.campos[markerInerteAccesibilidad] != nil {
+			m.avisa("AccessibilityManager.isEnabled: sin servicios de accesibilidad reales " +
+				"(aproximación)")
+			return int32(0), true, nil
 		}
 	case "getBondedDevices":
 		if len(vals) == 0 && obj != nil && es("Landroid/bluetooth/BluetoothAdapter;") {
@@ -7893,6 +8025,22 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return nil, true, nil
 		}
 	case "Builder", "newSimpleInstance", "fromUri", "build":
+		// `AudioAttributes$Builder.build()` no tiene cuerpo en el dex de Termux. Devuelve un
+		// AudioAttributes modelado no nulo, sin sonido detrás, para que el `setAudioAttributes`
+		// posterior reciba una referencia y la cadena siga avanzando.
+		if nombre == "build" && esReceptorBuilderAudio() && stubsFrameworkActivos &&
+			proto == "()Landroid/media/AudioAttributes;" {
+			m.avisa("AudioAttributes.Builder.build: objeto inerte, sin audio real (aproximación)")
+			return objetoInerte("Landroid/media/AudioAttributes;", markerInerteAudio), true, nil
+		}
+		// `SoundPool$Builder.build()` no tiene cuerpo en el dex de Termux. Devuelve un SoundPool
+		// modelado no nulo, sin sonido detrás, para que el `load` posterior reciba una referencia y
+		// la cadena siga avanzando.
+		if nombre == "build" && esReceptorBuilderSoundPool() && stubsFrameworkActivos &&
+			proto == "()Landroid/media/SoundPool;" {
+			m.avisa("SoundPool.Builder.build: objeto inerte, sin audio real (aproximación)")
+			return objetoInerte("Landroid/media/SoundPool;", markerInerteAudio), true, nil
+		}
 		// ExoPlayer y Media3: las fábricas y el `build()` del builder devuelven objetos sintéticos.
 		// No se reproduce nada, no se descarga nada y no se abre ningún socket; la app recibe una
 		// referencia no nula para que su onCreate pueda continuar y el aviso lo delate.

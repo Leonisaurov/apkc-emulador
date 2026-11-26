@@ -3376,3 +3376,427 @@ func TestResolveAttribute(t *testing.T) {
 		t.Errorf("faltaron los avisos de la tabla: %v", m.avisos)
 	}
 }
+
+// TestViewTreeObserverNoNuloLigadoALaVista falsifica la frontera de los 7072 pasos: el dex de
+// Termux llama a `getViewTreeObserver` sobre su `TermuxActivityRootView`, que hereda de
+// LinearLayout, y el framework no trae cuerpo para ese método. El observador tiene que existir,
+// pertenecer a esa vista y ser el mismo en la segunda llamada.
+func TestViewTreeObserverNoNuloLigadoALaVista(t *testing.T) {
+	m := maquinaDeStubs()
+	raiz := "Lcom/termux/app/terminal/TermuxActivityRootView;"
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{
+		raiz: {nombre: raiz, super: "Landroid/widget/LinearLayout;"},
+	}}
+	vista := objDe(raiz)
+	proto := "()Landroid/view/ViewTreeObserver;"
+	obs, ok, err := m.intentaStub([]string{raiz}, "getViewTreeObserver", proto, nil, vista)
+	if err != nil || !ok {
+		t.Fatalf("getViewTreeObserver: v=%v ok=%v err=%v", obs, ok, err)
+	}
+	observer, esObjeto := obs.(*objetoDalvik)
+	if !esObjeto || observer == nil {
+		t.Fatalf("getViewTreeObserver devolvió %T y se esperaba un objeto no nulo", obs)
+	}
+	if observer.clase != "Landroid/view/ViewTreeObserver;" {
+		t.Errorf("el observador es de %s y se esperaba ViewTreeObserver", observer.clase)
+	}
+	if ligado, _ := vista.campos["vista.viewTreeObserver"].(*objetoDalvik); ligado != observer {
+		t.Error("el observador no quedó ligado a la vista que lo pidió")
+	}
+	otro, ok, err := m.intentaStub([]string{raiz}, "getViewTreeObserver", proto, nil, vista)
+	if err != nil || !ok || otro != observer {
+		t.Errorf("la segunda llamada devolvió %v, ok=%v, err=%v; se esperaba el mismo observador",
+			otro, ok, err)
+	}
+	if _, hayAncho := observer.campos[campoLayoutParamsAncho]; hayAncho {
+		t.Error("el observador inventó una medida de ancho")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"no hay ciclo de layout ni medidas reales (aproximación)") {
+		t.Errorf("getViewTreeObserver no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestViewTreeObserverListenerInerteConAviso comprueba que registrar o quitar un
+// `OnGlobalLayoutListener` no ejecuta ningún callback ni inventa medidas: solo deja el aviso de
+// aproximación, que es lo que impide confundir el observador inerte con un layout real.
+func TestViewTreeObserverListenerInerteConAviso(t *testing.T) {
+	m := maquinaDeStubs()
+	observer := objDe("Landroid/view/ViewTreeObserver;")
+	listener := objDe("Lcom/termux/app/terminal/TermuxActivityRootView;")
+	proto := "(Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;)V"
+	for _, nombre := range []string{"addOnGlobalLayoutListener", "removeOnGlobalLayoutListener"} {
+		v, ok, err := m.intentaStub([]string{"Landroid/view/ViewTreeObserver;"}, nombre, proto,
+			[]any{listener}, observer)
+		if err != nil || !ok || v != nil {
+			t.Errorf("%s: v=%v ok=%v err=%v", nombre, v, ok, err)
+		}
+	}
+	if len(listener.campos) != 0 {
+		t.Error("el listener recibió estado: el modelo no debe ejecutar callbacks de layout")
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "listener inerte, sin callbacks de layout (aproximación)") {
+		t.Errorf("no se avisó de que el listener es inerte: %s", avisos)
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("alguna llamada cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestViewTreeObserverReceptorNuloSigueCortando mantiene el guardián de `invoca`: aunque el stub
+// del listener exista, un receptor nulo —el cero que causaba la frontera— sigue cortando con el
+// error de siempre, antes de llegar al stub.
+func TestViewTreeObserverReceptorNuloSigueCortando(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Landroid/view/ViewTreeObserver;", name: "addOnGlobalLayoutListener",
+		proto: dexProto{params: []string{"Landroid/view/ViewTreeObserver$OnGlobalLayoutListener;"}},
+	}}}
+	listener := objDe("Lcom/termux/app/terminal/TermuxActivityRootView;")
+	_, err := m.invoca(0x6e, d, 0, []int{0, 1}, []any{nil, listener},
+		"Lcom/termux/app/TermuxActivity;")
+	if err == nil {
+		t.Fatal("addOnGlobalLayoutListener con receptor nulo no devolvió error")
+	}
+	esperado := "se llamó a android.view.ViewTreeObserver.addOnGlobalLayoutListener sobre un objeto nulo"
+	if err.Error() != esperado {
+		t.Errorf("el error fue %q y se esperaba %q", err, esperado)
+	}
+}
+
+// TestAudioAttributesBuilderNoNulo falsifica la frontera de los 7126 pasos de Termux. El dex de
+// `getBellSoundPool` crea el builder con `new-instance` y llama a su `<init>`, que vive en el
+// framework y no tiene cuerpo en el dex. El constructor tiene que entregar la referencia modelada
+// del builder, marcada como inerte, sin inicializar ningún atributo ni crear sonido.
+func TestAudioAttributesBuilderNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/AudioAttributes$Builder;")
+	v, ok, err := m.intentaStub([]string{"Landroid/media/AudioAttributes$Builder;"},
+		"<init>", "()V", nil, builder)
+	if err != nil || !ok {
+		t.Fatalf("AudioAttributes.Builder.<init>: v=%v ok=%v err=%v", v, ok, err)
+	}
+	o, esObjeto := v.(*objetoDalvik)
+	if !esObjeto || o == nil {
+		t.Fatalf("<init> devolvió %T y se esperaba un objeto no nulo", v)
+	}
+	if o != builder {
+		t.Error("el constructor no devolvió la referencia modelada del builder")
+	}
+	if o.clase != "Landroid/media/AudioAttributes$Builder;" {
+		t.Errorf("el builder es de %s y se esperaba AudioAttributes$Builder", o.clase)
+	}
+	if o.campos[markerInerteAudio] == nil {
+		t.Error("el builder no quedó marcado como inerte")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"constructor inerte, sin audio real (aproximación)") {
+		t.Errorf("el constructor no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestAudioAttributesSetterInerteConAviso comprueba que los cuatro setters del builder devuelven
+// el MISMO builder —no el cero que dejaba el registro nulo y cortaba en `setUsage`— y dejan un
+// aviso explícito de aproximación. Ninguno toca el sonido ni guarda atributos reales.
+func TestAudioAttributesSetterInerteConAviso(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/AudioAttributes$Builder;")
+	builder.campos[markerInerteAudio] = builder.clase
+	protos := map[string]string{
+		"setUsage":            "(I)Landroid/media/AudioAttributes$Builder;",
+		"setContentType":      "(I)Landroid/media/AudioAttributes$Builder;",
+		"setFlags":            "(II)Landroid/media/AudioAttributes$Builder;",
+		"setLegacyStreamType": "(I)Landroid/media/AudioAttributes$Builder;",
+	}
+	for nombre, proto := range protos {
+		v, ok, err := m.intentaStub([]string{"Landroid/media/AudioAttributes$Builder;"},
+			nombre, proto, []any{int32(4), int32(0)}, builder)
+		if err != nil || !ok {
+			t.Fatalf("%s: v=%v ok=%v err=%v", nombre, v, ok, err)
+		}
+		if v != builder {
+			t.Errorf("%s devolvió %v y se esperaba el mismo builder para encadenar", nombre, v)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"setter inerte, sin audio real (aproximación)") {
+		t.Errorf("los setters no avisaron de la aproximación: %s", avisos)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos,
+		"no está en el dex ni en los stubs") {
+		t.Errorf("algún setter cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestAudioAttributesReceptorNuloSigueCortando congela el guardián de `invoca`: el stub de los
+// setters no lo relaja, así que el cero que causaba la frontera sigue cortando con el error de
+// siempre antes de llegar al stub.
+func TestAudioAttributesReceptorNuloSigueCortando(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Landroid/media/AudioAttributes$Builder;", name: "setUsage",
+		proto: dexProto{params: []string{"I"}, returnType: "Landroid/media/AudioAttributes$Builder;"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0, 1}, []any{nil, int32(13)},
+		"Lcom/termux/app/TermuxActivity;")
+	if err == nil {
+		t.Fatal("setUsage con receptor nulo no devolvió error")
+	}
+	esperado := "se llamó a android.media.AudioAttributes$Builder.setUsage sobre un objeto nulo"
+	if err.Error() != esperado {
+		t.Errorf("el error fue %q y se esperaba %q", err, esperado)
+	}
+}
+
+// TestAudioAttributesBuildNoNulo comprueba que `build()` entrega un AudioAttributes modelado no
+// nulo, marcado como inerte, con su aviso de aproximación y sin sonido detrás.
+func TestAudioAttributesBuildNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/AudioAttributes$Builder;")
+	builder.campos[markerInerteAudio] = builder.clase
+	v, ok, err := m.intentaStub([]string{"Landroid/media/AudioAttributes$Builder;"},
+		"build", "()Landroid/media/AudioAttributes;", nil, builder)
+	if err != nil || !ok {
+		t.Fatalf("build: v=%v ok=%v err=%v", v, ok, err)
+	}
+	attrs, esObjeto := v.(*objetoDalvik)
+	if !esObjeto || attrs == nil {
+		t.Fatalf("build devolvió %T y se esperaba un objeto no nulo", v)
+	}
+	if attrs.clase != "Landroid/media/AudioAttributes;" {
+		t.Errorf("el resultado es de %s y se esperaba AudioAttributes", attrs.clase)
+	}
+	if attrs.campos[markerInerteAudio] == nil {
+		t.Error("el AudioAttributes devuelto no quedó marcado como inerte")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"objeto inerte, sin audio real (aproximación)") {
+		t.Errorf("build no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestSoundPoolBuilderNoNulo falsifica la frontera de los 7130 pasos de Termux. El dex de
+// `getBellSoundPool` crea el builder con `new-instance` y llama a su `<init>`, que vive en el
+// framework (dexdump confirma que no hay class_def ni cuerpo para SoundPool$Builder en el dex).
+// El constructor tiene que entregar la referencia modelada del builder, marcada como inerte, sin
+// inicializar ningún parámetro de sonido ni crear sonido.
+func TestSoundPoolBuilderNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/SoundPool$Builder;")
+	v, ok, err := m.intentaStub([]string{"Landroid/media/SoundPool$Builder;"},
+		"<init>", "()V", nil, builder)
+	if err != nil || !ok {
+		t.Fatalf("SoundPool.Builder.<init>: v=%v ok=%v err=%v", v, ok, err)
+	}
+	o, esObjeto := v.(*objetoDalvik)
+	if !esObjeto || o == nil {
+		t.Fatalf("<init> devolvió %T y se esperaba un objeto no nulo", v)
+	}
+	if o != builder {
+		t.Error("el constructor no devolvió la referencia modelada del builder")
+	}
+	if o.clase != "Landroid/media/SoundPool$Builder;" {
+		t.Errorf("el builder es de %s y se esperaba SoundPool$Builder", o.clase)
+	}
+	if o.campos[markerInerteAudio] == nil {
+		t.Error("el builder no quedó marcado como inerte")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"constructor inerte, sin audio real (aproximación)") {
+		t.Errorf("el constructor no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestSoundPoolSetterInerteConAviso comprueba que `setAudioAttributes` y `setMaxStreams` devuelven
+// el MISMO builder —no el cero que dejaba el registro nulo y cortaba en `setAudioAttributes`— y
+// dejan un aviso explícito de aproximación. Ninguno toca el sonido ni cuenta streams reales.
+func TestSoundPoolSetterInerteConAviso(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/SoundPool$Builder;")
+	builder.campos[markerInerteAudio] = builder.clase
+	protos := map[string]string{
+		"setAudioAttributes": "(Landroid/media/AudioAttributes;)Landroid/media/SoundPool$Builder;",
+		"setMaxStreams":      "(I)Landroid/media/SoundPool$Builder;",
+	}
+	for nombre, proto := range protos {
+		v, ok, err := m.intentaStub([]string{"Landroid/media/SoundPool$Builder;"},
+			nombre, proto, []any{objetoInerte("Landroid/media/AudioAttributes;", markerInerteAudio), int32(1)}, builder)
+		if err != nil || !ok {
+			t.Fatalf("%s: v=%v ok=%v err=%v", nombre, v, ok, err)
+		}
+		if v != builder {
+			t.Errorf("%s devolvió %v y se esperaba el mismo builder para encadenar", nombre, v)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"setter inerte, sin audio real (aproximación)") {
+		t.Errorf("los setters no avisaron de la aproximación: %s", avisos)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos,
+		"no está en el dex ni en los stubs") {
+		t.Errorf("algún setter cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestSoundPoolReceptorNuloSigueCortando congela el guardián de `invoca`: el stub de los setters
+// no lo relaja, así que el cero que causaba la frontera sigue cortando con el error de siempre
+// antes de llegar al stub.
+func TestSoundPoolReceptorNuloSigueCortando(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Landroid/media/SoundPool$Builder;", name: "setAudioAttributes",
+		proto: dexProto{params: []string{"Landroid/media/AudioAttributes;"},
+			returnType: "Landroid/media/SoundPool$Builder;"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0, 1},
+		[]any{nil, objetoInerte("Landroid/media/AudioAttributes;", markerInerteAudio)},
+		"Lcom/termux/app/TermuxActivity;")
+	if err == nil {
+		t.Fatal("setAudioAttributes con receptor nulo no devolvió error")
+	}
+	esperado := "se llamó a android.media.SoundPool$Builder.setAudioAttributes sobre un objeto nulo"
+	if err.Error() != esperado {
+		t.Errorf("el error fue %q y se esperaba %q", err, esperado)
+	}
+}
+
+// TestSoundPoolBuildNoNulo comprueba que `build()` entrega un SoundPool modelado no nulo, marcado
+// como inerte, con su aviso de aproximación y sin sonido detrás.
+func TestSoundPoolBuildNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	builder := objDe("Landroid/media/SoundPool$Builder;")
+	builder.campos[markerInerteAudio] = builder.clase
+	v, ok, err := m.intentaStub([]string{"Landroid/media/SoundPool$Builder;"},
+		"build", "()Landroid/media/SoundPool;", nil, builder)
+	if err != nil || !ok {
+		t.Fatalf("build: v=%v ok=%v err=%v", v, ok, err)
+	}
+	sonido, esObjeto := v.(*objetoDalvik)
+	if !esObjeto || sonido == nil {
+		t.Fatalf("build devolvió %T y se esperaba un objeto no nulo", v)
+	}
+	if sonido.clase != "Landroid/media/SoundPool;" {
+		t.Errorf("el resultado es de %s y se esperaba SoundPool", sonido.clase)
+	}
+	if sonido.campos[markerInerteAudio] == nil {
+		t.Error("el SoundPool devuelto no quedó marcado como inerte")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"objeto inerte, sin audio real (aproximación)") {
+		t.Errorf("build no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestAccesibilidadServicioNoNulo falsifica la frontera del constructor de TerminalView
+// (dexdump de classes14.dex, 013cf0-013d08): Termux pide `getSystemService("accessibility")`,
+// hace `check-cast` a AccessibilityManager y acto seguido llama a `isEnabled`. En Android el
+// servicio existe aunque no haya servicios de accesibilidad; el cero devolvía un receptor nulo
+// y cortaba la construcción de la vista. Solo se atiende ese nombre y esa firma exacta.
+func TestAccesibilidadServicioNoNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	proto := "(Ljava/lang/String;)Ljava/lang/Object;"
+	v, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;"}, "getSystemService",
+		proto, []any{"accessibility"}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("getSystemService(accessibility): v=%v ok=%v err=%v", v, ok, err)
+	}
+	manager, esObjeto := v.(*objetoDalvik)
+	if !esObjeto || manager == nil {
+		t.Fatalf("getSystemService devolvió %T y se esperaba un objeto no nulo", v)
+	}
+	if manager.clase != "Landroid/view/accessibility/AccessibilityManager;" {
+		t.Errorf("el servicio es de %s y se esperaba AccessibilityManager", manager.clase)
+	}
+	if manager.campos[markerInerteAccesibilidad] == nil {
+		t.Error("el gestor no quedó marcado como inerte")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"sin servicios de accesibilidad reales (aproximación)") {
+		t.Errorf("getSystemService no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestAccesibilidadIsEnabledCero comprueba que `isEnabled:()Z` sobre el gestor modelado
+// devuelve `int32(0)`, que es el cero de `Z` que TerminalView guarda en `mAccessibilityEnabled`.
+// No se inventa ningún servicio activo.
+func TestAccesibilidadIsEnabledCero(t *testing.T) {
+	m := maquinaDeStubs()
+	manager := objetoInerte("Landroid/view/accessibility/AccessibilityManager;",
+		markerInerteAccesibilidad)
+	v, ok, err := m.intentaStub([]string{"Landroid/view/accessibility/AccessibilityManager;"},
+		"isEnabled", "()Z", nil, manager)
+	if err != nil || !ok {
+		t.Fatalf("isEnabled: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v != int32(0) {
+		t.Errorf("isEnabled devolvió %T(%v) y se esperaba int32(0)", v, v)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"sin servicios de accesibilidad reales (aproximación)") {
+		t.Errorf("isEnabled no avisó de la aproximación: %s", avisos)
+	}
+}
+
+// TestAccesibilidadOtroServicioCaeAlCero congela el alcance: `getSystemService` solo responde
+// por "accessibility"; cualquier otro nombre sigue sin stub y `invoca` entrega el cero de
+// `Ljava/lang/Object;` con el aviso de siempre.
+func TestAccesibilidadOtroServicioCaeAlCero(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	_, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;"}, "getSystemService",
+		"(Ljava/lang/String;)Ljava/lang/Object;", []any{"wifi"}, actividad)
+	if err != nil || ok {
+		t.Fatalf("getSystemService(wifi) no debía atenderlo: ok=%v err=%v", ok, err)
+	}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Landroid/content/Context;", name: "getSystemService",
+		proto: dexProto{params: []string{"Ljava/lang/String;"},
+			returnType: "Ljava/lang/Object;"},
+	}}}
+	v, err := m.invoca(0x6e, d, 0, []int{0, 1}, []any{actividad, "wifi"},
+		"Lcom/termux/app/TermuxActivity;")
+	if err != nil {
+		t.Fatalf("getSystemService(wifi) devolvió error: %v", err)
+	}
+	if v != nil {
+		t.Errorf("getSystemService(wifi) devolvió %v y se esperaba el cero (nil)", v)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"no está en el dex ni en los stubs") {
+		t.Errorf("otro servicio no cayó en el aviso de stub ausente: %s", avisos)
+	}
+}
+
+// TestAccesibilidadReceptorNuloSigueCortando mantiene el guardián de `invoca`: el stub no
+// relaja el error de siempre cuando el receptor es el cero que causaba la frontera.
+func TestAccesibilidadReceptorNuloSigueCortando(t *testing.T) {
+	m := maquinaDeStubs()
+	m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Landroid/view/accessibility/AccessibilityManager;", name: "isEnabled",
+		proto: dexProto{returnType: "Z"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "Lcom/termux/app/TermuxActivity;")
+	if err == nil {
+		t.Fatal("isEnabled con receptor nulo no devolvió error")
+	}
+	esperado := "se llamó a android.view.accessibility.AccessibilityManager.isEnabled " +
+		"sobre un objeto nulo"
+	if err.Error() != esperado {
+		t.Errorf("el error fue %q y se esperaba %q", err, esperado)
+	}
+}
