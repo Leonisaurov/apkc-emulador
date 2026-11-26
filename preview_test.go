@@ -757,15 +757,15 @@ func TestListFilesFiltraPorExtension(t *testing.T) {
 		0x106e, 0x0000, 0x0007, // invoke-virtual {v7}, File.getPath:()Ljava/lang/String;
 		0x000c,                 // move-result-object v0
 		0x106e, 0x0001, 0x0000, // invoke-virtual {v0}, String.length:()I
-		0x010a,                 // move-result v1
-		0x4212,                 // const/4 v2, #4
-		0x0191, 0x0201,         // sub-int v1, v1, v2
+		0x010a,         // move-result v1
+		0x4212,         // const/4 v2, #4
+		0x0191, 0x0201, // sub-int v1, v1, v2
 		0x206e, 0x0002, 0x0010, // invoke-virtual {v0, v1}, String.substring:(I)Ljava/lang/String;
-		0x030c,                 // move-result-object v3
-		0x041a, 0x0000,         // const-string v4, ".txt"
+		0x030c,         // move-result-object v3
+		0x041a, 0x0000, // const-string v4, ".txt"
 		0x206e, 0x0003, 0x0043, // invoke-virtual {v3, v4}, String.equals:(Ljava/lang/Object;)Z
-		0x050a,                 // move-result v5
-		0x050f,                 // return v5
+		0x050a, // move-result v5
+		0x050f, // return v5
 	}
 	m, filtro := maquinaListConFiltro(t, "Lfiltro/Extension;", cuerpo, 8)
 	casos := []struct {
@@ -869,6 +869,108 @@ func TestListFilesSplitDelMimeSinPerderLaFila(t *testing.T) {
 			}
 		}
 	}
+}
+
+// compruebaPartesSplit verifica el arreglo que devuelve la forma de dos argumentos de `split`.
+func compruebaPartesSplit(t *testing.T, v any, ok bool, err error, esperado []string) {
+	t.Helper()
+	if err != nil || !ok {
+		t.Fatalf("split con límite: ok=%v err=%v", ok, err)
+	}
+	arreglo, esArreglo := v.(*arregloDalvik)
+	if !esArreglo || arreglo.tipo != "[Ljava/lang/String;" {
+		t.Fatalf("split devolvió %T y se esperaba [Ljava/lang/String;", v)
+	}
+	if len(arreglo.datos) != len(esperado) {
+		t.Fatalf("split dio %d partes y se esperaban %d: %v", len(arreglo.datos), len(esperado), arreglo.datos)
+	}
+	for i, parte := range esperado {
+		if obtenido := textoDe(arreglo.datos[i]); obtenido != parte {
+			t.Errorf("split[%d] dio %q y se esperaba %q", i, obtenido, parte)
+		}
+	}
+}
+
+// TestSplitConLimiteMenosUno fija la forma de dos argumentos que usa `LocaleListCompat.forLanguageTags`:
+// con límite -1 el JDK conserva los huecos vacíos del final, y el `array-length` posterior necesita
+// un arreglo de verdad en vez del cero de `[Ljava/lang/String;` que hacia caer a NewPipe en 3037 pasos.
+func TestSplitConLimiteMenosUno(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	casos := []struct {
+		cadena   string
+		esperado []string
+	}{
+		{"en,es,de", []string{"en", "es", "de"}},
+		{"en,es,", []string{"en", "es", ""}},
+		{"en,,es,,", []string{"en", "", "es", "", ""}},
+		{"", []string{""}},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "split",
+			"(Ljava/lang/String;I)[Ljava/lang/String;",
+			[]any{cadenaObjeto(","), int32(-1)}, cadenaObjeto(caso.cadena))
+		compruebaPartesSplit(t, v, ok, err, caso.esperado)
+	}
+	// el receptor nulo sigue cortando: el guardián de `invoca` no se relaja aquí.
+	if _, _, err := m.intentaStub([]string{"Ljava/lang/String;"}, "split",
+		"(Ljava/lang/String;I)[Ljava/lang/String;",
+		[]any{cadenaObjeto(","), int32(-1)}, nil); err == nil {
+		t.Error("split con receptor nulo devolvió un arreglo; se esperaba error")
+	}
+}
+
+// TestSplitConLimiteCero comprueba que el límite cero sigue descartando los huecos finales, igual
+// que la forma de un argumento, sin tocar los huecos intermedios.
+func TestSplitConLimiteCero(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	casos := []struct {
+		cadena   string
+		esperado []string
+	}{
+		{"en,es,de", []string{"en", "es", "de"}},
+		{"en,es,,", []string{"en", "es"}},
+		{"en,,es", []string{"en", "", "es"}},
+		{"", []string{""}},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "split",
+			"(Ljava/lang/String;I)[Ljava/lang/String;",
+			[]any{cadenaObjeto(","), int32(0)}, cadenaObjeto(caso.cadena))
+		compruebaPartesSplit(t, v, ok, err, caso.esperado)
+	}
+}
+
+// TestSplitConLimitePositivo comprueba el tope: el patrón se aplica como máximo límite-1 veces y
+// la última parte conserva el resto, huecos finales incluidos.
+func TestSplitConLimitePositivo(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	casos := []struct {
+		cadena   string
+		limite   int32
+		esperado []string
+	}{
+		{"en,es,de,fr", 2, []string{"en", "es,de,fr"}},
+		{"en,es,de,fr", 1, []string{"en,es,de,fr"}},
+		{"en,es,de,fr", 3, []string{"en", "es", "de,fr"}},
+		{"en,es,", 3, []string{"en", "es", ""}},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "split",
+			"(Ljava/lang/String;I)[Ljava/lang/String;",
+			[]any{cadenaObjeto(","), caso.limite}, cadenaObjeto(caso.cadena))
+		compruebaPartesSplit(t, v, ok, err, caso.esperado)
+	}
+}
+
+// TestSplitConNombreCorrupto fija el method_id dañado que NewPipe trae para
+// `String.split(String,int)`: la clase y el proto identifican al método aunque el nombre leído sea
+// `, configFlags`, de modo que `forLanguageTags` reciba un arreglo y no el cero nulo.
+func TestSplitConNombreCorrupto(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, ", configFlags",
+		"(Ljava/lang/String;I)[Ljava/lang/String;",
+		[]any{cadenaObjeto(","), int32(-1)}, cadenaObjeto("en,es,"))
+	compruebaPartesSplit(t, v, ok, err, []string{"en", "es", ""})
 }
 
 // TestLastIndexOfCuentaLaUltimaUnidad cierra el eslabón que el gestor dejó abierto en §376: sin
@@ -1056,7 +1158,7 @@ func maquinaFutureTaskCallable(t *testing.T) (*maquinaDalvik, *objetoDalvik) {
 		0x106e, 0x0000, 0x0000, // invoke-virtual {v0}, File.listFiles:()[Ljava/io/File;
 		0x000c,         // move-result-object v0
 		0x105b, 0x0001, // iput-object v0, v1, Lcall/Lista;.resultado:Ljava/lang/Object;
-		0x0011,         // return-object v0
+		0x0011, // return-object v0
 	}
 	met := &metodoDalvik{nombre: "call", proto: "()Ljava/lang/Object;", retorno: "Ljava/lang/Object;",
 		dex: d, item: &codeItem{registersSize: 2, insSize: 1,
@@ -1141,7 +1243,7 @@ func TestFutureTaskNoRompeRunnableRun(t *testing.T) {
 		0x106e, 0x0000, 0x0000, // invoke-virtual {v0}, File.listFiles:()[Ljava/io/File;
 		0x000c,         // move-result-object v0
 		0x105b, 0x0001, // iput-object v0, v1, Lrunnable/Plano;.resultado:Ljava/lang/Object;
-		0x000e,         // return-void
+		0x000e, // return-void
 	}
 	met := &metodoDalvik{nombre: "run", proto: "()V", retorno: "V", dex: d,
 		item: &codeItem{registersSize: 2, insSize: 1,

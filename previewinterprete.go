@@ -5221,6 +5221,14 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		return es("Landroid/webkit/WebView;", "Landroid/webkit/WebChromeClient;",
 			"Landroid/webkit/WebViewClient;", "Landroid/webkit/WebSettings;")
 	}
+	// En el dex de NewPipe el method_id de `String.split(String,int)` trae el nombre corrupto
+	// `, configFlags` (el mismo género de daño que `substringRoto`): el switch no lo reconocería y
+	// el cero del arreglo llegaba al `array-length` de `forLanguageTags`. La clase y el proto
+	// identifican al método sin inventar un stub de LocaleListCompat ni tocar `invoca`.
+	if nombre != "split" && proto == "(Ljava/lang/String;I)[Ljava/lang/String;" &&
+		es("Ljava/lang/String;") {
+		nombre = "split"
+	}
 
 	switch nombre {
 	case "arraycopy":
@@ -7850,28 +7858,47 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return int32(n), true, nil
 		}
 	case "split":
-		// `String.split` parte por una expresión regular y descarta los huecos vacíos del final,
-		// como el JDK con límite cero. Sin este stub el MIME del fichero (`text/plain`) llegaba
-		// como null al `aget-object` siguiente y la fila del fichero regular no se añadía.
-		if len(vals) == 1 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
+		// `String.split` parte por una expresión regular. Con un argumento descarta los huecos
+		// vacíos del final, como el JDK con límite cero: sin este stub el MIME del fichero
+		// (`text/plain`) llegaba como null al `aget-object` siguiente y la fila del fichero
+		// regular no se añadía. Con dos argumentos se aplica el límite de Java: -1 conserva los
+		// huecos finales y un positivo topa el número de partes; `forLanguageTags` de NewPipe
+		// troza la cadena de idiomas con `split(",", -1)` y necesita un arreglo de verdad.
+		if (len(vals) == 1 || len(vals) == 2) &&
+			es("Ljava/lang/String;", "Ljava/lang/CharSequence;") &&
+			(len(vals) == 1 || proto == "(Ljava/lang/String;I)[Ljava/lang/String;") {
 			s, ok := cadenaDe(receptor)
 			if !ok {
 				return nil, true, fmt.Errorf("split sobre un receptor que no es una cadena")
 			}
 			patron := textoDe(vals[0])
+			limite := 0
+			if len(vals) == 2 {
+				n, err := aInt32(vals[1])
+				if err != nil {
+					return nil, true, err
+				}
+				limite = int(n)
+			}
 			re, err := regexp.Compile(patron)
 			if err != nil {
 				return nil, true, fmt.Errorf("split con el patrón %q: %w", patron, err)
 			}
+			huecos := re.FindAllStringIndex(s, -1)
+			if limite > 0 && len(huecos) > limite-1 {
+				huecos = huecos[:limite-1]
+			}
 			partes := []string{}
 			inicio := 0
-			for _, hueco := range re.FindAllStringIndex(s, -1) {
+			for _, hueco := range huecos {
 				partes = append(partes, s[inicio:hueco[0]])
 				inicio = hueco[1]
 			}
 			partes = append(partes, s[inicio:])
-			for len(partes) > 1 && partes[len(partes)-1] == "" {
-				partes = partes[:len(partes)-1]
+			if limite == 0 {
+				for len(partes) > 1 && partes[len(partes)-1] == "" {
+					partes = partes[:len(partes)-1]
+				}
 			}
 			datos := make([]any, 0, len(partes))
 			for _, parte := range partes {
