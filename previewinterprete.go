@@ -6761,20 +6761,24 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	case "getDeclaredMethods":
 		// `Class.getDeclaredMethods` se atiende para el observador de Lifecycle (ClassesInfoCache),
 		// que pregunta por los métodos de una clase y espera un arreglo; con el cero del tipo
-		// reventaba después en `array-length`. Se devuelve un arreglo vacío tipado —aproximación
-		// explícita, sin fabricar ningún `Method`— y el observador termina sin crear un adaptador.
-		// La frontera es estrecha: solo clases sintéticas sin `class_def` en el dex y clases del
-		// framework (`android`/`androidx`), cuyo observador ya modela `getObserverConstructorType`
-		// sin ejecutar el cuerpo del dex. Las clases de la app con `class_def` no se tocan, para no
-		// ocultar sus callbacks reales: caen al camino de la reflexión rechazada.
-		if len(vals) == 0 && es("Ljava/lang/Class;") {
+		// reventaba después en `array-length` tanto en Godot como en NewPipe y F-Droid. Se devuelve
+		// un arreglo vacío tipado —aproximación explícita, sin fabricar ningún `Method`— y el
+		// observador termina sin crear un adaptador. La frontera conserva las dos mitades que se
+		// habían escrito por separado: el prototipo `()[Ljava/lang/reflect/Method;` de la reflexión
+		// genérica, y la restricción de no tocar clases de la app con `class_def` en el dex. Solo
+		// pasan las clases sintéticas sin `class_def` y las del framework (`android`/`androidx`),
+		// cuyo observador ya modela `getObserverConstructorType` sin ejecutar el cuerpo del dex.
+		// Las clases de la app con `class_def` caen al camino de la reflexión rechazada, para no
+		// ocultar sus callbacks reales. Un receptor nulo corta antes, en `invoca`.
+		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") &&
+			proto == "()[Ljava/lang/reflect/Method;" {
 			descriptor := claseDeLiteral(obj)
 			if descriptor != "" && m.prog != nil {
 				sinDef := m.prog.clases[descriptor] == nil
 				delFramework := strings.HasPrefix(descriptor, "Landroid/") ||
 					strings.HasPrefix(descriptor, "Landroidx/")
 				if sinDef || delFramework {
-					m.avisa("getDeclaredMethods(%s): observador sin métodos consultables; se devuelve un arreglo vacío de Method (aproximación)",
+					m.avisa("getDeclaredMethods(%s): la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo de Method (aproximación)",
 						descriptor)
 					return &arregloDalvik{tipo: "[Ljava/lang/reflect/Method;", datos: []any{}}, true, nil
 				}
@@ -6980,23 +6984,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"Ljava/lang/Class;.$tipo": obj.clase,
 			}}, true, nil
 		}
-	case "getInterfaces", "getDeclaredMethods":
-		// `ClassesInfoCache.createInfo` (AndroidX Lifecycle) recorre los interfaces y los métodos
-		// declarados del observador. El cero de `[Ljava/lang/Class;` y de
-		// `[Ljava/lang/reflect/Method;` llegaba nulo al `array-length` siguiente de ESE cuerpo —que
-		// sí está en el dex de NewPipe— y cortaba la ejecución en el paso 517. La vista previa no
-		// tiene la reflexión de la JVM: devuelve el arreglo VACÍO NO NULO y avisa, sin inventar
-		// interfaces ni métodos. Un receptor nulo sigue cortando en `invoca` antes de llegar aquí.
-		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") {
-			retorno := "()[Ljava/lang/reflect/Method;"
-			if nombre == "getInterfaces" {
-				retorno = "()[Ljava/lang/Class;"
-			}
-			if proto == retorno {
-				m.avisa("%s.%s: la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo (aproximación)",
-					claseCorta(obj.clase), nombre)
-				return &arregloDalvik{tipo: strings.TrimPrefix(retorno, "()"), datos: []any{}}, true, nil
-			}
+	case "getInterfaces":
+		// `ClassesInfoCache.createInfo` (AndroidX Lifecycle) recorre también los interfaces del
+		// observador. El cero de `[Ljava/lang/Class;` llegaba nulo al `array-length` siguiente de
+		// ESE cuerpo —que sí está en el dex de NewPipe y de F-Droid— y cortaba la ejecución. La
+		// vista previa no tiene la reflexión de la JVM: devuelve el arreglo VACÍO NO NULO y avisa,
+		// sin inventar interfaces. Un receptor nulo sigue cortando en `invoca` antes de llegar aquí.
+		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") &&
+			proto == "()[Ljava/lang/Class;" {
+			m.avisa("%s.getInterfaces: la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo (aproximación)",
+				claseCorta(obj.clase))
+			return &arregloDalvik{tipo: "[Ljava/lang/Class;", datos: []any{}}, true, nil
 		}
 	case "getObserverConstructorType":
 		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
