@@ -1247,3 +1247,68 @@ func TestTextoDeFilaCodigoUsaElUltimoSetText(t *testing.T) {
 		t.Errorf("la fila dice %q; el último setText de la vista fue vacío", texto)
 	}
 }
+
+// TestVisibilidadMedidaDeVistaFalsaLosTransitorios delimita la señal: la retirada y el setVisibility
+// son estado medido; el texto de la vista no se mira nunca, porque un fichero legítimo podría
+// llamarse «Loading...». El id sintético 0x7ffffffe es el que el dex pone a la vista creada en código.
+func TestVisibilidadMedidaDeVistaFalsaLosTransitorios(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	transitoria := &objetoDalvik{clase: "Landroid/widget/TextView;", id: 0x7ffffffe,
+		campos: map[string]any{}, texto: "Loading..."}
+	m.vistasRetiradas = map[uint32]bool{0x7ffffffe: true}
+	if visibilidadMedidaDeVista(transitoria, m) {
+		t.Error("la vista retirada sigue visible para el modelo")
+	}
+	// otra vista con el MISMO texto, sin marca de retirada, se publica: no hay filtro de cadenas
+	legitima := &objetoDalvik{clase: "Landroid/widget/TextView;", id: 0,
+		campos: map[string]any{}, texto: "Loading..."}
+	if !visibilidadMedidaDeVista(legitima, m) {
+		t.Error("se descartó una vista legítima por su texto")
+	}
+	oculta := &objetoDalvik{clase: "Landroid/widget/TextView;", id: 0,
+		campos: map[string]any{"vista.visibilidad": int32(vistaGone)}}
+	if visibilidadMedidaDeVista(oculta, m) {
+		t.Error("una vista puesta gone sigue visible para el modelo")
+	}
+	if !visibilidadMedidaDeVista(&objetoDalvik{campos: map[string]any{}}, m) {
+		t.Error("una vista sin marcas se descartó sin motivo medido")
+	}
+}
+
+// TestCampoVisibleEnElJSONDelNodo comprueba que la visibilidad medida viaja en cada nodo publicado
+// y que la ausencia de llamada no se inventa un `gone`.
+func TestCampoVisibleEnElJSONDelNodo(t *testing.T) {
+	n := &nodoVista{Tipo: "LinearLayout", Visible: true,
+		Hijos: []*nodoVista{{Tipo: "TextView", Visible: false, Visibilidad: "gone"}}}
+	datos, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("el nodo no se serializa: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(datos, &doc); err != nil {
+		t.Fatalf("el JSON del nodo no se relee: %v", err)
+	}
+	if visible, ok := doc["visible"].(bool); !ok || !visible {
+		t.Errorf("el nodo visible dice visible=%v", doc["visible"])
+	}
+	hijo := doc["hijos"].([]any)[0].(map[string]any)
+	if visible, ok := hijo["visible"].(bool); !ok || visible {
+		t.Errorf("el nodo gone dice visible=%v", hijo["visible"])
+	}
+}
+
+// TestRegistraRetiradasSobreviveAlRefresh fija la propiedad que el gestor necesita: el id sintético
+// retirado queda en la máquina aunque la vista se vuelva a crear con un objeto nuevo.
+func TestRegistraRetiradasSobreviveAlRefresh(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	retirada := &objetoDalvik{clase: "Landroid/widget/TextView;", id: 0x7ffffffe,
+		campos: map[string]any{}, texto: "Loading..."}
+	contenedor := &objetoDalvik{clase: "Landroid/widget/LinearLayout;", id: 0x7f030005,
+		campos: map[string]any{}, hijosCodigo: []*objetoDalvik{retirada}}
+	m.registraRetiradas(contenedor)
+	nueva := &objetoDalvik{clase: "Landroid/widget/TextView;", id: 0x7ffffffe,
+		campos: map[string]any{}, texto: "Loading..."}
+	if visibilidadMedidaDeVista(nueva, m) {
+		t.Error("la vista recreada tras el refresh volvió a publicarse")
+	}
+}

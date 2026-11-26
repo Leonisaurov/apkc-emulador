@@ -210,7 +210,11 @@ type nodoVista struct {
 	Margen  *ladosVista `json:"margen,omitempty"`
 	// Visibilidad es `invisible` o `gone` cuando el layout lo declara; vacío es visible. Un `gone` se
 	// queda en el árbol (para que su id siga resolviéndose) con el rectángulo a cero.
-	Visibilidad string       `json:"visibilidad,omitempty"`
+	Visibilidad string `json:"visibilidad,omitempty"`
+	// Visible es la visibilidad medida por la ejecución. False cuando la app retiró la vista con
+	// removeView/removeAllViews o llamó a setVisibility con GONE/INVISIBLE: esas filas no se publican.
+	// El campo viaja en los nodos que quedan, sin filtrar cadenas de texto.
+	Visible     bool         `json:"visible"`
 	TamTexto    string       `json:"tamTexto,omitempty"`
 	Color       string       `json:"color,omitempty"`
 	EstiloTexto string       `json:"estiloTexto,omitempty"`
@@ -1468,6 +1472,7 @@ func anotaVisibilidad(n *nodoVista, ejecucion *resultadoEjecucion) {
 				if bits, ok := bitsDeVisibilidad(vista.campos["vista.visibilidad"]); ok {
 					n.visibilidad = bits
 					n.Visibilidad = nombreDeVisibilidad(bits)
+					n.Visible = bits == vistaVisible
 				}
 			}
 		}
@@ -1590,6 +1595,12 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 		if n := porID["id/list"]; n != nil {
 			filas := make([]*nodoVista, 0)
 			for _, hijo := range ejecucion.maquina.contenedores[id] {
+				// una vista que la app retiró (removeView/removeAllViews) o puso
+				// gone/invisible (setVisibility) no se publica: es el estado medido, no un filtro
+				// sobre su texto
+				if !visibilidadMedidaDeVista(hijo, ejecucion.maquina) {
+					continue
+				}
 				filas = append(filas, nodoDeFila(filaPintada{Tipo: claseCorta(hijo.clase),
 					Texto: textoDeFilaCodigo(hijo)}, tabla, zr))
 			}
@@ -1599,6 +1610,28 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 			}
 		}
 	}
+}
+
+// visibilidadMedidaDeVista lee lo que la ejecución dejó sobre una vista añadida a un contenedor.
+// `vista.visibilidad` lo escribe `setVisibility` (previewinterprete.go, `case "setVisibility"`);
+// `vista.retirada` lo pone removeAllViews/removeView, y `vistasRetiradas` conserva el id sintético
+// entre refreshes. Sin ninguna de las tres marcas la vista sigue visible, que es el estado del
+// framework y el del layout. No se mira el texto: filtrar cadenas borraría también ficheros
+// legítimos que se llamen igual que un rótulo transitorio.
+func visibilidadMedidaDeVista(v *objetoDalvik, m *maquinaDalvik) bool {
+	if v == nil {
+		return false
+	}
+	if retirada, ok := v.campos["vista.retirada"].(bool); ok && retirada {
+		return false
+	}
+	if m != nil && v.id >= 0x7ffffffe && m.vistasRetiradas[v.id] {
+		return false
+	}
+	if bits, ok := bitsDeVisibilidad(v.campos["vista.visibilidad"]); ok {
+		return bits == vistaVisible
+	}
+	return true
 }
 
 // textoDeFilaCodigo busca el texto de una fila añadida por código: puede estar en la propia vista
@@ -1727,7 +1760,7 @@ func nodoDeFila(fila filaPintada, tabla *tablaRecursos, zr *zip.Reader) *nodoVis
 		}
 	}
 	return &nodoVista{Tipo: fila.Tipo, Texto: fila.Texto, Recurso: recursoDeFila(fila.Texto, tabla),
-		declAncho: medidaMatch, declAlto: medidaWrap, layoutGravity: -1}
+		Visible: true, declAncho: medidaMatch, declAlto: medidaWrap, layoutGravity: -1}
 }
 
 // aplicaTextosDeFila copia a cada nodo el texto que el getView escribió en la vista de su id. Es el
@@ -2120,7 +2153,7 @@ func etiquetaDeLaApp(arbol *elementoLeido, ctx *contextoVista) string {
 // raizSinLayout es el marco que se publica cuando la actividad no tiene layout XML: lleva la
 // etiqueta de la app y no finge ningún fichero nuevo.
 func raizSinLayout(etiqueta string) *nodoVista {
-	return &nodoVista{Tipo: "FrameLayout", Texto: etiqueta,
+	return &nodoVista{Tipo: "FrameLayout", Texto: etiqueta, Visible: true,
 		declAncho: medidaMatch, declAlto: medidaMatch, layoutGravity: -1}
 }
 
@@ -2292,7 +2325,7 @@ func (c *contextoVista) nodoDe(e *elementoLeido) *nodoVista {
 	if e == nil {
 		return nil
 	}
-	n := &nodoVista{Tipo: e.nombre, declAncho: medidaWrap, declAlto: medidaWrap, layoutGravity: -1}
+	n := &nodoVista{Tipo: e.nombre, Visible: true, declAncho: medidaWrap, declAlto: medidaWrap, layoutGravity: -1}
 	// El estilo propio se lee antes que los atributos: sus valores son los defectos y lo que el
 	// elemento declara encima manda, como en el inflado del framework.
 	estilo := map[uint32]valor{}
@@ -2390,6 +2423,7 @@ func (c *contextoVista) nodoDe(e *elementoLeido) *nodoVista {
 		if nombre := nombreDeVisibilidad(n.visibilidad); nombre != "" {
 			n.Visibilidad = nombre
 		}
+		n.Visible = n.visibilidad == vistaVisible
 	}
 	if tam, ok := valorDeVista(e, estilo, "textSize", idVistaTextSize); ok {
 		n.TamTexto, n.tamTextoDp = c.tamanoDeTexto(tam)

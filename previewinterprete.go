@@ -303,6 +303,49 @@ func (r *resultadoEjecucion) falla(err error) {
 // y una lectura del registro alto no devuelva un valor que parece un entero normal.
 type marcaAncha struct{}
 
+// registraRetiradas guarda en la máquina los ids sintéticos de las vistas que la app acaba de
+// retirar. Son los que el dex asigna a las vistas creadas en código sin id de recurso; se mantienen
+// entre refreshes aunque el objeto se vuelva a crear, así que el modelo puede excluir las filas
+// retiradas sin mirar su texto.
+func (m *maquinaDalvik) registraRetiradas(v *objetoDalvik) {
+	if v == nil {
+		return
+	}
+	if v.id >= 0x7ffffffe {
+		if m.vistasRetiradas == nil {
+			m.vistasRetiradas = map[uint32]bool{}
+		}
+		m.vistasRetiradas[v.id] = true
+	}
+	for _, h := range v.hijosCodigo {
+		m.registraRetiradas(h)
+	}
+	for _, h := range v.vistas {
+		m.registraRetiradas(h)
+	}
+}
+
+// marcaRetiradas propaga la retirada de una vista a los hijos que el intérprete conserva como
+// objetos persistentes. Los TextViews transitorios del gestor («Loading...» y
+// «cutting/copying/deleting files...») viven en ese árbol: sin esta marca sobreviven al
+// removeAllViews y el modelo los publica como filas. No se toca su texto: solo se registra lo que
+// la app hizo con la vista.
+func marcaRetiradas(v *objetoDalvik) {
+	if v == nil {
+		return
+	}
+	if v.campos == nil {
+		v.campos = map[string]any{}
+	}
+	v.campos["vista.retirada"] = true
+	for _, h := range v.hijosCodigo {
+		marcaRetiradas(h)
+	}
+	for _, h := range v.vistas {
+		marcaRetiradas(h)
+	}
+}
+
 // objetoDalvik es una instancia: su clase, sus campos (con la clave dueño.nombre, para que un campo
 // heredado no se confunda con otro), el id de recurso si vino de `findViewById`, el texto que ya se
 // le puso, la etiqueta de `setTag` y el listener que se registró sobre una view.
@@ -637,6 +680,11 @@ type maquinaDalvik struct {
 	// gestor es id/drive_list (0x7f030001), no id/list: el modelo publica sus filas en id/list, que
 	// es el nodo de lista que se enseña, sin confundirlas con los botones de los diálogos.
 	listaRefrescada uint32
+	// vistasRetiradas guarda los ids sintéticos que la app quitó con removeAllViews/removeView. Las
+	// vistas se crean de nuevo en cada refresh (el gestor reañade «Loading...»), pero el id sintético
+	// persiste, así que la máquina —que sí sobrevive a los Runnables— puede decir al modelo cuáles
+	// no están ya en pantalla. No es un filtro de cadenas: solo transporta lo que la app retiró.
+	vistasRetiradas map[uint32]bool
 	// bundleInicial es el `savedInstanceState` con el que arranca esta máquina: nil salvo que venga
 	// de una recreación, que es cuando el framework lo entrega no nulo
 	bundleInicial *objetoDalvik
@@ -5747,9 +5795,13 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "removeAllViews":
 		// Vaciar el contenedor descarta también las filas que se hubieran añadido por código: sin
-		// esto, una refresh de la lista dejaría las filas viejas en el modelo.
+		// esto, una refresh de la lista dejaría las filas viejas en el modelo. Las vistas que el
+		// intérprete conserva como hijos persistentes se marcan como retiradas para que el modelo
+		// no las publique: es el efecto medido del removeAllViews, no un filtro de cadenas.
 		if len(vals) == 0 && obj != nil &&
 			(es("Landroid/view/ViewGroup;", "Landroid/widget/ScrollView;") || esVista()) {
+			marcaRetiradas(obj)
+			m.registraRetiradas(obj)
 			obj.hijosCodigo = nil
 			if obj.vistas != nil {
 				obj.vistas = map[uint32]*objetoDalvik{}
@@ -5757,6 +5809,16 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			if obj.id != 0 {
 				delete(m.contenedores, obj.id)
 				m.listaRefrescada = obj.id
+			}
+			return nil, true, nil
+		}
+	case "removeView":
+		// Quitar una vista suelta la retira del contenedor: el modelo debe dejar de publicarla
+		// aunque el intérprete la conserve como hijo persistente.
+		if len(vals) == 1 && obj != nil && (esVista() || es("Landroid/view/ViewGroup;")) {
+			if hijo, ok := vals[0].(*objetoDalvik); ok {
+				marcaRetiradas(hijo)
+				m.registraRetiradas(hijo)
 			}
 			return nil, true, nil
 		}
