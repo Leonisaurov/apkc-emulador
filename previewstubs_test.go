@@ -997,3 +997,50 @@ func TestBindServiceNoAtiendeReceptorNulo(t *testing.T) {
 		t.Errorf("onServiceConnected sobre un receptor nulo: v=%v ok=%v err=%v", v, ok, err)
 	}
 }
+
+// TestSetAddDevuelveTrueSoloSiEsNuevo comprueba la semántica real de `java.util.Set.add`: el primer
+// `type` entra y devuelve true, el segundo no entra y devuelve false. Sin este stub el cero de `Z`
+// hacía que kotlinx.serialization creyera que el nombre ya estaba registrado en el primer element.
+func TestSetAddDevuelveTrueSoloSiEsNuevo(t *testing.T) {
+	m := maquinaDeStubs()
+	conjunto := objDe("Ljava/util/HashSet;")
+	candidatos := []string{"Ljava/util/Set;"}
+	for _, caso := range []struct {
+		valor    string
+		esperado int32
+		tamano   int
+	}{
+		{"type", int32(1), 1},
+		{"type", int32(0), 1},
+		{"otro", int32(1), 2},
+	} {
+		v, ok, err := m.intentaStub(candidatos, "add", "(Ljava/lang/Object;)Z",
+			[]any{cadenaObjeto(caso.valor)}, conjunto)
+		if err != nil || !ok || v != caso.esperado {
+			t.Fatalf("add(%q): v=%v ok=%v err=%v; se esperaba %d", caso.valor, v, ok, err,
+				caso.esperado)
+		}
+		if len(conjunto.conjunto) != caso.tamano {
+			t.Errorf("add(%q): el conjunto tiene %d elementos y se esperaban %d", caso.valor,
+				len(conjunto.conjunto), caso.tamano)
+		}
+	}
+	// `contains` lee el mismo respaldo: lo que `add` guardó es lo que el Set consulta después.
+	for _, caso := range []struct {
+		valor    string
+		esperado int32
+	}{
+		{"type", int32(1)}, {"otro", int32(1)}, {"ausente", int32(0)},
+	} {
+		v, ok, err := m.intentaStub(candidatos, "contains", "(Ljava/lang/Object;)Z",
+			[]any{cadenaObjeto(caso.valor)}, conjunto)
+		if err != nil || !ok || v != caso.esperado {
+			t.Errorf("contains(%q): v=%v ok=%v err=%v", caso.valor, v, ok, err)
+		}
+	}
+	// Ningún stub relaja el guardián: con receptor nulo `invoca` corta antes de llegar aquí.
+	if v, ok, err := m.intentaStub(candidatos, "add", "(Ljava/lang/Object;)Z",
+		[]any{cadenaObjeto("type")}, nil); ok || err != nil || v != nil {
+		t.Errorf("add sobre un receptor nulo: v=%v ok=%v err=%v", v, ok, err)
+	}
+}

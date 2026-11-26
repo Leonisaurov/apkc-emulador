@@ -6259,6 +6259,23 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			obj.menuItems = append(obj.menuItems, item)
 			return item, true, nil
 		}
+		// `Set.add(Object)` devuelve true solo si el elemento era nuevo: kotlinx.serialization decide
+		// con ese booleano si un nombre está repetido, y devolver el cero de `Z` (false) hacía que el
+		// primer `element` de un descriptor dijera que `type` ya estaba registrado. El conjunto
+		// modelado es `objeto.conjunto`, el mismo que publican `keySet`, `contains` e `iterator`.
+		// El receptor nulo ya lo corta `invoca` antes de llegar aquí, así que no se inventa uno.
+		if len(vals) == 1 && obj != nil && proto == "(Ljava/lang/Object;)Z" &&
+			es("Ljava/util/Set;", "Ljava/util/HashSet;", "Ljava/util/LinkedHashSet;",
+				"Ljava/util/TreeSet;", "Ljava/util/AbstractSet;") {
+			valor := textoDe(vals[0])
+			for _, guardado := range obj.conjunto {
+				if textoDe(guardado) == valor {
+					return boolAInt(false), true, nil
+				}
+			}
+			obj.conjunto = append(obj.conjunto, vals[0])
+			return boolAInt(true), true, nil
+		}
 		// `add(E)` y `add(int, E)` del ArrayList: el segundo respeta el índice e inserta delante de
 		// lo que ya estaba, como el framework. La lista de `Arrays.asList` es de tamaño fijo y en
 		// el framework rechaza el cambio con UnsupportedOperationException.
