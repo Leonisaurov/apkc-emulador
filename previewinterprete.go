@@ -37,11 +37,9 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -4599,9 +4597,8 @@ func (m *maquinaDalvik) rechaza(nombre, proto, motivo, retorno string) (any, boo
 // Servicios reales del APK. El intérprete NO fabrica proveedores: el iterador de ServiceLoader solo
 // puede entregar nombres que estén escritos en una entrada META-INF/services/<interfaz> del zip.
 // El mapa se llena desde las entradas reales del zip de la corrida (registraServiciosDelApk, llamado
-// por preview.go en cuanto abre la APK) y, cuando no hay zip de por medio, se abre perezosamente la
-// APK que el hospedador puso en la línea de órdenes (cargaServiciosDelHost). Sin entrada de servicios
-// el iterador sale vacío, que es la respuesta fiel para una interfaz sin fichero.
+// por preview.go en cuanto abre la APK). Sin entrada de servicios el iterador sale vacío, que es la
+// respuesta fiel para una interfaz sin fichero.
 var (
 	serviciosDelApk         = map[string][]string{}
 	serviciosDelApkCargados = false
@@ -4664,39 +4661,13 @@ func registraServiciosDelApk(zr *zip.Reader) {
 }
 
 // registraServiciosDeLaAPKEnPreview es el envoltorio que usa la vista previa con el zip ya abierto.
-// Respeta el indicador de carga: si el hospedador nativo ya trajo los servicios de su APK, no los
-// sustituye por los del zip (en la pestaña no hay os.Args con APK, así que esta es la única vía).
+// Es la única vía para llenar el registro: el intérprete no lee argumentos ni abre ficheros. Respeta
+// el indicador de carga para no sustituir un registro ya lleno por el de un zip posterior.
 func registraServiciosDeLaAPKEnPreview(zr *zip.Reader) {
 	if serviciosDelApkCargados {
 		return
 	}
 	registraServiciosDelApk(zr)
-}
-
-// cargaServiciosDelHost abre, una sola vez, la APK que el hospedador pasó al comando nativo. Se
-// recorren los argumentos de detrás hacia delante y se toma el primero que es un zip legible: en
-// `apkc preview … app.apk` esa es la APK de la corrida. Sin una APK accesible el mapa sigue vacío,
-// que es el estado honesto del hospedador sin ficheros.
-func cargaServiciosDelHost() {
-	if serviciosDelApkCargados {
-		return
-	}
-	serviciosDelApkCargados = true
-	for i := len(os.Args) - 1; i >= 0; i-- {
-		if !strings.HasSuffix(strings.ToLower(os.Args[i]), ".apk") {
-			continue
-		}
-		datos, err := os.ReadFile(os.Args[i])
-		if err != nil {
-			continue
-		}
-		zr, err := zip.NewReader(bytes.NewReader(datos), int64(len(datos)))
-		if err != nil {
-			continue
-		}
-		registraServiciosDelApk(zr)
-		return
-	}
 }
 
 // esAlmacenDeEstado dice si un objeto representa un Bundle o un SharedPreferences, que son los dos
@@ -7904,7 +7875,6 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			proto == "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;" {
 			descriptor := claseDeLiteral(vals[0])
 			interfaz := nombreBinarioDeDescriptor(descriptor)
-			cargaServiciosDelHost()
 			proveedores := append([]string(nil), serviciosDelApk[interfaz]...)
 			loader := &objetoDalvik{clase: "Ljava/util/ServiceLoader;", campos: map[string]any{
 				markerServicioCargador:  interfaz,

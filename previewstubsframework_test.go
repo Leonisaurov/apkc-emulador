@@ -3205,6 +3205,43 @@ func TestServiciosDelApkDisponiblesEnLaPestana(t *testing.T) {
 	}
 }
 
+// TestServiciosDelApkSinAPKEnArgs falsifica que el proveedor llega solo del zip ya abierto: sin
+// ninguna APK en los argumentos, la vista previa entrega el nombre escrito en META-INF/services.
+func TestServiciosDelApkSinAPKEnArgs(t *testing.T) {
+	aíslaLosServiciosDelPreview(t)
+	datos := apkConServicioParaPreview(t, "org.slf4j.impl.LoggerServiceProvider")
+	argsPrevios := os.Args
+	os.Args = []string{"apkc", "preview"}
+	t.Cleanup(func() { os.Args = argsPrevios })
+
+	modelo, err := modeloVistaDeAPKCon(datos, "", false)
+	if err != nil || modelo == nil {
+		t.Fatalf("la vista previa sin APK en argumentos falló: modelo=%v err=%v", modelo, err)
+	}
+	proveedores := serviciosDelApk["org.slf4j.spi.SLF4JServiceProvider"]
+	if len(proveedores) != 1 || proveedores[0] != "org.slf4j.impl.LoggerServiceProvider" {
+		t.Fatalf("sin APK en os.Args el proveedor no vino del zip: %v", proveedores)
+	}
+
+	m := maquinaDeStubs()
+	loader := cargadorDeServicio(t, m, "Lorg/slf4j/spi/SLF4JServiceProvider;")
+	it, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, loader)
+	if err != nil || !ok {
+		t.Fatalf("ServiceLoader.iterator: ok=%v err=%v", ok, err)
+	}
+	cursor := esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+	if len(cursor.iterando) != 1 {
+		t.Fatalf("el iterador trae %d proveedores y el fichero declaraba uno: %v", len(cursor.iterando), cursor.iterando)
+	}
+	siguiente, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "next",
+		"()Ljava/lang/Object;", nil, cursor)
+	if err != nil || !ok {
+		t.Fatalf("next: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, siguiente, "org.slf4j.impl.LoggerServiceProvider")
+}
+
 // TestPreviewSinFicheroDeServiciosDaIteradorVacio comprueba el otro lado del enganche: una APK sin
 // entrada META-INF/services deja el mapa vacío y el iterador no inventa ningún proveedor.
 func TestPreviewSinFicheroDeServiciosDaIteradorVacio(t *testing.T) {
