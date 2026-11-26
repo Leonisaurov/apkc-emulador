@@ -1162,3 +1162,88 @@ func TestFutureTaskNoRompeRunnableRun(t *testing.T) {
 		t.Errorf("el Runnable corriente no ejecutó su run()V; avisos %v", m.avisos)
 	}
 }
+
+// tablaDeDrawablesDelGestor escribe los siete drawables medidos en el APK del gestor con el tipo 2,
+// de modo que sus ids son 0x7f020000 a 0x7f020006, como los que trae el resources.arsc de verdad.
+func tablaDeDrawablesDelGestor() tablaEscribir {
+	claves := []string{"archive", "audio", "file", "folder", "picture", "unknown", "video"}
+	entradas := make([]entradaEscribir, 0, len(claves))
+	for i := range claves {
+		entradas = append(entradas, entradaEscribir{clave: i,
+			valor: valorEscribir{tipo: 0x03, datos: uint32(i)}})
+	}
+	return tablaEscribir{
+		idPaquete: 0x7f, nombrePaquete: "com.prueba.gestor",
+		nombresTipo: []string{"id", "drawable"}, nombresUTF8: false,
+		claves: claves, clavesUTF8: true,
+		tipos: []tipoEscribir{
+			{id: 1, specFlags: []uint32{0},
+				bloques: []bloqueEscribir{{entradas: []entradaEscribir{{clave: 0,
+					valor: valorEscribir{tipo: 0x03, datos: 0}}}}}},
+			{id: 2, specFlags: make([]uint32, len(claves)),
+				bloques: []bloqueEscribir{{entradas: entradas}}},
+		},
+	}
+}
+
+func TestRecursoDeFilaDelGestorSaleDelArsc(t *testing.T) {
+	arsc, err := escribeTablaRecursos(tablaDeDrawablesDelGestor())
+	if err != nil {
+		t.Fatalf("la tabla de drawables no se escribe: %v", err)
+	}
+	tabla, err := leeTabla(arsc)
+	if err != nil {
+		t.Fatalf("la tabla de drawables no se relee: %v", err)
+	}
+	casos := []struct{ nombre, quiero string }{
+		{"fotos", "0x7f020003"},
+		{"leeme.txt", "0x7f020002"},
+		{"gato.png", "0x7f020004"},
+		{"cancion.mp3", "0x7f020001"},
+		{"pelicula.mp4", "0x7f020006"},
+		{"paquete.zip", "0x7f020000"},
+		{"misterio.xyz", "0x7f020005"},
+	}
+	for _, c := range casos {
+		n := nodoDeFila(filaPintada{Tipo: "c.b", Texto: c.nombre}, tabla, nil)
+		if n.Recurso != c.quiero {
+			t.Errorf("%s publica recurso=%q y se esperaba %s", c.nombre, n.Recurso, c.quiero)
+		}
+	}
+	// los rótulos del encabezado y los textos de estado son literales del APK, no ficheros
+	for _, rotulo := range []string{" <- ", " ||| ", "Loading...", "cutting/copying/deleting files..."} {
+		if clave := drawableDeExtension(rotulo); clave != "" {
+			t.Errorf("el rótulo %q se convirtió en el drawable %q", rotulo, clave)
+		}
+	}
+}
+
+func TestAnotaVisibilidadDeLaEjecucion(t *testing.T) {
+	const id = uint32(0x7f030008) // id/menu_list del gestor
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	m.vistas[id] = &objetoDalvik{clase: "Landroid/widget/LinearLayout;", id: id,
+		campos: map[string]any{"vista.visibilidad": int32(vistaGone)}}
+	raiz := &nodoVista{IDRef: "0x7f030008", Hijos: []*nodoVista{{IDRef: "0x7fffffff"}}}
+	anotaVisibilidad(raiz, &resultadoEjecucion{maquina: m})
+	if raiz.Visibilidad != "gone" || raiz.visibilidad != vistaGone {
+		t.Errorf("el nodo dice visibilidad=%q (%d) y la app pidió gone", raiz.Visibilidad, raiz.visibilidad)
+	}
+	if hijo := raiz.Hijos[0]; hijo.Visibilidad != "" || hijo.visibilidad != vistaVisible {
+		t.Errorf("un hijo sin llamada cambió a visibilidad=%q (%d)", hijo.Visibilidad, hijo.visibilidad)
+	}
+	// sin ejecución no se oculta nada: la visibilidad del layout se conserva
+	otro := &nodoVista{IDRef: "0x7f030008"}
+	anotaVisibilidad(otro, nil)
+	if otro.Visibilidad != "" {
+		t.Errorf("sin ejecución se escribió visibilidad=%q", otro.Visibilidad)
+	}
+}
+
+func TestTextoDeFilaCodigoUsaElUltimoSetText(t *testing.T) {
+	fila := &objetoDalvik{clase: "Landroid/widget/Button;", campos: map[string]any{},
+		texto: "", textoEscrito: true}
+	fila.hijosCodigo = []*objetoDalvik{{texto: "Loading...", textoEscrito: true}}
+	if texto := textoDeFilaCodigo(fila); texto != "" {
+		t.Errorf("la fila dice %q; el último setText de la vista fue vacío", texto)
+	}
+}

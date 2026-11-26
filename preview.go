@@ -216,6 +216,10 @@ type nodoVista struct {
 	EstiloTexto string       `json:"estiloTexto,omitempty"`
 	Fondo       string       `json:"fondo,omitempty"`
 	Imagen      *imagenVista `json:"imagen,omitempty"`
+	// Recurso es el id del drawable que la vista puso con setImageResource, leído del resources.arsc
+	// del APK y publicado en hexadecimal. El pintor de la pestaña ya consume este campo. No se
+	// escribe a mano: si la tabla no trae la clave, el campo queda vacío.
+	Recurso string `json:"recurso,omitempty"`
 	// Dibujo es lo que la vista propia dibujó al ejecutar su `onDraw`: las operaciones que el
 	// intérprete pudo medir y, si no se pudo, la frontera con su motivo. Vacío es una vista que no
 	// es propia o cuyo `onDraw` no se pidió.
@@ -1259,6 +1263,7 @@ func modeloVistaDeAPKConOpciones(datos []byte, o opcionesPreview) (*modeloVista,
 	cargaImagenes(raiz, zr, tabla)
 	coloca(raiz, 0, 0, dpPantallaAncho, dpPantallaAlto)
 	anotaTextoDinamico(raiz, modelo.Ejecucion)
+	anotaVisibilidad(raiz, modelo.Ejecucion)
 	anotaOyentes(raiz, modelo.Ejecucion)
 	anotaEstados(raiz, modelo.Ejecucion)
 	// las vistas propias ejecutan su onDraw con un Canvas del modelo: el rectángulo ya está y el
@@ -1449,6 +1454,45 @@ func anotaTextoDinamico(n *nodoVista, ejecucion *resultadoEjecucion) {
 	}
 }
 
+// anotaVisibilidad copia al árbol la visibilidad que la app dejó con View.setVisibility sobre una
+// vista con id. El match es por id de recurso, como el de los textos y los oyentes. Solo escribe
+// cuando hubo llamada: lo que declaró el layout se conserva si la app no tocó la vista. Un `gone`
+// se queda en el árbol con su id, pero la colocación no le da sitio y el pintor no lo dibuja.
+func anotaVisibilidad(n *nodoVista, ejecucion *resultadoEjecucion) {
+	if n == nil || ejecucion == nil || ejecucion.maquina == nil {
+		return
+	}
+	if n.IDRef != "" {
+		if id, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(n.IDRef), "0x"), 16, 32); err == nil {
+			if vista := ejecucion.maquina.vistas[uint32(id)]; vista != nil {
+				if bits, ok := bitsDeVisibilidad(vista.campos["vista.visibilidad"]); ok {
+					n.visibilidad = bits
+					n.Visibilidad = nombreDeVisibilidad(bits)
+				}
+			}
+		}
+	}
+	for _, h := range n.Hijos {
+		anotaVisibilidad(h, ejecucion)
+	}
+}
+
+// bitsDeVisibilidad lee el entero que el intérprete guardó en `vista.visibilidad` sin suponer su
+// tipo concreto: una constante del dex llega como int32 y una semilla del modelo como int.
+func bitsDeVisibilidad(valor any) (int, bool) {
+	switch v := valor.(type) {
+	case int32:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case uint32:
+		return int(v), true
+	}
+	return 0, false
+}
+
 // anotaEstados copia al árbol el estado de marcado y la pista que dejó la ejecución. El match es por
 // id de recurso, como el de los oyentes. Una vista marcable sin entrada en `marcas` conserva el
 // estado que declaró el layout (o el «sin marcar» del framework que puso `nodoDe`).
@@ -1558,10 +1602,15 @@ func expandeListas(raiz *nodoVista, ejecucion *resultadoEjecucion, tabla *tablaR
 }
 
 // textoDeFilaCodigo busca el texto de una fila añadida por código: puede estar en la propia vista
-// (un TextView) o en un hijo al que la app llamó setText. Sin texto, la fila se pinta vacía.
+// (un TextView) o en un hijo al que la app llamó setText. Gana el ÚLTIMO setText de cada vista,
+// aunque sea vacío: volver a un hijo con texto anterior era lo que hacía que un texto viejo
+// («Loading...») ganara al estado final de la fila. Sin ninguna escritura, la fila se pinta vacía.
 func textoDeFilaCodigo(v *objetoDalvik) string {
 	if v == nil {
 		return ""
+	}
+	if v.textoEscrito {
+		return v.texto
 	}
 	if v.texto != "" {
 		return v.texto
@@ -1579,9 +1628,83 @@ func textoDeFilaCodigo(v *objetoDalvik) string {
 	return ""
 }
 
+// drawableDeExtension lleva el nombre de un fichero a la clave del drawable de su icono. Las siete
+// claves son las que el resources.arsc del APK del gestor trae; el id se busca en la tabla, nunca se
+// escribe a mano. Un nombre sin extensión es un directorio; una extensión que no se conoce cae en
+// `unknown`, como hace la app cuando no reconoce el tipo.
+func drawableDeExtension(nombre string) string {
+	base := strings.ToLower(strings.TrimSpace(nombre))
+	if base == "" {
+		return ""
+	}
+	ext := ""
+	if punto := strings.LastIndex(base, "."); punto >= 0 {
+		ext = base[punto+1:]
+		// «Loading...» y «cutting/copying/deleting files...» llevan puntos sin extensión: no son
+		// nombres de fichero y no pueden recibir el icono de carpeta por no tener extensión
+		if ext == "" {
+			return ""
+		}
+		for i := 0; i < len(ext); i++ {
+			c := ext[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+				return ""
+			}
+		}
+	}
+	if ext == "" {
+		// un rótulo como « <- » o « ||| » es texto literal del APK, no el nombre de un fichero
+		primero := base[0]
+		if !((primero >= 'a' && primero <= 'z') || (primero >= 'A' && primero <= 'Z') ||
+			(primero >= '0' && primero <= '9')) {
+			return ""
+		}
+		return "folder"
+	}
+	switch ext {
+	case "png", "jpg", "jpeg", "gif", "bmp", "webp":
+		return "picture"
+	case "mp3", "wav", "ogg", "m4a", "flac", "aac":
+		return "audio"
+	case "mp4", "mkv", "avi", "webm", "mov", "3gp":
+		return "video"
+	case "zip", "rar", "7z", "tar", "gz", "bz2", "xz":
+		return "archive"
+	case "txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "md", "csv", "html", "htm", "xml", "json", "log":
+		return "file"
+	}
+	return "unknown"
+}
+
+// recursoDeFila resuelve el drawable de una fila contra la tabla del APK. Sin tabla, o si el APK no
+// trae esa clave, no se publica nada: un id inventado sería peor que la ausencia del campo.
+func recursoDeFila(nombre string, tabla *tablaRecursos) string {
+	clave := drawableDeExtension(nombre)
+	if clave == "" || tabla == nil {
+		return ""
+	}
+	// No se usa idDeNombre: aapt2 marca el bloque drawable con `density=ANY` (0xffff) y esa
+	// configuración no cuenta como base, así que la búsqueda estricta devuelve cero sobre un APK
+	// real. Se recorren los bloques en orden de fichero y se toma el primero que trae la clave;
+	// el id se compone con las tres partes que el propio resources.arsc publica.
+	for _, bl := range tabla.bloques {
+		if bl.nombre != "drawable" {
+			continue
+		}
+		for j, e := range bl.entradas {
+			if e.ausente || tabla.clave(e) != clave {
+				continue
+			}
+			id := (tabla.idPaquete&0xff)<<24 | uint32(bl.id)<<16 | uint32(j)
+			return fmt.Sprintf("%#08x", id)
+		}
+	}
+	return ""
+}
+
 // nodoDeFila arma el nodo de una fila a partir del layout que el getView infló, con los textos que
 // ese getView escribió en sus vistas con id. Sin layout (una vista creada en código) el nodo es la
-// vista tal cual: su tipo y su texto, que es lo único que se puede medir sin inventar un XML.
+// vista tal cual: su tipo, su texto y el drawable que le corresponde por la extensión del nombre.
 func nodoDeFila(fila filaPintada, tabla *tablaRecursos, zr *zip.Reader) *nodoVista {
 	if fila.LayoutID != 0 && tabla != nil && zr != nil {
 		if ruta, err := rutaDeLayoutPorId(tabla, fila.LayoutID); err == nil {
@@ -1603,8 +1726,8 @@ func nodoDeFila(fila filaPintada, tabla *tablaRecursos, zr *zip.Reader) *nodoVis
 			}
 		}
 	}
-	return &nodoVista{Tipo: fila.Tipo, Texto: fila.Texto, declAncho: medidaMatch,
-		declAlto: medidaWrap, layoutGravity: -1}
+	return &nodoVista{Tipo: fila.Tipo, Texto: fila.Texto, Recurso: recursoDeFila(fila.Texto, tabla),
+		declAncho: medidaMatch, declAlto: medidaWrap, layoutGravity: -1}
 }
 
 // aplicaTextosDeFila copia a cada nodo el texto que el getView escribió en la vista de su id. Es el
