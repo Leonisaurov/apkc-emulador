@@ -2628,3 +2628,109 @@ func TestBroadcastFalsificacionReceptorNulo(t *testing.T) {
 		t.Fatalf("iterator sobre el cero se resolvió: v=%v ok=%v err=%v", v, ok, err)
 	}
 }
+
+// cadenaGetLifecycle ejecuta `getLifecycle` sobre el receptor y encadena `addObserver` sobre lo que
+// devolvió, con un dex mínimo sin cuerpos para que la resolución pase por `intentaStub`. Es la
+// misma cadena que cortaba en NewPipe, sin APK ni navegador.
+func cadenaGetLifecycle(receptor any) (*maquinaDalvik, any, error) {
+	d := &dexFile{methods: []dexMethod{
+		{owner: "Landroidx/lifecycle/LifecycleOwner;", name: "getLifecycle",
+			proto: dexProto{shorty: "LLifecycle;", returnType: "Landroidx/lifecycle/Lifecycle;"}},
+		{owner: "Landroidx/lifecycle/Lifecycle;", name: "addObserver",
+			proto: dexProto{shorty: "VL", returnType: "V", params: []string{"Ljava/lang/Object;"}}},
+	}}
+	m := nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{}}, nil)
+	regs := []any{receptor, nil, objDe("Landroidx/lifecycle/DefaultLifecycleObserver;")}
+	lifecycle, err := m.invoca(0x6e, d, 0, []int{0}, regs, "Lorg/schabi/newpipe/MainActivity;")
+	if err != nil {
+		return m, lifecycle, err
+	}
+	regs[1] = lifecycle
+	_, err = m.invoca(0x6e, d, 1, []int{1, 2}, regs, "Lorg/schabi/newpipe/MainActivity;")
+	return m, lifecycle, err
+}
+
+// TestGetLifecycleDevuelveElRegistryDelDex comprueba que el stub entrega la MISMA referencia que el
+// dex guardó en el campo de la actividad: no se fabrica un LifecycleRegistry ni un observador.
+func TestGetLifecycleDevuelveElRegistryDelDex(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lorg/schabi/newpipe/MainActivity;")
+	registry := objDe("Landroidx/lifecycle/LifecycleRegistry;")
+	actividad.campos["Landroidx/core/app/ComponentActivity;.lifecycleRegistry"] = registry
+
+	for _, candidato := range []string{
+		"Landroidx/lifecycle/LifecycleOwner;",
+		"Landroidx/savedstate/SavedStateRegistryOwner;",
+	} {
+		v, ok, err := m.intentaStub([]string{candidato}, "getLifecycle",
+			"()Landroidx/lifecycle/Lifecycle;", nil, actividad)
+		if err != nil || !ok {
+			t.Fatalf("getLifecycle con %s: ok=%v err=%v", candidato, ok, err)
+		}
+		if v != registry {
+			t.Errorf("getLifecycle con %s devolvió %v y se esperaba el registry del dex", candidato, v)
+		}
+	}
+	// es un getter sin argumentos: con uno no debe casar
+	if v, ok, err := m.intentaStub([]string{"Landroidx/lifecycle/LifecycleOwner;"}, "getLifecycle",
+		"()Landroidx/lifecycle/Lifecycle;", []any{objDe("Ljava/lang/Object;")}, actividad); err != nil || ok || v != nil {
+		t.Errorf("getLifecycle con un argumento casó: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "LifecycleRegistry que el dex construyó") {
+		t.Errorf("falta el aviso de aproximación: %s", avisos)
+	}
+}
+
+// TestGetLifecycleConStubsApagadosReapareceElError falsifica la base con el interruptor de
+// previewstubsframework_test.go:232. Sin el stub, el cero del tipo llega a `addObserver` y reaparece
+// «se llamó a androidx.lifecycle.Lifecycle.addObserver sobre un objeto nulo».
+func TestGetLifecycleConStubsApagadosReapareceElError(t *testing.T) {
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+
+	actividad := objDe("Lorg/schabi/newpipe/MainActivity;")
+	registry := objDe("Landroidx/lifecycle/LifecycleRegistry;")
+	actividad.campos["Landroidx/core/app/ComponentActivity;.lifecycleRegistry"] = registry
+
+	_, lifecycle, err := cadenaGetLifecycle(actividad)
+	if lifecycle != nil {
+		t.Fatalf("con los stubs apagados getLifecycle devolvió %v y se esperaba el cero", lifecycle)
+	}
+	if err == nil || !strings.Contains(err.Error(),
+		"androidx.lifecycle.Lifecycle.addObserver sobre un objeto nulo") {
+		t.Fatalf("no reapareció el error original: %v", err)
+	}
+
+	// con los stubs encendidos la misma cadena entrega el registry y no corta
+	stubsFrameworkActivos = true
+	_, lifecycle, err = cadenaGetLifecycle(actividad)
+	if lifecycle != registry {
+		t.Fatalf("con los stubs encendidos getLifecycle devolvió %v y se esperaba el registry", lifecycle)
+	}
+	if err != nil {
+		t.Fatalf("addObserver sobre el registry falló: %v", err)
+	}
+}
+
+// TestGetLifecycleReceptorSinCampoSigueCortando impide que el stub invente un lifecycle: sin el
+// campo que el propio dex escribe no casa, se devuelve el cero y `addObserver` corta igual que antes.
+func TestGetLifecycleReceptorSinCampoSigueCortando(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lorg/schabi/newpipe/MainActivity;")
+	v, ok, err := m.intentaStub([]string{"Landroidx/lifecycle/LifecycleOwner;"}, "getLifecycle",
+		"()Landroidx/lifecycle/Lifecycle;", nil, actividad)
+	if err != nil || ok || v != nil {
+		t.Fatalf("sin el campo getLifecycle se resolvió: v=%v ok=%v err=%v", v, ok, err)
+	}
+
+	m, lifecycle, err := cadenaGetLifecycle(actividad)
+	if lifecycle != nil {
+		t.Fatalf("sin el campo getLifecycle devolvió %v y se esperaba el cero", lifecycle)
+	}
+	if err == nil || !strings.Contains(err.Error(), "Lifecycle.addObserver sobre un objeto nulo") {
+		t.Fatalf("sin el campo no reapareció el error original: %v", err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("el cero no se anunció como aproximación: %s", avisos)
+	}
+}

@@ -4939,7 +4939,7 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			"getInstalledPackages", "queryBroadcastReceivers",
 			"newSingleThreadExecutor", "newFixedThreadPool",
 			"currentThread", "getThread", "getStackTrace", "uptimeMillis",
-			"getObserverConstructorType", "setView", "setCancelable",
+			"getLifecycle", "getObserverConstructorType", "setView", "setCancelable",
 			"checkSelfPermission", "invalidate", "loadLibrary", "load", "Builder",
 			"newSimpleInstance", "build", "getSettings", "loadUrl", "loadData",
 			"loadDataWithBaseURL", "evaluateJavascript", "requestPermissions",
@@ -7057,6 +7057,21 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			m.avisa("%s.getInterfaces: la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo (aproximación)",
 				claseCorta(obj.clase))
 			return &arregloDalvik{tipo: "[Ljava/lang/Class;", datos: []any{}}, true, nil
+		}
+	case "getLifecycle":
+		// `LifecycleOwner.getLifecycle()` caía al cero del tipo: el invoke se declara en la interfaz
+		// (o en `SavedStateRegistryOwner` tras el `check-cast` que sobrescribe la clase concreta) y
+		// el receptor es la actividad. Ésa ya tiene en su campo el `LifecycleRegistry` que el propio
+		// dex construyó, así que se devuelve ESA referencia, sin fabricar un objeto ni un
+		// observador: el `addObserver` posterior recibe el registry real. Aviso explícito de
+		// aproximación porque la vista previa no ejecuta el getter del framework. Sin el campo el
+		// stub no casa y la cadena corta en el guardián de receptor nulo de `invoca`.
+		if len(vals) == 0 && obj != nil &&
+			es("Landroidx/lifecycle/LifecycleOwner;", "Landroidx/savedstate/SavedStateRegistryOwner;") {
+			if registry := obj.campos["Landroidx/core/app/ComponentActivity;.lifecycleRegistry"]; registry != nil {
+				m.avisa("LifecycleOwner.getLifecycle: se devuelve el LifecycleRegistry que el dex construyó en la actividad (aproximación)")
+				return registry, true, nil
+			}
 		}
 	case "getObserverConstructorType":
 		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
