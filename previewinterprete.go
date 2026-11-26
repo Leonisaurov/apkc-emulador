@@ -4831,7 +4831,8 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	if !stubsFrameworkActivos {
 		switch nombre {
 		case "getMainLooper", "getPackageManager", "getApplicationContext",
-			"getInstalledPackages", "newSingleThreadExecutor", "newFixedThreadPool",
+			"getInstalledPackages", "queryBroadcastReceivers",
+			"newSingleThreadExecutor", "newFixedThreadPool",
 			"currentThread", "getThread", "getStackTrace", "uptimeMillis",
 			"getObserverConstructorType", "setView", "setCancelable",
 			"checkSelfPermission", "invalidate", "loadLibrary", "load", "Builder",
@@ -5293,6 +5294,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// no hay sistema de paquetes en la vista previa: la lista es vacía, pero no nula, para que
 		// un `for (PackageInfo info : pm.getInstalledPackages(...))` termine sin un receptor nulo.
 		if len(vals) <= 1 && obj != nil && es("Landroid/content/pm/PackageManager;") {
+			return &objetoDalvik{clase: "Ljava/util/ArrayList;", campos: map[string]any{},
+				lista: []any{}}, true, nil
+		}
+	case "queryBroadcastReceivers":
+		// Termux encadena `pm.queryBroadcastReceivers(intent, flags).iterator()` en
+		// `sendTermuxOpenedBroadcast` sin comprobar nulo. No hay registro de receptores ni se
+		// despacha ningún broadcast: se devuelve una lista vacía y no nula, como en
+		// `getInstalledPackages`, para que el `iterator()` y su `hasNext()` terminen sin un receptor
+		// nulo. El aviso deja claro que es una aproximación, no una consulta real al PackageManager.
+		if len(vals) == 2 && obj != nil && es("Landroid/content/pm/PackageManager;") {
+			m.avisa("queryBroadcastReceivers-inerte: no hay receptores registrados; se devuelve " +
+				"una lista vacía sin consultar el PackageManager real")
 			return &objetoDalvik{clase: "Ljava/util/ArrayList;", campos: map[string]any{},
 				lista: []any{}}, true, nil
 		}

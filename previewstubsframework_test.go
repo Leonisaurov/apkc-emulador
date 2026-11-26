@@ -2307,3 +2307,78 @@ func TestLifecycleGetObserverConstructorTypeConsistente(t *testing.T) {
 		t.Errorf("el aviso no distingue el tipo sintético: %s", avisos)
 	}
 }
+
+// TestBroadcastReceiversListaVaciaNoNula comprueba que el PackageManager devuelve una lista
+// no nula aunque no haya ningún receptor registrado, y lo hace con el aviso de aproximación.
+func TestBroadcastReceiversListaVaciaNoNula(t *testing.T) {
+	m := maquinaDeStubs()
+	pm := objDe("Landroid/content/pm/PackageManager;")
+	intento := objDe("Landroid/content/Intent;")
+	lista, ok, err := m.intentaStub([]string{"Landroid/content/pm/PackageManager;"},
+		"queryBroadcastReceivers", "(Landroid/content/Intent;I)Ljava/util/List;",
+		[]any{intento, int32(0)}, pm)
+	if err != nil || !ok || lista == nil {
+		t.Fatalf("queryBroadcastReceivers: v=%v ok=%v err=%v", lista, ok, err)
+	}
+	l, ok := lista.(*objetoDalvik)
+	if !ok || l.clase != "Ljava/util/ArrayList;" || l.lista == nil || len(l.lista) != 0 {
+		t.Fatalf("la lista devuelta no es un ArrayList vacío: %#v", lista)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "queryBroadcastReceivers-inerte") {
+		t.Errorf("falta el aviso de aproximación: %v", m.avisos)
+	}
+}
+
+// TestBroadcastReceiversIteradorVacioNoNula comprueba la cadena que usaba Termux: el
+// `iterator()` de la lista devuelta existe y su `hasNext()` da cero, sin un receptor nulo.
+func TestBroadcastReceiversIteradorVacioNoNula(t *testing.T) {
+	m := maquinaDeStubs()
+	pm := objDe("Landroid/content/pm/PackageManager;")
+	lista, ok, err := m.intentaStub([]string{"Landroid/content/pm/PackageManager;"},
+		"queryBroadcastReceivers", "(Landroid/content/Intent;I)Ljava/util/List;",
+		[]any{objDe("Landroid/content/Intent;"), int32(0)}, pm)
+	if err != nil || !ok || lista == nil {
+		t.Fatalf("queryBroadcastReceivers: v=%v ok=%v err=%v", lista, ok, err)
+	}
+	it, ok, err := m.intentaStub([]string{"Ljava/util/List;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, lista)
+	if err != nil || !ok || it == nil {
+		t.Fatalf("iterator: v=%v ok=%v err=%v", it, ok, err)
+	}
+	v, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, it)
+	if err != nil || !ok {
+		t.Fatalf("hasNext: ok=%v err=%v", ok, err)
+	}
+	if v != int32(0) {
+		t.Errorf("hasNext devolvió %v y la lista está vacía", v)
+	}
+}
+
+// TestBroadcastFalsificacionReceptorNulo reproduce la frontera anterior con los
+// stubs apagados: `queryBroadcastReceivers` no se resuelve, el cero del List es un receptor nulo y
+// el `iterator()` siguiente tampoco casa con ningún stub. Es el estado que hacía cortar a
+// `sendTermuxOpenedBroadcast` con «se llamó a java.util.List.iterator sobre un objeto nulo».
+func TestBroadcastFalsificacionReceptorNulo(t *testing.T) {
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+
+	m := maquinaDeStubs()
+	pm := objDe("Landroid/content/pm/PackageManager;")
+	v, ok, err := m.intentaStub([]string{"Landroid/content/pm/PackageManager;"},
+		"queryBroadcastReceivers", "(Landroid/content/Intent;I)Ljava/util/List;",
+		[]any{objDe("Landroid/content/Intent;"), int32(0)}, pm)
+	if err != nil || ok || v != nil {
+		t.Fatalf("con los stubs apagados queryBroadcastReceivers se resolvió: v=%v ok=%v err=%v",
+			v, ok, err)
+	}
+	receptor := valorCero("Ljava/util/List;")
+	if receptor != nil {
+		t.Fatalf("el cero del tipo de retorno es %v y se esperaba el receptor nulo", receptor)
+	}
+	v, ok, err = m.intentaStub([]string{"Ljava/util/List;"}, "iterator", "()Ljava/util/Iterator;",
+		nil, receptor)
+	if err != nil || ok {
+		t.Fatalf("iterator sobre el cero se resolvió: v=%v ok=%v err=%v", v, ok, err)
+	}
+}
