@@ -2680,6 +2680,50 @@ func TestGetLifecycleDevuelveElRegistryDelDex(t *testing.T) {
 	}
 }
 
+// TestGetLifecycleLeeLasClavesDelDexDeGodot comprueba las dos claves `mLifecycleRegistry` que
+// `dexdump` muestra en el dex de Godot: la de androidx.core y la de androidx.activity. Con una
+// sola de ellas presente, `getLifecycle` entrega ESA referencia y el `addObserver` encadenado no
+// corta. Es la frontera de 7279 pasos: con solo la clave histórica el cero llegaba al observador.
+func TestGetLifecycleLeeLasClavesDelDexDeGodot(t *testing.T) {
+	for _, clave := range []string{
+		"Landroidx/core/app/ComponentActivity;.mLifecycleRegistry",
+		"Landroidx/activity/ComponentActivity;.mLifecycleRegistry",
+	} {
+		t.Run(clave, func(t *testing.T) {
+			actividad := objDe("Lcom/godot/game/GodotApp;")
+			registry := objDe("Landroidx/lifecycle/LifecycleRegistry;")
+			actividad.campos[clave] = registry
+
+			for _, candidato := range []string{
+				"Landroidx/lifecycle/LifecycleOwner;",
+				"Landroidx/savedstate/SavedStateRegistryOwner;",
+			} {
+				m := maquinaDeStubs()
+				v, ok, err := m.intentaStub([]string{candidato}, "getLifecycle",
+					"()Landroidx/lifecycle/Lifecycle;", nil, actividad)
+				if err != nil || !ok {
+					t.Fatalf("getLifecycle con %s y clave %s: ok=%v err=%v", candidato, clave, ok, err)
+				}
+				if v != registry {
+					t.Errorf("getLifecycle con %s y clave %s devolvió %v y se esperaba el registry del dex",
+						candidato, clave, v)
+				}
+				if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "LifecycleRegistry que el dex construyó") {
+					t.Errorf("falta el aviso de aproximación con %s: %s", clave, avisos)
+				}
+			}
+
+			_, lifecycle, err := cadenaGetLifecycle(actividad)
+			if lifecycle != registry {
+				t.Fatalf("cadena con clave %s devolvió %v y se esperaba el registry", clave, lifecycle)
+			}
+			if err != nil {
+				t.Fatalf("addObserver con clave %s falló: %v", clave, err)
+			}
+		})
+	}
+}
+
 // TestGetLifecycleConStubsApagadosReapareceElError falsifica la base con el interruptor de
 // previewstubsframework_test.go:232. Sin el stub, el cero del tipo llega a `addObserver` y reaparece
 // «se llamó a androidx.lifecycle.Lifecycle.addObserver sobre un objeto nulo».

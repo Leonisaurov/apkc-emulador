@@ -7190,11 +7190,22 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// observador: el `addObserver` posterior recibe el registry real. Aviso explícito de
 		// aproximación porque la vista previa no ejecuta el getter del framework. Sin el campo el
 		// stub no casa y la cadena corta en el guardián de receptor nulo de `invoca`.
+		// El dex no escribe una sola clave: `dexdump` muestra el campo de androidx.core (4804) y el
+		// de androidx.activity (5556) con su `iget` (6141), ambos `mLifecycleRegistry` con la M
+		// mayúscula. La clave histórica `lifecycleRegistry` se prueba primero para no romper las
+		// APK que ya la escribían; se devuelve solo la referencia que esté presente, nunca un
+		// registry inventado.
 		if len(vals) == 0 && obj != nil &&
 			es("Landroidx/lifecycle/LifecycleOwner;", "Landroidx/savedstate/SavedStateRegistryOwner;") {
-			if registry := obj.campos["Landroidx/core/app/ComponentActivity;.lifecycleRegistry"]; registry != nil {
-				m.avisa("LifecycleOwner.getLifecycle: se devuelve el LifecycleRegistry que el dex construyó en la actividad (aproximación)")
-				return registry, true, nil
+			for _, clave := range []string{
+				"Landroidx/core/app/ComponentActivity;.lifecycleRegistry",
+				"Landroidx/core/app/ComponentActivity;.mLifecycleRegistry",
+				"Landroidx/activity/ComponentActivity;.mLifecycleRegistry",
+			} {
+				if registry := obj.campos[clave]; registry != nil {
+					m.avisa("LifecycleOwner.getLifecycle: se devuelve el LifecycleRegistry que el dex construyó en la actividad (aproximación)")
+					return registry, true, nil
+				}
 			}
 		}
 	case "getObserverConstructorType":
