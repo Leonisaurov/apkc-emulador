@@ -4533,6 +4533,16 @@ func (m *maquinaDalvik) stubSinCuerpo(clase string, met *metodoDalvik, args []an
 			m.captura(met.nombre, nil, textoDe(args[len(args)-1]))
 		}
 		return valorCero(met.retorno), nil
+	case "getsavedstateregistry":
+		// La interfaz `SavedStateRegistryOwner` declara el getter sin cuerpo en el dex, así que
+		// `ejecutaCuerpo` llega aquí antes de que `invoca` pruebe los stubs. Se delega en el mismo
+		// case de `intentaStub` para no duplicar la búsqueda del registry que el dex construyó.
+		if stubsFrameworkActivos && len(args) > 0 &&
+			met.proto == "()Landroidx/savedstate/SavedStateRegistry;" {
+			if v, ok, err := m.intentaStub([]string{clase}, met.nombre, met.proto, args[1:], args[0]); ok || err != nil {
+				return v, err
+			}
+		}
 	case "createentryset":
 		// `ImmutableBiMap.entrySet()` llama a este método sin cuerpo y su cero llegaba al
 		// `ImmutableSet.iterator()` siguiente como receptor nulo. Se devuelve el mismo conjunto de
@@ -4696,7 +4706,12 @@ func datosDelMapa(obj *objetoDalvik) map[string]any {
 	if datos, ok := obj.campos["mapa.datos"].(map[string]any); ok {
 		return datos
 	}
-	if strings.HasSuffix(obj.clase, "Ljava/util/HashMap;") || strings.HasSuffix(obj.clase, "Ljava/util/Map;") {
+	// `SavedStateRegistryImpl.<init>` guarda un LinkedHashMap en `keyToProviders` (confirmado con
+	// dexdump sobre los dex de F-Droid y NewPipe). Sin reconocerlo, `entrySet` caía al cero de
+	// Ljava/util/Set; y el `Set.iterator` siguiente reventaba. Se modela vacío, sin inventar claves.
+	if strings.HasSuffix(obj.clase, "Ljava/util/HashMap;") ||
+		strings.HasSuffix(obj.clase, "Ljava/util/LinkedHashMap;") ||
+		strings.HasSuffix(obj.clase, "Ljava/util/Map;") {
 		if obj.campos == nil {
 			obj.campos = map[string]any{}
 		}
@@ -4710,6 +4725,91 @@ func datosDelMapa(obj *objetoDalvik) map[string]any {
 		return datos
 	}
 	return nil
+}
+
+// initSavedStateConDex ejecuta sobre `objeto` el `<init>` con cuerpo que el dex declare en `clase`.
+// El stub `create` del Companion entregaba un controlador con un campo propio y sin el
+// `savedStateRegistry` que el constructor del dex escribe; correr ESE cuerpo evita fabricar el
+// registry. Los parámetros que no son el owner se satisfacen con objetos inertes del tipo declarado
+// (callbacks que la vista previa no llega a invocar) o con el cero del primitivo. Devuelve false
+// cuando el dex no trae cuerpo, para que el stub pueda conservar su forma anterior.
+func (m *maquinaDalvik) initSavedStateConDex(clase string, objeto *objetoDalvik, owner any, profundidad int) bool {
+	if m.prog == nil || objeto == nil || profundidad > 2 {
+		return false
+	}
+	cl, ok := m.prog.clases[clase]
+	if !ok {
+		return false
+	}
+	var ctor *metodoDalvik
+	for _, met := range cl.metodos {
+		if met == nil || met.nombre != "<init>" || met.item == nil {
+			continue
+		}
+		if ctor == nil || len(camposDelProto(met.proto)) < len(camposDelProto(ctor.proto)) {
+			ctor = met
+		}
+	}
+	if ctor == nil {
+		return false
+	}
+	args := []any{objeto}
+	tipos := []string{clase}
+	for _, p := range camposDelProto(ctor.proto) {
+		switch {
+		case p == "Ljava/lang/Object;" || strings.HasSuffix(p, "SavedStateRegistryOwner;"):
+			args = append(args, owner)
+		case p != "" && strings.ContainsRune("ZBSCIJFD", rune(p[0])):
+			args = append(args, valorCero(p))
+		default:
+			inerte := &objetoDalvik{clase: p, campos: map[string]any{}}
+			m.initSavedStateConDex(p, inerte, owner, profundidad+1)
+			args = append(args, inerte)
+		}
+		tipos = append(tipos, p)
+	}
+	if _, err := m.ejecutaCuerpo(clase, ctor, args, tipos); err != nil {
+		m.avisa("SavedStateRegistryController.create: el <init> del dex no se pudo ejecutar: %v", err)
+		return false
+	}
+	return true
+}
+
+// campoQueTermina busca en los campos del objeto el primero cuyo nombre acaba en el sufijo dado.
+func campoQueTermina(obj *objetoDalvik, sufijo string) any {
+	if obj == nil {
+		return nil
+	}
+	for clave, valor := range obj.campos {
+		if strings.HasSuffix(clave, sufijo) {
+			return valor
+		}
+	}
+	return nil
+}
+
+// registryDelOwnerSavedState devuelve el SavedStateRegistry que el dex guardó en el controlador del
+// owner. No crea ninguno: si el campo no está, devuelve nil para que el getter siga cortando.
+func registryDelOwnerSavedState(obj *objetoDalvik) any {
+	if obj == nil {
+		return nil
+	}
+	if registry := campoQueTermina(obj, ".savedStateRegistry"); registry != nil {
+		return registry
+	}
+	var controlador *objetoDalvik
+	for clave, valor := range obj.campos {
+		if strings.HasSuffix(clave, ".mSavedStateRegistryController") ||
+			strings.HasSuffix(clave, ".savedStateRegistryController") ||
+			clave == "savedstate.controlador" {
+			controlador, _ = valor.(*objetoDalvik)
+			break
+		}
+	}
+	if controlador == nil {
+		return nil
+	}
+	return campoQueTermina(controlador, ".savedStateRegistry")
 }
 
 // clavesModeladasDelObjeto reúne las claves que el intérprete ya guardó en un objeto: las entradas
@@ -4939,7 +5039,7 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			"getInstalledPackages", "queryBroadcastReceivers",
 			"newSingleThreadExecutor", "newFixedThreadPool",
 			"currentThread", "getThread", "getStackTrace", "uptimeMillis",
-			"getLifecycle", "getObserverConstructorType", "setView", "setCancelable",
+			"getLifecycle", "getSavedStateRegistry", "getObserverConstructorType", "setView", "setCancelable",
 			"checkSelfPermission", "invalidate", "loadLibrary", "load", "Builder",
 			"newSimpleInstance", "build", "getSettings", "loadUrl", "loadData",
 			"loadDataWithBaseURL", "evaluateJavascript", "requestPermissions",
@@ -6925,8 +7025,17 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// por la clase declarada en el invoke, que `candidatos` siempre trae.
 		if len(vals) == 1 &&
 			es("Landroidx/savedstate/SavedStateRegistryController$Companion;") {
-			return &objetoDalvik{clase: "Landroidx/savedstate/SavedStateRegistryController;",
-				campos: map[string]any{"savedstate.owner": vals[0]}}, true, nil
+			const claseControlador = "Landroidx/savedstate/SavedStateRegistryController;"
+			controlador := &objetoDalvik{clase: claseControlador, campos: map[string]any{}}
+			if m.initSavedStateConDex(claseControlador, controlador, vals[0], 0) {
+				m.avisa("SavedStateRegistryController.create: se ejecutó el <init> del dex sobre el controlador (aproximación)")
+			} else {
+				m.avisa("SavedStateRegistryController.create: el dex no trae <init> del controlador; se devuelve el controlador del stub (aproximación)")
+			}
+			// el campo histórico se conserva para las pruebas y para quien aún lo lee; el dex
+			// escribe además sus campos `owner` y `savedStateRegistry`.
+			controlador.campos["savedstate.owner"] = vals[0]
+			return controlador, true, nil
 		}
 	case "show":
 		// `show()` sobre el builder crea el diálogo y lo pone delante; sobre un Toast deja su línea
@@ -7057,6 +7166,21 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			m.avisa("%s.getInterfaces: la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo (aproximación)",
 				claseCorta(obj.clase))
 			return &arregloDalvik{tipo: "[Ljava/lang/Class;", datos: []any{}}, true, nil
+		}
+	case "getSavedStateRegistry":
+		// `SavedStateRegistryOwner.getSavedStateRegistry()` se declara en el dex sin cuerpo: la
+		// actividad ya guarda el controlador que el propio dex construyó, con el
+		// `savedStateRegistry` escrito por su `<init>`. Se devuelve ESA referencia, sin fabricar un
+		// registry ni un proveedor. El aviso dice que es una aproximación porque la vista previa no
+		// ejecuta el getter del framework. Sin el campo el stub no casa y el cero llega al
+		// `getSavedStateProvider` siguiente, que corta con receptor nulo.
+		if stubsFrameworkActivos && len(vals) == 0 && obj != nil &&
+			proto == "()Landroidx/savedstate/SavedStateRegistry;" &&
+			es("Landroidx/savedstate/SavedStateRegistryOwner;", "Landroidx/activity/ComponentActivity;") {
+			if registry := registryDelOwnerSavedState(obj); registry != nil {
+				m.avisa("SavedStateRegistryOwner.getSavedStateRegistry: se devuelve el SavedStateRegistry que el dex construyó en el controlador (aproximación)")
+				return registry, true, nil
+			}
 		}
 	case "getLifecycle":
 		// `LifecycleOwner.getLifecycle()` caía al cero del tipo: el invoke se declara en la interfaz

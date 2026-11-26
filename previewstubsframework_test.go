@@ -2446,8 +2446,7 @@ func TestCallbacksDeServiceConnectionInertes(t *testing.T) {
 	// La conexión ligada por bindService se reconoce por la marca, no solo por su clase.
 	m.registraConexion(conexion)
 	if v, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;"},
-		"onServiceDisconnected", "(Landroid/content/ComponentName;)V", []any{componente}, conexion);
-		err != nil || !ok || v != nil {
+		"onServiceDisconnected", "(Landroid/content/ComponentName;)V", []any{componente}, conexion); err != nil || !ok || v != nil {
 		t.Errorf("onServiceDisconnected sobre la conexión ligada: v=%v ok=%v err=%v", v, ok, err)
 	}
 	avisos := strings.Join(m.avisos, "\n")
@@ -2505,9 +2504,9 @@ func TestLifecycleObserverSinteticoDeLaLambdaNoEsNulo(t *testing.T) {
 // rellenarse con un objeto inventado.
 func TestLifecycleReceptorNuloSigueCortando(t *testing.T) {
 	d := &dexFile{methods: []dexMethod{{
-		owner:  "Ljava/lang/Object;",
-		name:   "getClass",
-		proto:  dexProto{shorty: "()Ljava/lang/Class;", returnType: "Ljava/lang/Class;"},
+		owner: "Ljava/lang/Object;",
+		name:  "getClass",
+		proto: dexProto{shorty: "()Ljava/lang/Class;", returnType: "Ljava/lang/Class;"},
 	}}}
 	m := &maquinaDalvik{vistos: map[string]bool{}}
 	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "Landroidx/lifecycle/Lifecycling;")
@@ -2732,5 +2731,73 @@ func TestGetLifecycleReceptorSinCampoSigueCortando(t *testing.T) {
 	}
 	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "no está en el dex ni en los stubs") {
 		t.Errorf("el cero no se anunció como aproximación: %s", avisos)
+	}
+}
+
+// TestDatosDelMapaAceptaLinkedHashMap fija el respaldo del `keyToProviders` que el dex crea con
+// `new-instance Ljava/util/LinkedHashMap;`: sin él, `entrySet` devolvía el cero de Ljava/util/Set;
+// y el `Set.iterator` siguiente reventaba en F-Droid y NewPipe. El mapa nace vacío: no se inventa
+// ninguna clave.
+func TestDatosDelMapaAceptaLinkedHashMap(t *testing.T) {
+	mapa := objDe("Ljava/util/LinkedHashMap;")
+	// la clave se siembra antes de la primera lectura: datosDelMapa cachea el respaldo en
+	// `mapa.datos` y una lectura posterior no recorre otra vez los campos `mapa.*`.
+	mapa.campos["mapa.claveSembrada"] = cadenaObjeto("valorSembrado")
+	datos := datosDelMapa(mapa)
+	if datos == nil {
+		t.Fatal("datosDelMapa no reconoció el LinkedHashMap del dex")
+	}
+	if textoDe(datos["claveSembrada"]) != "valorSembrado" {
+		t.Errorf("la clave sembrada no se leyó: %v", datos)
+	}
+	// un mapa sin sembrar nace vacío y no inventa ninguna clave
+	if datos := datosDelMapa(objDe("Ljava/util/LinkedHashMap;")); len(datos) != 0 {
+		t.Errorf("el mapa nació con %d claves inventadas", len(datos))
+	}
+}
+
+// TestGetSavedStateRegistryDevuelveElDelDex comprueba que el getter acotado entrega solo la
+// referencia que el dex guardó en el controlador de la actividad, y que sin ese campo no casa.
+func TestGetSavedStateRegistryDevuelveElDelDex(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lorg/schabi/newpipe/MainActivity;")
+	registry := objDe("Landroidx/savedstate/SavedStateRegistry;")
+	controlador := objDe("Landroidx/savedstate/SavedStateRegistryController;")
+	controlador.campos["Landroidx/savedstate/SavedStateRegistryController;.savedStateRegistry"] = registry
+	actividad.campos["Landroidx/activity/ComponentActivity;.mSavedStateRegistryController"] = controlador
+
+	v, ok, err := m.intentaStub([]string{"Landroidx/savedstate/SavedStateRegistryOwner;"},
+		"getSavedStateRegistry", "()Landroidx/savedstate/SavedStateRegistry;", nil, actividad)
+	if err != nil || !ok || v != registry {
+		t.Fatalf("getSavedStateRegistry: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "SavedStateRegistry que el dex construyó") {
+		t.Errorf("falta el aviso de aproximación: %s", avisos)
+	}
+
+	// otra firma y otro receptor no deben casa: el stub no inventa un registry
+	if v, ok, err := m.intentaStub([]string{"Landroidx/savedstate/SavedStateRegistryOwner;"},
+		"getSavedStateRegistry", "()Landroidx/savedstate/SavedStateRegistry;", nil,
+		objDe("Lorg/schabi/newpipe/MainActivity;")); err != nil || ok || v != nil {
+		t.Errorf("sin el campo getSavedStateRegistry se resolvió: v=%v ok=%v err=%v", v, ok, err)
+	}
+}
+
+// TestGetSavedStateRegistryConStubsApagados no entrega la referencia: el interruptor de
+// previewstubsframework_test.go:232 debe devolverla al aviso de getter ausente de antes.
+func TestGetSavedStateRegistryConStubsApagados(t *testing.T) {
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+	m := maquinaDeStubs()
+	actividad := objDe("Lorg/schabi/newpipe/MainActivity;")
+	registry := objDe("Landroidx/savedstate/SavedStateRegistry;")
+	controlador := objDe("Landroidx/savedstate/SavedStateRegistryController;")
+	controlador.campos["Landroidx/savedstate/SavedStateRegistryController;.savedStateRegistry"] = registry
+	actividad.campos["Landroidx/activity/ComponentActivity;.mSavedStateRegistryController"] = controlador
+
+	v, ok, err := m.intentaStub([]string{"Landroidx/savedstate/SavedStateRegistryOwner;"},
+		"getSavedStateRegistry", "()Landroidx/savedstate/SavedStateRegistry;", nil, actividad)
+	if err != nil || ok || v != nil {
+		t.Fatalf("con los stubs apagados getSavedStateRegistry se resolvió: v=%v ok=%v err=%v", v, ok, err)
 	}
 }
