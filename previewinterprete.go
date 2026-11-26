@@ -3925,7 +3925,9 @@ func (m *maquinaDalvik) ejecutaCuerpo(clase string, met *metodoDalvik, args []an
 					return nil, err
 				}
 				lit := int32(int8(w >> 8))
-				v, err := enteraLit(op-0xd8, regs[int(w)&0xf], lit)
+				// El formato 22b toma el registro fuente de los ocho bits bajos de la segunda
+				// palabra, no de un nibble: con &0xf un registro mayor que 15 se leía como v1.
+				v, err := enteraLit(op-0xd8, regs[int(w)&0xff], lit)
 				if err != nil {
 					return nil, err
 				}
@@ -4997,6 +4999,35 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 	}
 
 	switch nombre {
+	case "arraycopy":
+		// `System.arraycopy(src, srcPos, dst, dstPos, n)` copia los elementos reales del arreglo y
+		// comprueba los rangos antes de escribir, como hace el JDK.
+		if proto == "(Ljava/lang/Object;ILjava/lang/Object;II)V" && len(vals) == 5 && es("Ljava/lang/System;") {
+			origen, okOrigen := vals[0].(*arregloDalvik)
+			destino, okDestino := vals[2].(*arregloDalvik)
+			if !okOrigen || !okDestino {
+				return nil, true, fmt.Errorf("System.arraycopy sobre un registro que no es arreglo")
+			}
+			desde, err := aInt32(vals[1])
+			if err != nil {
+				return nil, true, err
+			}
+			hasta, err := aInt32(vals[3])
+			if err != nil {
+				return nil, true, err
+			}
+			n, err := aInt32(vals[4])
+			if err != nil {
+				return nil, true, err
+			}
+			if desde < 0 || hasta < 0 || n < 0 || int(desde)+int(n) > len(origen.datos) ||
+				int(hasta)+int(n) > len(destino.datos) {
+				return nil, true, nuevaExcepcion("Ljava/lang/ArrayIndexOutOfBoundsException;",
+					"arraycopy: rangos fuera de los arreglos de %d y %d elementos", len(origen.datos), len(destino.datos))
+			}
+			copy(destino.datos[hasta:hasta+n], origen.datos[desde:desde+n])
+			return nil, true, nil
+		}
 	case "numberOfLeadingZeros":
 		// `Integer.numberOfLeadingZeros` es una función pura del entero: la cuenta de ceros a la
 		// izquierda. `androidx.collection` la llama al calcular capacidades, dentro del `<clinit>`

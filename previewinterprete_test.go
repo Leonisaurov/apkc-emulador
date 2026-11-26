@@ -2196,3 +2196,48 @@ func TestAndIntLit16LeeLosNibblesDeD8(t *testing.T) {
 		t.Errorf("and-int/lit16 dio %v y se esperaba %d", v, 222&128)
 	}
 }
+
+// TestAndIntLit8LeeElRegistroDeUnByte falsifica el opcode 0xdd con un registro fuente mayor que
+// 15: el formato 22b guarda ese registro en el byte bajo de la segunda palabra y leer solo un
+// nibble daba v1 (vacío) en vez de v33. 222 & -128 = 128.
+func TestAndIntLit8LeeElRegistroDeUnByte(t *testing.T) {
+	d := &dexFile{}
+	insns := []uint16{
+		0x2113, 0x00de, // const/16 v33, #222
+		0x22dd, 0x8021, // and-int/lit8 v34, v33, #-128  (0x21 = 33; 0x80 = -128)
+		0x220f,         // return v34
+	}
+	met := &metodoDalvik{nombre: "and8", retorno: "I", proto: "()I", dex: d,
+		item: &codeItem{registersSize: 35, insnsSize: uint32(len(insns)), insns: insns}}
+	m := nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{}}, nil)
+	v, err := m.ejecutaCuerpo("Lcom/ejemplo/A;", met, nil, nil)
+	if err != nil {
+		t.Fatalf("el método con and-int/lit8 falló: %v", err)
+	}
+	if v != int32(222&128) {
+		t.Errorf("and-int/lit8 dio %v y se esperaba %d", v, 222&128)
+	}
+}
+
+// TestArraycopyCopiaYRango falsifica el stub de System.arraycopy con una copia real y un rango
+// negativo: la copia escribe los elementos y el rango fuera de límites devuelve una excepción.
+func TestArraycopyCopiaYRango(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{dex: &dexFile{}, clases: map[string]*claseDalvik{}}, nil)
+	origen := &arregloDalvik{tipo: "[I", datos: []any{int32(1), int32(2), int32(3), int32(4)}}
+	destino := &arregloDalvik{tipo: "[I", datos: make([]any, 4)}
+	proto := "(Ljava/lang/Object;ILjava/lang/Object;II)V"
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/System;"}, "arraycopy", proto,
+		[]any{origen, int32(1), destino, int32(0), int32(2)}, nil)
+	if err != nil || !ok || v != nil {
+		t.Fatalf("System.arraycopy no se resolvió: ok=%v, err=%v, valor=%v", ok, err, v)
+	}
+	for i, quiero := range []any{int32(2), int32(3), nil, nil} {
+		if destino.datos[i] != quiero {
+			t.Errorf("el hueco %d es %#v y se esperaba %#v", i, destino.datos[i], quiero)
+		}
+	}
+	if _, _, err := m.intentaStub([]string{"Ljava/lang/System;"}, "arraycopy", proto,
+		[]any{origen, int32(-1), destino, int32(0), int32(2)}, nil); err == nil {
+		t.Error("se aceptó un índice de origen negativo")
+	}
+}
