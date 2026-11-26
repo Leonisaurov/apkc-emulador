@@ -742,6 +742,114 @@ func TestLifecycleDelCompanionAlObservador(t *testing.T) {
 	}
 }
 
+// maquinaConTiposDeForName arma una máquina con la tabla de tipos que trae Libre Memory Game:
+// `GodotApp` y `GeneratedAdapter` están escritos en el dex, y el adaptador `_LifecycleAdapter`
+// que Lifecycling busca por nombre no está. Es lo que distingue un Class legítimo de un nombre
+// que el APK no contiene.
+func maquinaConTiposDeForName() *maquinaDalvik {
+	d := &dexFile{types: []string{
+		"",
+		"Lcom/godot/game/GodotApp;",
+		"Landroidx/lifecycle/GeneratedAdapter;",
+		"Ljava/lang/String;",
+	}}
+	return nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{
+		"Lcom/godot/game/GodotApp;": {nombre: "Lcom/godot/game/GodotApp;"},
+	}}, nil)
+}
+
+// TestForNameConNombreDelDexDevuelveUnaClaseNoNula cierra la mitad fail-open: los nombres que sí
+// están en la tabla de tipos se resuelven al Class sintético que ya usa `getClass`, con su
+// descriptor, sin aviso de excepción y sin devolver nunca el cero.
+func TestForNameConNombreDelDexDevuelveUnaClaseNoNula(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	for _, nombre := range []string{"com.godot.game.GodotApp", "androidx.lifecycle.GeneratedAdapter"} {
+		t.Run(nombre, func(t *testing.T) {
+			m.avisos = nil
+			m.vistos = map[string]bool{}
+			v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "forName",
+				"(Ljava/lang/String;)Ljava/lang/Class;", []any{nombre}, nil)
+			if err != nil || !ok {
+				t.Fatalf("forName(%s): ok=%v err=%v", nombre, ok, err)
+			}
+			clase := esperaObjetoDeStub(t, v, "Ljava/lang/Class;")
+			esperado := "L" + strings.ReplaceAll(nombre, ".", "/") + ";"
+			if got := claseDeLiteral(clase); got != esperado {
+				t.Errorf("forName(%s) guardó el descriptor %q y tenía que guardar %q", nombre, got, esperado)
+			}
+			if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "ClassNotFoundException") {
+				t.Errorf("forName(%s) lanzó una excepción para un nombre que sí está: %s", nombre, avisos)
+			}
+		})
+	}
+}
+
+// TestForNameConNombreAusenteLanzaClassNotFoundException cierra la mitad fail-closed: un nombre
+// que no está en el dex —en especial el `*_LifecycleAdapter` que buscaba Lifecycling— no se
+// fabrica. Se lanza la excepción que el propio dex catcha y se registra el aviso, en vez de
+// devolver el nulo que acababa en el cast a `Class<out GeneratedAdapter>`.
+func TestForNameConNombreAusenteLanzaClassNotFoundException(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	ausentes := []string{
+		"com.godot.game.GodotApp_LifecycleAdapter",
+		"androidx.lifecycle.GeneratedAdapter_LifecycleAdapter",
+		"no.esta.EnElDex",
+		"",
+	}
+	for _, nombre := range ausentes {
+		t.Run(nombre, func(t *testing.T) {
+			m.avisos = nil
+			m.vistos = map[string]bool{}
+			v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "forName",
+				"(Ljava/lang/String;)Ljava/lang/Class;", []any{nombre}, nil)
+			if !ok {
+				t.Fatalf("forName(%q) tiene que resolverse dentro del stub", nombre)
+			}
+			if v != nil {
+				t.Errorf("forName(%q) devolvió %v junto a la excepción", nombre, v)
+			}
+			ex := excepcionDe(err)
+			if ex == nil || ex.tipo != "Ljava/lang/ClassNotFoundException;" {
+				t.Fatalf("forName(%q) dio %v y tenía que lanzar ClassNotFoundException", nombre, err)
+			}
+			if !m.tipoAcepta("Ljava/lang/ClassNotFoundException;", ex.tipo) {
+				t.Errorf("el catch del dex no aceptaría la excepción de forName(%q)", nombre)
+			}
+			if len(m.avisos) != 1 || !strings.Contains(m.avisos[0], "ClassNotFoundException") {
+				t.Errorf("el aviso de forName(%q) es %v y tenía que registrar la excepción", nombre, m.avisos)
+			}
+		})
+	}
+}
+
+// TestForNameNoAbreLaReflexionRestante fija que el stub nuevo no abre la puerta a fabricar el
+// adaptador: `newInstance` sigue rechazándose por nombre, y `getDeclaredConstructor`,
+// `isAccessible`, `setAccessible` y los `Field`/`Method` siguen sin tener stub (el aviso lo pone
+// `invoca` al no resolverlos). Ninguno devuelve un Class ni una excepción nueva.
+func TestForNameNoAbreLaReflexionRestante(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	for _, nombre := range []string{
+		"getMethod", "getDeclaredMethod", "newInstance", "invoke",
+		"getDeclaredConstructor", "isAccessible", "setAccessible", "getField", "getDeclaredField",
+	} {
+		t.Run(nombre, func(t *testing.T) {
+			m.avisos = nil
+			m.vistos = map[string]bool{}
+			v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;", "Ljava/lang/reflect/Constructor;"},
+				nombre, "()Ljava/lang/Object;", nil, nil)
+			if err != nil {
+				t.Fatalf("%s lanzó %v y tenía que rechazarse con aviso", nombre, err)
+			}
+			if ok && v != nil {
+				t.Errorf("%s devolvió %v y no tiene stub", nombre, v)
+			}
+			if ok && len(m.avisos) == 0 {
+				t.Errorf("%s se aceptó sin aviso", nombre)
+			}
+		})
+	}
+}
+
 // TestLifecycleElPoolFijoDevuelveUnEjecutor añade `newFixedThreadPool` a la familia de ejecutores:
 // recibe argumentos (a diferencia de los otros dos) y por eso la condición de aridad tuvo que
 // ampliarse. Sin esto, NewPipe y Libre Memory Game seguían con un ExecutorService nulo.

@@ -1409,9 +1409,11 @@ func TestLaSiembraDelLayoutNoPisaLoQueLaAppEscribio(t *testing.T) {
 }
 
 // TestElInterpreteRechazaPorNombreLoQueNoEmula fija la otra mitad: lo que no tiene una aproximación
-// honesta (formato de cadenas, Html, reflexión) no se stubbea a medias. El aviso lo nombra y el test
-// comprueba que el nombre y el motivo están. `getEditableText` ya no está aquí: se emula como texto
-// plano desde E5, porque es lo único que una app lee de un Editable.
+// honesta (formato de cadenas, Html, el resto de la reflexión) no se stubbea a medias. El aviso lo
+// nombra y el test comprueba que el nombre y el motivo están. `getEditableText` ya no está aquí: se
+// emula como texto plano desde E5, porque es lo único que una app lee de un Editable. `forName`
+// tampoco: ahora se resuelve contra la tabla de tipos del dex o lanza ClassNotFoundException, y
+// tiene sus propias pruebas en previewstubsframework_test.go.
 func TestElInterpreteRechazaPorNombreLoQueNoEmula(t *testing.T) {
 	m := maquinaDelContador(t)
 	casos := []struct {
@@ -1426,8 +1428,6 @@ func TestElInterpreteRechazaPorNombreLoQueNoEmula(t *testing.T) {
 			[]string{"Lcom/hola/contador/MainActivity;"}, m.actividad, "formato de cadenas"},
 		{"fromHtml", "(Ljava/lang/String;)Landroid/text/Spanned;", []any{"<b>x</b>"},
 			[]string{"Landroid/text/Html;"}, nil, "Html"},
-		{"forName", "(Ljava/lang/String;)Ljava/lang/Class;", []any{"java.lang.String"},
-			[]string{"Ljava/lang/Class;"}, nil, "reflexión"},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {

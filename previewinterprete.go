@@ -1577,6 +1577,61 @@ func esReflexion(candidatos []string) bool {
 	return false
 }
 
+// descriptorDeNombreBinario convierte el nombre que recibe `Class.forName` en el descriptor con el
+// que el dex escribe sus tipos: puntos a barras y `L…;`. Los nombres con `/`, `;`, `[` o paréntesis
+// no son nombres binarios y se rechazan sin mirar la tabla. Los nombres de clase anidada conservan
+// el `$` que ya traen, que es el mismo carácter que usa el descriptor.
+func descriptorDeNombreBinario(nombre string) string {
+	if nombre == "" || strings.ContainsAny(nombre, "/;[]()") {
+		return ""
+	}
+	return "L" + strings.ReplaceAll(nombre, ".", "/") + ";"
+}
+
+// dexesDelPrograma junta la tabla de tipos de todos los dex que aportaron clases: `programaDalvik`
+// guarda el primero como `dex` de la sesión y los demás quedan en los métodos. Una referencia que
+// no tenga `class_def` solo vive en `type_ids`, y `forName` tiene que verla igual que el framework.
+func dexesDelPrograma(p *programaDalvik) []*dexFile {
+	vistos := map[*dexFile]bool{}
+	var dexes []*dexFile
+	if p == nil {
+		return dexes
+	}
+	if p.dex != nil {
+		vistos[p.dex] = true
+		dexes = append(dexes, p.dex)
+	}
+	for _, cl := range p.clases {
+		for _, met := range cl.metodos {
+			if met != nil && met.dex != nil && !vistos[met.dex] {
+				vistos[met.dex] = true
+				dexes = append(dexes, met.dex)
+			}
+		}
+	}
+	return dexes
+}
+
+// tipoEnDexDice si el descriptor está escrito en el dex cargado, sea como clase definida o como
+// tipo referenciado. Es la única fuente de `Class.forName`: nada de lo que no esté en el fichero
+// se inventa ni se carga de fuera.
+func (m *maquinaDalvik) tipoEnDex(descriptor string) bool {
+	if m == nil || m.prog == nil || descriptor == "" {
+		return false
+	}
+	if _, ok := m.prog.clases[descriptor]; ok {
+		return true
+	}
+	for _, d := range dexesDelPrograma(m.prog) {
+		for _, t := range d.types {
+			if t == descriptor {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ejecutaOnCreate carga el programa y corre la actividad, sin pulsar nada. Es el camino de siempre:
 // el emulador arranca en el estado que deja `onCreate` y espera un clic de verdad.
 func ejecutaOnCreate(d *dexFile, tabla *tablaRecursos, actividad string) (*resultadoEjecucion, uint32) {
@@ -6684,11 +6739,29 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"el formato con Html no está en el subconjunto: solo se emula texto plano",
 				"Landroid/text/Spanned;")
 		}
-	case "forName", "getMethod", "getDeclaredMethod", "newInstance", "invoke":
-		// `Class.forName` queda FUERA del subconjunto a propósito: cargar una clase por nombre
-		// exigiría resolver y ejecutar código que la app no trae en el dex, y devolver un Class
-		// inventado sería peor que el aviso. Se mantiene `forName: la reflexión no está en el
-		// subconjunto`, que es explícito y fail-closed; esta ronda no añade un stub para él.
+	case "forName":
+		// `Class.forName` se resuelve contra la tabla de tipos del dex ya cargado: si el nombre
+		// binario está escrito en él, se devuelve el mismo Class sintético que guarda `getClass`
+		// (nunca nulo). Si no está, se lanza ClassNotFoundException para que el catch del propio
+		// dex continúe, en vez de dejar un nulo que reventaba después al hacer el cast a
+		// `Class<out GeneratedAdapter>`. Es fail-closed: no se carga código de fuera ni se
+		// fabrica un adaptador que el APK no trae.
+		if len(vals) == 1 && es("Ljava/lang/Class;") {
+			nombreClase := textoDe(vals[0])
+			descriptor := descriptorDeNombreBinario(nombreClase)
+			if descriptor != "" && m.tipoEnDex(descriptor) {
+				return &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+					"Ljava/lang/Class;.$tipo": descriptor,
+				}}, true, nil
+			}
+			m.avisa("forName(%s): el nombre no está en la tabla de tipos del dex; se lanza ClassNotFoundException",
+				nombreClase)
+			return nil, true, nuevaExcepcion("Ljava/lang/ClassNotFoundException;", "%s", nombreClase)
+		}
+	case "getMethod", "getDeclaredMethod", "newInstance", "invoke":
+		// el resto de la reflexión sigue FUERA del subconjunto: `getDeclaredConstructor`,
+		// `isAccessible`/`setAccessible` y los `Field`/`Method` de ActivityRecreator tampoco
+		// se stubbean. Fabricar el adaptador inexistente sería un falso avance.
 		if esReflexion(candidatos) {
 			return m.rechaza(nombre, proto,
 				"la reflexión no está en el subconjunto", "")
