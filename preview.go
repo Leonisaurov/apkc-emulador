@@ -229,6 +229,25 @@ type nodoVista struct {
 	imagenAncho   int    // el tamaño intrínseco del PNG ya en dp
 	imagenAlto    int
 	fondoRef      uint32 // el id de `android:background` si es una referencia, o 0
+	// regDerecha, regIzquierda, regAbajo y regArriba son las cuatro reglas que atan esta vista a un
+	// hermano; regPadreDer y regCentroPadre las que la atan al padre. Se guardan sin exponer en el
+	// JSON: son la entrada de la colocación, no un dato nuevo del modelo. Cada destino lleva su texto
+	// y su referencia numérica para encontrarlo tanto en un AXML enlazado como en un modelo a mano.
+	regDerecha     referenciaRelativa
+	regIzquierda   referenciaRelativa
+	regAbajo       referenciaRelativa
+	regArriba      referenciaRelativa
+	regPadreDer    bool
+	regCentroPadre bool
+	resueltoRel    bool
+	avisadoRel     bool
+}
+
+// referenciaRelativa es el destino de una regla de RelativeLayout: el nombre que resuelve la tabla
+// (`id/title`) y, cuando el AXML lo escribió como referencia, su id numérico (`0x7f030000`).
+type referenciaRelativa struct {
+	nombre string
+	ref    string
 }
 
 // coloresTema son los colores que el tema de la app aporta a la pantalla. No se publican como un
@@ -2151,6 +2170,35 @@ func (c *contextoVista) nodoDe(e *elementoLeido) *nodoVista {
 		n.ID = c.texto(id)
 		n.IDRef = fmt.Sprintf("%#08x", id.datos)
 	}
+	// Solo se leen las seis reglas que se resuelven: las cuatro relativas a un hermano y las dos
+	// relativas al padre. El resto de `layout_*` se deja estar: no se inventa una posición para él.
+	for _, regla := range []struct {
+		nombre  string
+		destino *referenciaRelativa
+	}{
+		{"layout_toRightOf", &n.regDerecha},
+		{"layout_toLeftOf", &n.regIzquierda},
+		{"layout_below", &n.regAbajo},
+		{"layout_above", &n.regArriba},
+	} {
+		if v, ok := e.atributo(uriDeRecursos, regla.nombre); ok {
+			regla.destino.nombre = c.texto(v)
+			if v.tipo == tipoReferencia {
+				regla.destino.ref = fmt.Sprintf("%#08x", v.datos)
+			}
+		}
+	}
+	for _, bandera := range []struct {
+		nombre  string
+		destino *bool
+	}{
+		{"layout_alignParentRight", &n.regPadreDer},
+		{"layout_centerInParent", &n.regCentroPadre},
+	} {
+		if v, ok := e.atributo(uriDeRecursos, bandera.nombre); ok {
+			*bandera.destino = boolDeRegla(v, c)
+		}
+	}
 	if texto, ok := e.atributo(uriDeRecursos, "text"); ok {
 		n.Texto = c.texto(texto)
 	}
@@ -3335,15 +3383,171 @@ func (n *nodoVista) colocar(x, y int) {
 	case "frame":
 		n.colocarFrame()
 	default:
-		// RelativeLayout y el resto: sin resolver las relaciones, se apilan en el origen
+		// RelativeLayout y el resto. Primero se da a cada hijo su rectángulo inicial, como antes;
+		// después se aplican solo las reglas que el layout declaró. Quien no declara ninguna se queda
+		// en ese rectángulo. Las referencias adelantadas se resuelven en la segunda pasada.
+		porID := map[string]*nodoVista{}
 		for _, h := range n.Hijos {
 			if h.estaGone() {
 				h.Rect = rectVista{}
 				continue
 			}
 			h.colocar(x+n.pad.Izq+h.margen.Izq, y+n.pad.Arr+h.margen.Arr)
+			if h.ID != "" {
+				if _, repetido := porID[h.ID]; !repetido {
+					porID[h.ID] = h
+				}
+			}
+			if h.IDRef != "" {
+				if _, repetido := porID[h.IDRef]; !repetido {
+					porID[h.IDRef] = h
+				}
+			}
+			h.resueltoRel = !h.tieneReglasRelativas()
+		}
+		for pasada := 0; pasada < 2; pasada++ {
+			for _, h := range n.Hijos {
+				if h.estaGone() {
+					continue
+				}
+				h.resolverReglasRelativas(porID, n.Rect, n.pad, pasada == 1)
+			}
 		}
 	}
+}
+
+// boolDeRegla lee un booleano de LayoutParams: aapt2 escribe `true` con tipo booleano y el
+// enlazador en Go puede dejarlo como entero. Una referencia o un valor ausente no activa la regla.
+func boolDeRegla(v valor, c *contextoVista) bool {
+	switch v.tipo {
+	case tipoBooleano, tipoEnteroDec, tipoEnteroHex:
+		return v.datos != 0
+	}
+	return strings.EqualFold(c.texto(v), "true")
+}
+
+// tieneReglasRelativas dice si el nodo declaró alguna de las seis reglas que se resuelven.
+func (n *nodoVista) tieneReglasRelativas() bool {
+	return n.regDerecha.nombre != "" || n.regIzquierda.nombre != "" ||
+		n.regAbajo.nombre != "" || n.regArriba.nombre != "" ||
+		n.regPadreDer || n.regCentroPadre
+}
+
+// hermanoRelativo busca al destino de una regla entre los hermanos ya indexados.
+func (n *nodoVista) hermanoRelativo(r referenciaRelativa, porID map[string]*nodoVista) *nodoVista {
+	if r.nombre == "" {
+		return nil
+	}
+	if h, ok := porID[r.nombre]; ok {
+		return h
+	}
+	if r.ref != "" {
+		return porID[r.ref]
+	}
+	return nil
+}
+
+// avisaReglaRelativa escribe en stderr, nunca en stdout: stdout es el JSON del modelo. Cada nodo
+// avisa una sola vez aunque la colocación se repita al interpretar el dex.
+func (n *nodoVista) avisaReglaRelativa(esta, destino string) {
+	if n.avisadoRel {
+		return
+	}
+	n.avisadoRel = true
+	fmt.Fprintf(os.Stderr, "preview: %s con %s=%s sin resolver; se conserva su rectángulo\n", n.ID, esta, destino)
+}
+
+// resolverReglasRelativas coloca un hijo usando únicamente las reglas que declaró. `toRightOf` y
+// `below` mandan sobre `toLeftOf` y `above` cuando el layout declara ambos, porque son los que fijan
+// el borde superior e izquierdo; `toLeftOf` junto con `toRightOf` recorta el ancho a los dos anclas,
+// que es lo que el framework hace y lo que evita salir del padre sin inventar medida. Si un ancla
+// todavía no está resuelta, la aplicación se difiere a la segunda pasada; si no existe, se avisa y
+// el rectángulo anterior queda intacto.
+func (n *nodoVista) resolverReglasRelativas(porID map[string]*nodoVista, padre rectVista, margen ladosVista, avisar bool) {
+	if !n.tieneReglasRelativas() {
+		n.resueltoRel = true
+		return
+	}
+	pendiente := false
+	anclaDer := n.hermanoRelativo(n.regDerecha, porID)
+	if n.regDerecha.nombre != "" && anclaDer == nil && avisar {
+		n.avisaReglaRelativa("layout_toRightOf", n.regDerecha.nombre)
+	}
+	anclaIzq := n.hermanoRelativo(n.regIzquierda, porID)
+	if n.regIzquierda.nombre != "" && anclaIzq == nil && avisar {
+		n.avisaReglaRelativa("layout_toLeftOf", n.regIzquierda.nombre)
+	}
+	anclaAbajo := n.hermanoRelativo(n.regAbajo, porID)
+	if n.regAbajo.nombre != "" && anclaAbajo == nil && avisar {
+		n.avisaReglaRelativa("layout_below", n.regAbajo.nombre)
+	}
+	anclaArriba := n.hermanoRelativo(n.regArriba, porID)
+	if n.regArriba.nombre != "" && anclaArriba == nil && avisar {
+		n.avisaReglaRelativa("layout_above", n.regArriba.nombre)
+	}
+	x, y := n.Rect.X, n.Rect.Y
+	switch {
+	case anclaDer != nil:
+		if !anclaDer.resueltoRel {
+			pendiente = true
+		} else {
+			x = anclaDer.Rect.X + anclaDer.Rect.Ancho + margen.Izq
+			if anclaIzq != nil && anclaIzq.resueltoRel {
+				ancho := anclaIzq.Rect.X - margen.Der - x
+				if ancho < 0 {
+					ancho = 0
+				}
+				n.Rect.Ancho = ancho
+				n.medAncho = ancho
+			} else if n.declAncho == medidaMatch {
+				// match_parent a la derecha de otro hermano ocupa solo el hueco que queda.
+				if ancho := padre.X + padre.Ancho - margen.Der - x; ancho > 0 {
+					n.Rect.Ancho = ancho
+					n.medAncho = ancho
+				}
+			}
+		}
+	case anclaIzq != nil:
+		if !anclaIzq.resueltoRel {
+			pendiente = true
+		} else {
+			x = anclaIzq.Rect.X - n.Rect.Ancho - margen.Der
+		}
+	case n.regPadreDer:
+		x = padre.X + padre.Ancho - n.Rect.Ancho - margen.Der
+	case n.regCentroPadre:
+		x = padre.X + (padre.Ancho-n.Rect.Ancho)/2
+	}
+	switch {
+	case anclaAbajo != nil:
+		if !anclaAbajo.resueltoRel {
+			pendiente = true
+		} else {
+			y = anclaAbajo.Rect.Y + anclaAbajo.Rect.Alto + margen.Arr
+			if n.declAlto == medidaMatch {
+				// match_parent debajo de otro hermano mide el hueco restante, no el padre entero.
+				if alto := padre.Y + padre.Alto - margen.Aba - y; alto > 0 {
+					n.Rect.Alto = alto
+					n.medAlto = alto
+				}
+			}
+		}
+	case anclaArriba != nil:
+		if !anclaArriba.resueltoRel {
+			pendiente = true
+		} else {
+			y = anclaArriba.Rect.Y - n.Rect.Alto - margen.Aba
+		}
+	case n.regCentroPadre:
+		y = padre.Y + (padre.Alto-n.Rect.Alto)/2
+	}
+	if pendiente {
+		return
+	}
+	n.Rect.X, n.Rect.Y = x, y
+	n.resueltoRel = true
+	// La vista pudo moverse: sus hijos se recolocan desde su rectángulo nuevo, sin volver a medirlos.
+	n.colocar(n.Rect.X, n.Rect.Y)
 }
 
 // colocarVertical es layoutVertical: la gravedad mayor centra o pega abajo el bloque de hijos y la

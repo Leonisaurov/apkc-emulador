@@ -40,6 +40,13 @@ const (
 	idAttrWeightSum      = 0x01010128
 	idAttrLayoutWeight   = 0x01010181
 	idAttrText           = 0x0101014f
+	// reglas de RelativeLayout, con los ids que imprime `aapt2 dump xmltree`.
+	idAttrAToLeftOf         = 0x01010182
+	idAttrAToRightOf        = 0x01010183
+	idAttrALayoutAbove      = 0x01010184
+	idAttrALayoutBelow      = 0x01010185
+	idAttrAAlignParentRight = 0x0101018d
+	idAttrACenterInParent   = 0x0101018f
 )
 
 // atributoDim arma un atributo con una dimensión en la forma que elija el caso: el entero complejo
@@ -615,4 +622,85 @@ func aapt2DeLaMaquina(t *testing.T) string {
 	}
 	sort.Strings(raices)
 	return raices[len(raices)-1]
+}
+
+// TestGeometriaReglasRelativasDelLayout fija las seis reglas que se resuelven sobre un
+// RelativeLayout sintético, con sus ids escritos en el AXML como referencias. Dos casos van
+// adelantados (c depende de b y e de f) para exigir la segunda pasada, y uno apunta a un id que no
+// existe para exigir que se conserve el rectángulo inicial. No hay oráculo de aparato: los números
+// son la cuenta de la regla declarada, no una medida de la app real.
+func TestGeometriaReglasRelativasDelLayout(t *testing.T) {
+	ref := func(nombre string, id, destino uint32) atributoEscribir {
+		return atributoEscribir{ns: "android", nombre: nombre, id: id, tipo: tipoReferencia, datos: destino}
+	}
+	bandera := func(nombre string, id uint32) atributoEscribir {
+		return atributoEscribir{ns: "android", nombre: nombre, id: id, tipo: tipoBooleano, datos: 1}
+	}
+	hoja := func(id uint32, ancho, alto int, extras ...atributoEscribir) *elementoEscribir {
+		attrs := []atributoEscribir{
+			{ns: "android", nombre: "layout_width", id: idAttrLayoutWidth, tipo: tipoEnteroDec, datos: uint32(ancho)},
+			{ns: "android", nombre: "layout_height", id: idAttrLayoutHeight, tipo: tipoEnteroDec, datos: uint32(alto)},
+		}
+		if id != 0 {
+			attrs = append(attrs, ref("id", idAttrId, id))
+		}
+		return &elementoEscribir{nombre: "View", attrs: append(attrs, extras...)}
+	}
+	layout := documentoAXML{
+		ns:   []declaracionNS{{prefijo: "android", uri: uriAndroid, linea: 2}},
+		utf8: true,
+		raiz: &elementoEscribir{
+			nombre: "RelativeLayout",
+			attrs: []atributoEscribir{
+				{ns: "android", nombre: "layout_width", id: idAttrLayoutWidth, tipo: tipoEnteroDec, datos: 0xffffffff},
+				{ns: "android", nombre: "layout_height", id: idAttrLayoutHeight, tipo: tipoEnteroDec, datos: 0xffffffff},
+			},
+			hijos: []*elementoEscribir{
+				hoja(0x7f030000, 80, 40),
+				hoja(0x7f030002, 50, 40, ref("layout_toLeftOf", idAttrAToLeftOf, 0x7f030001)),
+				hoja(0x7f030001, 60, 40, ref("layout_toRightOf", idAttrAToRightOf, 0x7f030000)),
+				hoja(0x7f030003, 360, 30, ref("layout_below", idAttrALayoutBelow, 0x7f030000)),
+				hoja(0x7f030004, 40, 30, ref("layout_above", idAttrALayoutAbove, 0x7f030005),
+					bandera("layout_centerInParent", idAttrACenterInParent)),
+				hoja(0x7f030005, 40, 30, ref("layout_below", idAttrALayoutBelow, 0x7f030003)),
+				hoja(0x7f030006, 40, 20, bandera("layout_alignParentRight", idAttrAAlignParentRight)),
+				hoja(0x7f030007, 30, 20, ref("layout_below", idAttrALayoutBelow, 0x7f030099)),
+			},
+		},
+	}
+	m, err := modeloVistaDeAPK(apkConLayout(t, layout), "")
+	if err != nil {
+		t.Fatalf("el layout sintético no se dejó leer: %v", err)
+	}
+	porRef := map[string]*nodoVista{}
+	var recorre func(*nodoVista)
+	recorre = func(n *nodoVista) {
+		if n.IDRef != "" {
+			porRef[n.IDRef] = n
+		}
+		for _, h := range n.Hijos {
+			recorre(h)
+		}
+	}
+	recorre(m.Raiz)
+	esperado := map[string]rectVista{
+		"0x7f030000": {X: 0, Y: 0, Ancho: 80, Alto: 40},
+		"0x7f030001": {X: 80, Y: 0, Ancho: 60, Alto: 40}, // toRightOf de a
+		"0x7f030002": {X: 30, Y: 0, Ancho: 50, Alto: 40}, // toLeftOf de b, resuelto en la segunda pasada
+		"0x7f030003": {X: 0, Y: 40, Ancho: 360, Alto: 30},
+		"0x7f030004": {X: 160, Y: 40, Ancho: 40, Alto: 30}, // centro en X, above de f en la segunda pasada
+		"0x7f030005": {X: 0, Y: 70, Ancho: 40, Alto: 30},
+		"0x7f030006": {X: 320, Y: 0, Ancho: 40, Alto: 20}, // alignParentRight
+		"0x7f030007": {X: 0, Y: 0, Ancho: 30, Alto: 20},   // referencia ausente: rect inicial
+	}
+	for id, querido := range esperado {
+		n, ok := porRef[id]
+		if !ok {
+			t.Errorf("falta el nodo con idRef %s", id)
+			continue
+		}
+		if n.Rect != querido {
+			t.Errorf("%s se coloca en %+v: se esperaba %+v", id, n.Rect, querido)
+		}
+	}
 }
