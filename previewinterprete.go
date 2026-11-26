@@ -6758,6 +6758,28 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				nombreClase)
 			return nil, true, nuevaExcepcion("Ljava/lang/ClassNotFoundException;", "%s", nombreClase)
 		}
+	case "getDeclaredMethods":
+		// `Class.getDeclaredMethods` se atiende para el observador de Lifecycle (ClassesInfoCache),
+		// que pregunta por los métodos de una clase y espera un arreglo; con el cero del tipo
+		// reventaba después en `array-length`. Se devuelve un arreglo vacío tipado —aproximación
+		// explícita, sin fabricar ningún `Method`— y el observador termina sin crear un adaptador.
+		// La frontera es estrecha: solo clases sintéticas sin `class_def` en el dex y clases del
+		// framework (`android`/`androidx`), cuyo observador ya modela `getObserverConstructorType`
+		// sin ejecutar el cuerpo del dex. Las clases de la app con `class_def` no se tocan, para no
+		// ocultar sus callbacks reales: caen al camino de la reflexión rechazada.
+		if len(vals) == 0 && es("Ljava/lang/Class;") {
+			descriptor := claseDeLiteral(obj)
+			if descriptor != "" && m.prog != nil {
+				sinDef := m.prog.clases[descriptor] == nil
+				delFramework := strings.HasPrefix(descriptor, "Landroid/") ||
+					strings.HasPrefix(descriptor, "Landroidx/")
+				if sinDef || delFramework {
+					m.avisa("getDeclaredMethods(%s): observador sin métodos consultables; se devuelve un arreglo vacío de Method (aproximación)",
+						descriptor)
+					return &arregloDalvik{tipo: "[Ljava/lang/reflect/Method;", datos: []any{}}, true, nil
+				}
+			}
+		}
 	case "getMethod", "getDeclaredMethod", "newInstance", "invoke":
 		// el resto de la reflexión sigue FUERA del subconjunto: `getDeclaredConstructor`,
 		// `isAccessible`/`setAccessible` y los `Field`/`Method` de ActivityRecreator tampoco

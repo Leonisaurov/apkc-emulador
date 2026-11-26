@@ -850,6 +850,87 @@ func TestForNameNoAbreLaReflexionRestante(t *testing.T) {
 	}
 }
 
+// TestMetodosVaciosDelObservadorSinClassDef fija el stub de `Class.getDeclaredMethods`: para una
+// clase sintética sin `class_def` en el dex devuelve un arreglo vacío tipado, con aviso explícito de
+// aproximación y sin fabricar ningún `Method`. Es lo que deja a `ClassesInfoCache.hasLifecycleMethods`
+// escribir `false` sin llegar al `array-length` de un registro nulo.
+func TestMetodosVaciosDelObservadorSinClassDef(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	m.avisos = nil
+	m.vistos = map[string]bool{}
+	sintetica := &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+		"Ljava/lang/Class;.$tipo": "Landroidx/activity46ComponentActivity$2_LifecycleAdapter;",
+	}}
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "getDeclaredMethods",
+		"()[Ljava/lang/reflect/Method;", nil, sintetica)
+	if err != nil || !ok {
+		t.Fatalf("getDeclaredMethods sobre una clase sintética: ok=%v err=%v", ok, err)
+	}
+	arr, ok := v.(*arregloDalvik)
+	if !ok || arr == nil {
+		t.Fatalf("se esperaba un arreglo y llegó %T (%v)", v, v)
+	}
+	if arr.tipo != "[Ljava/lang/reflect/Method;" {
+		t.Errorf("el arreglo es %q y tenía que ser [Ljava/lang/reflect/Method;", arr.tipo)
+	}
+	if len(arr.datos) != 0 {
+		t.Errorf("el arreglo trae %d elementos y tenía que estar vacío (no se fabrica Method)", len(arr.datos))
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "getDeclaredMethods") || !strings.Contains(avisos, "aproximación") {
+		t.Errorf("el aviso %q no nombra el stub y la aproximación", avisos)
+	}
+}
+
+// TestMetodosDeClaseDelDexNoSeStubbean comprueba la frontera: una clase con `class_def` en el dex
+// NO recibe el arreglo vacío, para no ocultar los callbacks reales que la app haya escrito.
+func TestMetodosDeClaseDelDexNoSeStubbean(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	m.avisos = nil
+	m.vistos = map[string]bool{}
+	conDef := &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+		"Ljava/lang/Class;.$tipo": "Lcom/godot/game/GodotApp;",
+	}}
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "getDeclaredMethods",
+		"()[Ljava/lang/reflect/Method;", nil, conDef)
+	if err != nil {
+		t.Fatalf("getDeclaredMethods sobre una clase del dex lanzó %v", err)
+	}
+	if ok && v != nil {
+		t.Errorf("la clase del dex recibió el arreglo vacío: %v", v)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos, "aproximación") {
+		t.Errorf("la clase del dex se stubbeó con aviso de aproximación: %s", avisos)
+	}
+}
+
+// TestMetodosDelObservadorDelFrameworkConClassDev fija la otra mitad de la frontera: el observador
+// anónimo de AndroidX sí tiene `class_def` en el dex, pero su notificación ya la modela
+// `getObserverConstructorType`. Se devuelve el arreglo vacío sin fabricar `Method` ni adaptador.
+func TestMetodosDelObservadorDelFrameworkConClassDev(t *testing.T) {
+	m := maquinaConTiposDeForName()
+	m.avisos = nil
+	m.vistos = map[string]bool{}
+	framework := &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+		"Ljava/lang/Class;.$tipo": "Landroidx/activity/ComponentActivity$2;",
+	}}
+	v, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "getDeclaredMethods",
+		"()[Ljava/lang/reflect/Method;", nil, framework)
+	if err != nil || !ok {
+		t.Fatalf("getDeclaredMethods sobre el observador de AndroidX: ok=%v err=%v", ok, err)
+	}
+	arr, ok := v.(*arregloDalvik)
+	if !ok || arr == nil {
+		t.Fatalf("se esperaba un arreglo y llegó %T (%v)", v, v)
+	}
+	if arr.tipo != "[Ljava/lang/reflect/Method;" || len(arr.datos) != 0 {
+		t.Errorf("el arreglo es %v con %d elementos y tenía que estar vacío y tipado", arr.tipo, len(arr.datos))
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "aproximación") {
+		t.Errorf("el aviso %q no declara la aproximación", avisos)
+	}
+}
+
 // TestLifecycleElPoolFijoDevuelveUnEjecutor añade `newFixedThreadPool` a la familia de ejecutores:
 // recibe argumentos (a diferencia de los otros dos) y por eso la condición de aridad tuvo que
 // ampliarse. Sin esto, NewPipe y Libre Memory Game seguían con un ExecutorService nulo.
