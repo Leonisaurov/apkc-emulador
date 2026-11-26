@@ -6885,6 +6885,24 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 				"Ljava/lang/Class;.$tipo": obj.clase,
 			}}, true, nil
 		}
+	case "getInterfaces", "getDeclaredMethods":
+		// `ClassesInfoCache.createInfo` (AndroidX Lifecycle) recorre los interfaces y los métodos
+		// declarados del observador. El cero de `[Ljava/lang/Class;` y de
+		// `[Ljava/lang/reflect/Method;` llegaba nulo al `array-length` siguiente de ESE cuerpo —que
+		// sí está en el dex de NewPipe— y cortaba la ejecución en el paso 517. La vista previa no
+		// tiene la reflexión de la JVM: devuelve el arreglo VACÍO NO NULO y avisa, sin inventar
+		// interfaces ni métodos. Un receptor nulo sigue cortando en `invoca` antes de llegar aquí.
+		if len(vals) == 0 && obj != nil && es("Ljava/lang/Class;") {
+			retorno := "()[Ljava/lang/reflect/Method;"
+			if nombre == "getInterfaces" {
+				retorno = "()[Ljava/lang/Class;"
+			}
+			if proto == retorno {
+				m.avisa("%s.%s: la vista previa no tiene reflexión; se devuelve un arreglo vacío no nulo (aproximación)",
+					claseCorta(obj.clase), nombre)
+				return &arregloDalvik{tipo: strings.TrimPrefix(retorno, "()"), datos: []any{}}, true, nil
+			}
+		}
 	case "getObserverConstructorType":
 		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
 		// lifecycle: 1 es el constructor por reflexión, 2 el adaptador generado. El cuerpo del dex

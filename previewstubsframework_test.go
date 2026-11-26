@@ -1052,6 +1052,63 @@ func TestInertesRetornoArregloEsVacio(t *testing.T) {
 	}
 }
 
+// TestClasesReflexionDevuelvenArregloVacio comprueba los dos arreglos que `ClassesInfoCache.createInfo`
+// lee en el dex de NewPipe: getInterfaces y getDeclaredMethods devuelven un arreglo vacío NO nulo,
+// `array-length` da cero y el aviso dice que es una aproximación. El guardián de receptor nulo de
+// `invoca` sigue cortando antes de llegar al stub.
+func TestClasesReflexionDevuelvenArregloVacio(t *testing.T) {
+	casos := []struct {
+		nombre string
+		proto  string
+		tipo   string
+	}{
+		{"getInterfaces", "()[Ljava/lang/Class;", "[Ljava/lang/Class;"},
+		{"getDeclaredMethods", "()[Ljava/lang/reflect/Method;", "[Ljava/lang/reflect/Method;"},
+	}
+	for _, caso := range casos {
+		t.Run(caso.nombre, func(t *testing.T) {
+			m := maquinaDeStubs()
+			m.prog = &programaDalvik{clases: map[string]*claseDalvik{}}
+			clase := objDe("Ljava/lang/Class;")
+			clase.campos["Ljava/lang/Class;.$tipo"] = "Landroidx/activity/ComponentActivity$$ExternalSyntheticLambda3;"
+			arreglo := mustStub(t, m, []string{"Ljava/lang/Class;"}, caso.nombre, caso.proto, nil, clase)
+			a, ok := arreglo.(*arregloDalvik)
+			if !ok || a == nil {
+				t.Fatalf("el retorno es %T y se esperaba un arreglo", arreglo)
+			}
+			if a.tipo != caso.tipo {
+				t.Errorf("el tipo es %q y se esperaba %q", a.tipo, caso.tipo)
+			}
+			if a.datos == nil || len(a.datos) != 0 {
+				t.Errorf("el arreglo lleva %v y se esperaban cero huecos no nulos", a.datos)
+			}
+			if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, caso.nombre) ||
+				!strings.Contains(avisos, "aproximación") {
+				t.Errorf("el aviso de aproximación falta en %q", avisos)
+			}
+			// `array-length v0, v1` seguido de `return v0`, como en createInfo
+			met := unMetodoDePrueba("longitud", &codeItem{registersSize: 2, insSize: 1, insnsSize: 2,
+				insns: []uint16{0x1021, 0x000f}})
+			n, err := m.ejecutaCuerpo("Lcom/prueba/A;", met, []any{a}, []string{caso.tipo})
+			if err != nil {
+				t.Fatalf("array-length sobre el arreglo de reflexión falló: %v", err)
+			}
+			if n != int32(0) {
+				t.Errorf("array-length devolvió %v y se esperaba 0", n)
+			}
+		})
+	}
+	m := maquinaDeStubs()
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Ljava/lang/Class;", name: "getInterfaces",
+		proto: dexProto{returnType: "[Ljava/lang/Class;"},
+	}}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "")
+	if err == nil || !strings.Contains(err.Error(), "java.lang.Class.getInterfaces sobre un objeto nulo") {
+		t.Errorf("getInterfaces con receptor nulo dio %v y se esperaba el error del guardián", err)
+	}
+}
+
 // TestInertesCuentaUnaVezAvisosRecortadosRepetidos falsifica el doble conteo: un aviso distinto que
 // no cupo se marca como visto, así que cien llamadas al mismo método recortado cuentan UNO y no cien.
 func TestInertesCuentaUnaVezAvisosRecortadosRepetidos(t *testing.T) {
