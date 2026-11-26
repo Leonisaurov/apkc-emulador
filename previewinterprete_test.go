@@ -2247,23 +2247,37 @@ func TestArraycopyCopiaYRango(t *testing.T) {
 // que se le pasen. El texto «cadena final» vive en el pool global, no en el nombre del recurso.
 func tablaDeReferenciasDePrueba(t *testing.T, entradas []entradaEscribir) *tablaRecursos {
 	t.Helper()
+	return tablaDeReferenciasDePruebaConTipo(t, 1, entradas)
+}
+
+// tablaDeReferenciasDePruebaConTipo permite escribir la tabla con un id de tipo distinto: el id
+// completo de NewPipe (0x7f1300e9) exige el tipo 0x13 y la entrada 0xe9.
+func tablaDeReferenciasDePruebaConTipo(t *testing.T, idTipo byte, entradas []entradaEscribir) *tablaRecursos {
+	t.Helper()
 	claves := make([]string, len(entradas))
 	banderas := make([]uint32, len(entradas))
 	for i := range entradas {
 		claves[i] = fmt.Sprintf("clave%d", i)
 		banderas[i] = 0x0004
 	}
+	// el escritor exige un nombre de tipo por cada id hasta el que se pide: el tipo 0x13
+	// (19) necesita 19 celdas, y el nombre real va en la última.
+	nombresTipo := make([]string, idTipo)
+	for i := range nombresTipo {
+		nombresTipo[i] = fmt.Sprintf("tipo%d", i+1)
+	}
+	nombresTipo[idTipo-1] = "string"
 	tb := tablaEscribir{
 		idPaquete:     0x7f,
 		nombrePaquete: "com.hola.referencias",
 		global:        []string{"cadena final", "intermedia"},
 		globalUTF8:    true,
-		nombresTipo:   []string{"string"},
+		nombresTipo:   nombresTipo,
 		nombresUTF8:   false,
 		claves:        claves,
 		clavesUTF8:    true,
 		tipos: []tipoEscribir{{
-			id:        1,
+			id:        idTipo,
 			specFlags: banderas,
 			bloques:   []bloqueEscribir{{entradas: entradas}},
 		}},
@@ -2354,5 +2368,36 @@ func TestReferenciaIdInexistenteConservaElError(t *testing.T) {
 	}
 	if quiero := "getString(2131951849): la tabla no resuelve ese id como una cadena"; err.Error() != quiero {
 		t.Errorf("error=%q, se esperaba %q", err.Error(), quiero)
+	}
+}
+
+// TestReferenciaProfundidadMaximaConservaElError falsifica el guardián de previewinterprete.go:1523
+// con doce referencias encadenadas, más que los ocho que permite profundidadMaxima. La última entrada
+// sí es una cadena: sin el corte se devolvería, así que el test solo pasa si la profundidad para.
+func TestReferenciaProfundidadMaximaConservaElError(t *testing.T) {
+	const idNewPipe uint32 = 0x7f1300e9
+	const indiceInicial = 0xe9
+	const saltos = 12
+
+	entradas := make([]entradaEscribir, indiceInicial+1)
+	for i := range entradas {
+		entradas[i] = entradaEscribir{clave: i, valor: valorEscribir{tipo: tipoCadena, datos: 0}}
+	}
+	for k := 0; k < saltos; k++ {
+		actual := indiceInicial - k
+		entradas[actual].valor = valorEscribir{tipo: tipoReferencia, datos: 0x7f130000 | uint32(actual-1)}
+	}
+	tr := tablaDeReferenciasDePruebaConTipo(t, 0x13, entradas)
+	m := &maquinaDalvik{tabla: tr, actividad: &objetoDalvik{
+		clase: "Lcom/hola/referencias/MainActivity;", campos: map[string]any{}}}
+
+	if texto, ok := m.textoDeId(int32(idNewPipe)); ok || texto != "" {
+		t.Errorf("una cadena de %d referencias devolvió %q (ok=%v), y debe cortar sin texto", saltos, texto, ok)
+	}
+	_, ok, err := m.intentaStub([]string{"Lcom/hola/referencias/MainActivity;"}, "getString",
+		"(I)Ljava/lang/String;", []any{int32(idNewPipe)}, m.actividad)
+	quiero := "getString(2131951849): la tabla no resuelve ese id como una cadena"
+	if err == nil || !ok || err.Error() != quiero {
+		t.Errorf("getString dio ok=%v err=%v; se esperaba %q", ok, err, quiero)
 	}
 }
