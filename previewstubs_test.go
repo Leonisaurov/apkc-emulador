@@ -978,3 +978,22 @@ func TestPreviewBooleanValueOfGuardaElBit(t *testing.T) {
 		t.Errorf("booleanValue sobre un receptor nulo: ok=%v err=%v", ok, err)
 	}
 }
+
+// TestBindServiceNoAtiendeReceptorNulo comprueba que los stubs nuevos no relajan el guardián de
+// `invoca`: con el receptor nulo `intentaStub` no responde, así que la llamada corta con el error
+// «se llamó a … sobre un objeto nulo» antes de llegar al stub.
+func TestBindServiceNoAtiendeReceptorNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	conexion := objDe("Landroid/content/ServiceConnection;")
+	if v, ok, err := m.intentaStub([]string{"Landroid/content/Context;"}, "bindService",
+		"(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z",
+		[]any{objDe("Landroid/content/Intent;"), conexion, int32(1)}, nil); ok || err != nil || v != nil {
+		t.Errorf("bindService sobre un receptor nulo: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if v, ok, err := m.intentaStub([]string{"Landroid/content/ServiceConnection;"},
+		"onServiceConnected", "(Landroid/content/ComponentName;Landroid/os/IBinder;)V",
+		[]any{objDe("Landroid/content/ComponentName;"), objDe("Landroid/os/IBinder;")}, nil);
+		ok || err != nil || v != nil {
+		t.Errorf("onServiceConnected sobre un receptor nulo: v=%v ok=%v err=%v", v, ok, err)
+	}
+}

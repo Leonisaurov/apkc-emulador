@@ -2121,3 +2121,92 @@ func TestLayoutParamsPuestosPorLaApp(t *testing.T) {
 		t.Errorf("no debería haber aviso de aproximación: %v", m.avisos)
 	}
 }
+
+// TestBindServiceInerteParaTermux falsifica la frontera de §377: sin stub, `bindService` devolvía
+// el cero de Z y `TermuxActivity.onCreate` lanzaba «bindService() failed». Con el stub devuelve
+// verdadero, registra la conexión y deja un aviso de aproximación; `unbindService` la olvida.
+func TestBindServiceInerteParaTermux(t *testing.T) {
+	m := maquinaDeStubs()
+	actividad := objDe("Lcom/termux/app/TermuxActivity;")
+	m.actividad = actividad
+	intento := objDe("Landroid/content/Intent;")
+	conexion := actividad // Termux se entrega a sí mismo: implementa ServiceConnection.
+
+	candidatos := []string{"Lcom/termux/app/TermuxActivity;", "Landroid/app/Activity;"}
+	v, ok, err := m.intentaStub(candidatos, "bindService",
+		"(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z",
+		[]any{intento, conexion, int32(1)}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("bindService: ok=%v err=%v", ok, err)
+	}
+	if v != int32(1) {
+		t.Errorf("bindService devolvió %v y se esperaba verdadero", v)
+	}
+	if len(m.conexiones) != 1 || m.conexiones[0] != conexion {
+		t.Fatalf("la conexión no quedó registrada: %v", m.conexiones)
+	}
+	if _, ligada := conexion.campos[conexionLigada]; !ligada {
+		t.Error("la conexión registrada no lleva la marca de ligada")
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "bindService-inerte") {
+		t.Errorf("falta el aviso de aproximación: %v", m.avisos)
+	}
+	if strings.Contains(avisos, "no está en el dex ni en los stubs") {
+		t.Errorf("bindService cayó en el aviso de stub ausente: %v", m.avisos)
+	}
+
+	// Desligar no falla y limpia el registro; no hay servicio real que detener.
+	v, ok, err = m.intentaStub(candidatos, "unbindService",
+		"(Landroid/content/ServiceConnection;)V", []any{conexion}, actividad)
+	if err != nil || !ok || v != nil {
+		t.Fatalf("unbindService: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if len(m.conexiones) != 0 {
+		t.Errorf("unbindService no olvidó la conexión: %v", m.conexiones)
+	}
+	if _, ligada := conexion.campos[conexionLigada]; ligada {
+		t.Error("unbindService no quitó la marca de ligada")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "unbindService-inerte") {
+		t.Errorf("falta el aviso de desligado inerte: %v", m.avisos)
+	}
+}
+
+// TestCallbacksDeServiceConnectionInertes comprueba que los dos callbacks se atienden sin servicio
+// detrás, tanto sobre un ServiceConnection del framework como sobre uno registrado por bindService.
+func TestCallbacksDeServiceConnectionInertes(t *testing.T) {
+	m := maquinaDeStubs()
+	conexion := objDe("Landroid/content/ServiceConnection;")
+	componente := objDe("Landroid/content/ComponentName;")
+	binder := objDe("Landroid/os/IBinder;")
+
+	casos := []struct {
+		nombre string
+		proto  string
+		vals   []any
+	}{
+		{"onServiceConnected", "(Landroid/content/ComponentName;Landroid/os/IBinder;)V",
+			[]any{componente, binder}},
+		{"onServiceDisconnected", "(Landroid/content/ComponentName;)V", []any{componente}},
+	}
+	for _, c := range casos {
+		v, ok, err := m.intentaStub([]string{"Landroid/content/ServiceConnection;"}, c.nombre,
+			c.proto, c.vals, conexion)
+		if err != nil || !ok || v != nil {
+			t.Errorf("%s: v=%v ok=%v err=%v", c.nombre, v, ok, err)
+		}
+	}
+	// La conexión ligada por bindService se reconoce por la marca, no solo por su clase.
+	m.registraConexion(conexion)
+	if v, ok, err := m.intentaStub([]string{"Lcom/termux/app/TermuxActivity;"},
+		"onServiceDisconnected", "(Landroid/content/ComponentName;)V", []any{componente}, conexion);
+		err != nil || !ok || v != nil {
+		t.Errorf("onServiceDisconnected sobre la conexión ligada: v=%v ok=%v err=%v", v, ok, err)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "onServiceConnected-inerte") ||
+		!strings.Contains(avisos, "onServiceDisconnected-inerte") {
+		t.Errorf("faltan los avisos de los callbacks: %v", m.avisos)
+	}
+}

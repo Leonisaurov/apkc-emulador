@@ -574,6 +574,10 @@ type maquinaDalvik struct {
 	avisosRecortados int
 	layoutID         uint32
 	oyentes          []oyenteRegistrado
+	// conexiones son los ServiceConnection que `bindService` registró. La vista previa no levanta
+	// servicios: solo guarda la referencia para que `unbindService` y los callbacks hablen del mismo
+	// objeto, sin inventar un Servicio ni un IBinder reales.
+	conexiones []*objetoDalvik
 	// las listas que `setAdapter` dejó armadas y los `OnItemClickListener` que se registraron
 	// sobre ellas: es lo que convierte `--pulsar id/lista:fila` en un clic por posición.
 	listas      []*objetoDalvik
@@ -4746,6 +4750,52 @@ func nombreInerte(candidatos []string, obj *objetoDalvik, nombre string) string 
 	return nombre
 }
 
+// conexionLigada marca el ServiceConnection que `bindService` registró. No lleva contenido: solo
+// distingue la conexión viva de un objeto del mismo tipo que nadie ligó.
+const conexionLigada = "emulador.conexionLigada"
+
+// registraConexion guarda el ServiceConnection entregado a bindService. No hay servicio detrás: la
+// referencia mantiene la identidad para que un desligado o un callback reconozcan el mismo objeto.
+func (m *maquinaDalvik) registraConexion(conexion *objetoDalvik) {
+	if conexion == nil {
+		return
+	}
+	for _, registrada := range m.conexiones {
+		if registrada == conexion {
+			return
+		}
+	}
+	m.conexiones = append(m.conexiones, conexion)
+	conexion.campos[conexionLigada] = true
+}
+
+// desregistraConexion quita la marca y la referencia de un ServiceConnection ligado. Sigue siendo
+// inerte: no se detiene ningún servicio ni se notifica a la app.
+func (m *maquinaDalvik) desregistraConexion(conexion *objetoDalvik) {
+	if conexion == nil {
+		return
+	}
+	delete(conexion.campos, conexionLigada)
+	for i, registrada := range m.conexiones {
+		if registrada == conexion {
+			m.conexiones = append(m.conexiones[:i], m.conexiones[i+1:]...)
+			return
+		}
+	}
+}
+
+// esConexionServicio reconoce un ServiceConnection por la marca que puso bindService o por su tipo
+// del framework, para atender los callbacks sin fabricar un servicio.
+func esConexionServicio(obj *objetoDalvik) bool {
+	if obj == nil {
+		return false
+	}
+	if _, ligada := obj.campos[conexionLigada]; ligada {
+		return true
+	}
+	return strings.HasSuffix(obj.clase, "Landroid/content/ServiceConnection;")
+}
+
 // intentaStub resuelve las llamadas de framework que la app toca. `candidatos` son las clases por
 // las que se busca (la del objeto, la que declara el método); los sufijos bastan porque lo que
 // distingue un `setText` es el nombre y su firma, no la jerarquía entera del framework.
@@ -5148,6 +5198,42 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		if len(vals) == 2 && esContexto() {
 			return &objetoDalvik{clase: "Landroid/content/Context;",
 				campos: map[string]any{"esContexto": true}}, true, nil
+		}
+	case "bindService":
+		// Termux encadena `startService` con `bindService` y lanza un RuntimeException si la
+		// ligadura devuelve falso (dexdump de classes20.dex, TermuxActivity.onCreate). La vista
+		// previa no levanta servicios ni despacha el Intent: registra la conexión y devuelve
+		// verdadero. El aviso deja claro que es una aproximación, no un servicio real.
+		if obj != nil && proto == "(Landroid/content/Intent;Landroid/content/ServiceConnection;I)Z" &&
+			len(vals) == 3 && (esContexto() || es("Landroid/content/Context;", "Landroid/app/Activity;")) {
+			conexion, _ := vals[1].(*objetoDalvik)
+			m.registraConexion(conexion)
+			m.avisa("bindService-inerte: Context.bindService devuelve verdadero y registra la conexión " +
+				"sin iniciar ningún servicio real")
+			return int32(1), true, nil
+		}
+	case "unbindService":
+		// El desligado es inerte: olvida la referencia registrada, sin detener nada ni avisar a la
+		// app. Si la conexión no estaba ligada, no hay nada que quitar y la llamada también termina
+		// sin efecto.
+		if obj != nil && proto == "(Landroid/content/ServiceConnection;)V" && len(vals) == 1 &&
+			(esContexto() || es("Landroid/content/Context;", "Landroid/app/Activity;")) {
+			conexion, _ := vals[0].(*objetoDalvik)
+			m.desregistraConexion(conexion)
+			m.avisa("unbindService-inerte: Context.unbindService olvida la conexión sin detener ningún servicio")
+			return nil, true, nil
+		}
+	case "onServiceConnected", "onServiceDisconnected":
+		// Los callbacks de un ServiceConnection del framework no tienen servicio detrás: se aceptan
+		// y devuelven el cero de V. Si la app implementa la interfaz en el dex, su método propio gana
+		// en `invoca` y este stub no se alcanza.
+		if esConexionServicio(obj) &&
+			((nombre == "onServiceConnected" &&
+				proto == "(Landroid/content/ComponentName;Landroid/os/IBinder;)V" && len(vals) == 2) ||
+				(nombre == "onServiceDisconnected" &&
+					proto == "(Landroid/content/ComponentName;)V" && len(vals) == 1)) {
+			m.avisa("%s-inerte: el ServiceConnection no tiene ningún servicio real detrás", nombre)
+			return nil, true, nil
 		}
 	case "checkSelfPermission":
 		// La ROM tiene un solo usuario y deniega por defecto: PERMISSION_DENIED es -1 en Android y
