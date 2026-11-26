@@ -69,6 +69,9 @@ const (
 	// TYPE_INT_COLOR_RGB8: lo que aapt2 escribe para un `#rrggbb` de res/values/colors.xml
 	// (medido con aapt2 dump resources sobre `<color name="probe">#336699</color>`)
 	tipoColorRGB8 byte = 0x1d
+	// TYPE_ATTRIBUTE: la forma en que aapt2 compila `?attr/x` dentro de un estilo. El dato es el id
+	// del atributo, igual que en TYPE_REFERENCE, pero hasta ahora se trataba como tipo desconocido.
+	tipoAtributo byte = 0x02
 )
 
 // Valores de View.VISIBLE, View.INVISIBLE y View.GONE, que son los que el enlazador escribe como
@@ -117,6 +120,14 @@ const (
 	idColorBlanco       = 0x0106000b
 	idColorNegro        = 0x0106000c
 	idColorTransparente = 0x0106000d
+	// Los cuatro atributos propios que el manifiesto del gestor elige para su tema. Los confirmó
+	// `apkanalyzer manifest print` (tema 0x7f050000) y `aapt2 dump resources` sobre ese APK:
+	// background=#ff2c2c2c, buttonBackground=#ff5f5f5f, foreground=#ffededed y
+	// topbarbg=#ff3c3c3c. Se buscan por id, no por nombre, como el resto de atributos del tema.
+	idAtributoFondoApp  = 0x7f010000 // background
+	idAtributoBotonApp  = 0x7f010001 // buttonBackground
+	idAtributoTextoApp  = 0x7f010002 // foreground
+	idAtributoBarraApp  = 0x7f010003 // topbarbg
 )
 
 // pixelesDeImagenMaximos es el máximo que se vuelca de un PNG: una imagen mayor se recorta para que
@@ -254,8 +265,10 @@ type referenciaRelativa struct {
 // campo nuevo del JSON: se copian a `color` y `fondo`, que el modelo ya traía para lo declarado en el
 // layout y en un `@style` propio. El tema es el defecto; lo que la vista declara gana siempre.
 type coloresTema struct {
-	Texto string
-	Fondo string
+	Texto string // foreground: el color de las vistas que muestran texto
+	Fondo string // background: el fondo de la pantalla
+	Boton string // buttonBackground: el fondo de los botones
+	Barra string // topbarbg: el fondo de la barra superior
 }
 
 // estaOculta: `gone` no se mide ni se coloca; `invisible` sí ocupa su sitio.
@@ -2471,10 +2484,11 @@ func colorDelFramework(id uint32) (string, bool) {
 	return "", false
 }
 
-// coloresDelTema resuelve texto y fondo del estilo de tema de la app. Los ítems se leen por id de
-// atributo (`valoresDeEstilo`), nunca por nombre: así un `m3_`/`abc_` ofuscado se resuelve igual que
-// un `AppTheme` legible. Una referencia se sigue primero dentro del propio estilo —es lo que hace
-// `?attr/…`— y después en la tabla de recursos.
+// coloresDelTema resuelve los colores del estilo de tema de la app: texto, fondo, botones y barra
+// superior. Los ítems se leen por id de atributo (`valoresDeEstilo`), nunca por nombre: así un
+// `m3_`/`abc_` ofuscado se resuelve igual que un `AppTheme` legible, y los cuatro atributos propios
+// del gestor se encuentran aunque el nombre esté ofuscado. Una referencia (TYPE_REFERENCE) o un
+// `?attr/…` (TYPE_ATTRIBUTE) se siguen primero dentro del propio estilo y después en la tabla.
 func (c *contextoVista) coloresDelTema(id uint32) coloresTema {
 	salida := coloresTema{}
 	if id == 0 || c == nil || c.tabla == nil {
@@ -2497,7 +2511,9 @@ func (c *contextoVista) coloresDelTema(id uint32) coloresTema {
 			if col, ok := colorDeCadena(c.resuelve(v, c.tabla.global.cadenas, 0)); ok {
 				return col
 			}
-		case tipoReferencia:
+		case tipoReferencia, tipoAtributo:
+			// TYPE_ATTRIBUTE es un `?attr/x`: apunta al id del atributo, que en el estilo se
+			// resuelve primero a su literal (`foreground` → #ffededed) y después en la tabla.
 			if enCurso[v.datos] {
 				return ""
 			}
@@ -2517,16 +2533,37 @@ func (c *contextoVista) coloresDelTema(id uint32) coloresTema {
 		}
 		return ""
 	}
-	if v, ok := items[idAtributoTextoTema]; ok {
-		salida.Texto = colorDeItem(v, 0)
+	// Primero los atributos propios del tema de la app: el gestor nombra sus cuatro colores con
+	// ids de su paquete, no con los del framework. Un `?attr/x` compilado como TYPE_ATTRIBUTE se
+	// resuelve aquí al literal que el mismo estilo declara.
+	for _, buscado := range []struct {
+		id   uint32
+		dest *string
+	}{
+		{idAtributoTextoApp, &salida.Texto},
+		{idAtributoFondoApp, &salida.Fondo},
+		{idAtributoBotonApp, &salida.Boton},
+		{idAtributoBarraApp, &salida.Barra},
+	} {
+		if v, ok := items[buscado.id]; ok {
+			*buscado.dest = colorDeItem(v, 0)
+		}
+	}
+	// Después los atributos del framework, para los temas que solo declaran esos.
+	if salida.Texto == "" {
+		if v, ok := items[idAtributoTextoTema]; ok {
+			salida.Texto = colorDeItem(v, 0)
+		}
 	}
 	if salida.Texto == "" {
 		if v, ok := items[idVistaTextColor]; ok {
 			salida.Texto = colorDeItem(v, 0)
 		}
 	}
-	if v, ok := items[idAtributoFondoTema]; ok {
-		salida.Fondo = colorDeItem(v, 0)
+	if salida.Fondo == "" {
+		if v, ok := items[idAtributoFondoTema]; ok {
+			salida.Fondo = colorDeItem(v, 0)
+		}
 	}
 	if salida.Fondo == "" {
 		if v, ok := items[idAtributoFondoVentana]; ok {
@@ -2536,18 +2573,34 @@ func (c *contextoVista) coloresDelTema(id uint32) coloresTema {
 	return salida
 }
 
-// aplicaColoresDelTema rellena `fondo` en la raíz —es el windowBackground del decor— y `color` en
-// las vistas que pueden mostrar texto, incluidas las filas que el adaptador acaba de devolver. Un
-// nodo que ya declare color o fondo, en el layout o en su `@style` propio, conserva lo que declara.
+// aplicaColoresDelTema rellena `fondo` en la raíz —es el background del decor—, `color` en las vistas
+// que pueden mostrar texto, incluidas las filas que el adaptador acaba de devolver, y el fondo de
+// botones y barra superior con `buttonBackground` y `topbarbg`. Un nodo que ya declare color o fondo,
+// en el layout o en su `@style` propio, conserva lo que declara. Los cuatro colores salen del estilo
+// que eligió el manifiesto: aquí no se inventa ninguno.
 func aplicaColoresDelTema(n *nodoVista, c coloresTema, raiz bool) {
-	if n == nil || (c.Texto == "" && c.Fondo == "") {
+	if n == nil || (c.Texto == "" && c.Fondo == "" && c.Boton == "" && c.Barra == "") {
 		return
 	}
-	if raiz && n.Fondo == "" && c.Fondo != "" {
-		n.Fondo = c.Fondo
+	if raiz {
+		if n.Fondo == "" && c.Fondo != "" {
+			n.Fondo = c.Fondo
+		}
+		// `topbarbg` pinta la barra superior. El modelo no tiene un rol «barra», así que se toma el
+		// primer hijo de la raíz que empieza arriba, ocupa todo el ancho y tiene hijos (en el gestor
+		// es `id/header`). No se elige por nombre: se elige por lo que el modelo ya midió.
+		if c.Barra != "" && len(n.Hijos) > 0 {
+			if barra := n.Hijos[0]; barra.Fondo == "" && barra.Rect.Y == 0 &&
+				barra.Rect.Ancho*2 >= n.Rect.Ancho && len(barra.Hijos) > 0 {
+				barra.Fondo = c.Barra
+			}
+		}
 	}
 	if n.Color == "" && c.Texto != "" && muestraTexto(n.Tipo) {
 		n.Color = c.Texto
+	}
+	if n.Fondo == "" && c.Boton != "" && strings.HasSuffix(n.Tipo, "Button") {
+		n.Fondo = c.Boton
 	}
 	for _, h := range n.Hijos {
 		aplicaColoresDelTema(h, c, false)

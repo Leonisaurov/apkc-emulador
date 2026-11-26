@@ -411,3 +411,67 @@ func TestElModeloNoInventaColorSinTema(t *testing.T) {
 	}
 	recorre(modelo.Raiz)
 }
+
+// TestTemaColoresPropiosDelGestor falsa la lectura de los cuatro atributos que el manifiesto del
+// gestor elige para su tema. El estilo declara background, buttonBackground y topbarbg como
+// literales y el texto como `?attr/foreground` (TYPE_ATTRIBUTE), que debe resolverse al literal del
+// atributo propio. Ningún color se inventa: los cuatro salen de la tabla escrita aquí.
+func TestTemaColoresPropiosDelGestor(t *testing.T) {
+	tabla := tablaEscribir{
+		idPaquete:     0x7f,
+		nombrePaquete: "com.martinmimigames.simplefileexplorer",
+		global:        []string{"", "0x7f010002"},
+		globalUTF8:    true,
+		nombresTipo:   []string{"attr", "style"},
+		claves:        []string{"fondo", "boton", "texto", "barra", "tema"},
+		clavesUTF8:    true,
+		tipos: []tipoEscribir{
+			{id: 1, specFlags: []uint32{0, 0, 0, 0}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 0, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff2c2c2c}},
+				{clave: 1, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff5f5f5f}},
+				{clave: 2, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xffededed}},
+				{clave: 3, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff3c3c3c}},
+			}}}},
+			{id: 2, specFlags: []uint32{0}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 4, flags: 0x0001, compleja: true, registros: []registroEscribir{
+					{nombre: idAtributoFondoApp, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff2c2c2c}},
+					{nombre: idAtributoBotonApp, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff5f5f5f}},
+					{nombre: idVistaTextColor, valor: valorEscribir{tipo: tipoAtributo, datos: idAtributoTextoApp}},
+					{nombre: idAtributoBarraApp, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff3c3c3c}},
+				}},
+			}}}},
+		},
+	}
+	arsc, err := escribeTablaRecursos(tabla)
+	if err != nil {
+		t.Fatalf("la tabla con el tema: %v", err)
+	}
+	leida, err := leeTabla(arsc)
+	if err != nil {
+		t.Fatalf("la tabla escrita no se lee: %v", err)
+	}
+	ctx := &contextoVista{tabla: leida}
+	colores := ctx.coloresDelTema(0x7f020000)
+	if colores.Fondo != "#2c2c2c" || colores.Boton != "#5f5f5f" ||
+		colores.Texto != "#ededed" || colores.Barra != "#3c3c3c" {
+		t.Fatalf("los cuatro colores del tema no se resolvieron: %+v", colores)
+	}
+
+	barra := &nodoVista{Tipo: "RelativeLayout", Rect: rectVista{X: 0, Y: 0, Ancho: 360, Alto: 68},
+		Hijos: []*nodoVista{{Tipo: "Button"}}}
+	raiz := &nodoVista{Tipo: "RelativeLayout", Rect: rectVista{Ancho: 360, Alto: 640},
+		Hijos: []*nodoVista{barra, {Tipo: "TextView"}}}
+	aplicaColoresDelTema(raiz, colores, true)
+	if raiz.Fondo != "#2c2c2c" {
+		t.Errorf("el fondo de la pantalla no llegó a la raíz: %q", raiz.Fondo)
+	}
+	if barra.Fondo != "#3c3c3c" {
+		t.Errorf("el topbarbg no llegó a la barra superior: %q", barra.Fondo)
+	}
+	if texto := raiz.Hijos[1]; texto.Color != "#ededed" {
+		t.Errorf("el foreground no llegó al TextView: %q", texto.Color)
+	}
+	if boton := barra.Hijos[0]; boton.Fondo != "#5f5f5f" {
+		t.Errorf("el buttonBackground no llegó al Button: %q", boton.Fondo)
+	}
+}
