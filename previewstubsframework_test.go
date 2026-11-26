@@ -10,8 +10,11 @@ package main
 // corren en el despacho puntual sin calentar el portátil.
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -2952,5 +2955,387 @@ func TestFragmentSavedStateConStubsApagadosReapareceElError(t *testing.T) {
 	}
 	if obtenido != registry {
 		t.Fatalf("con los stubs encendidos se devolvió %v y se esperaba el registry", obtenido)
+	}
+}
+
+// aíslaServicios deja el registro de servicios vacío durante una prueba y lo restaura al salir. El
+// interruptor `cargados` se pone a true para que la prueba no abra la APK del hospedador: todo lo que
+// vea el iterador tiene que venir del zip que siembra la propia prueba.
+func aíslaServicios(t *testing.T) {
+	t.Helper()
+	anterior := serviciosDelApk
+	cargados := serviciosDelApkCargados
+	t.Cleanup(func() {
+		serviciosDelApk = anterior
+		serviciosDelApkCargados = cargados
+	})
+	serviciosDelApk = map[string][]string{}
+	serviciosDelApkCargados = true
+}
+
+// zipConServicio arma un APK mínimo en memoria con una sola entrada META-INF/services/<interfaz>.
+func zipConServicio(t *testing.T, interfaz, contenido string) *zip.Reader {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("META-INF/services/" + interfaz)
+	if err != nil {
+		t.Fatalf("no se pudo crear la entrada de servicios: %v", err)
+	}
+	if _, err := w.Write([]byte(contenido)); err != nil {
+		t.Fatalf("no se pudo escribir la entrada de servicios: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("no se pudo cerrar el zip de servicios: %v", err)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatalf("el zip de servicios no se pudo leer: %v", err)
+	}
+	return zr
+}
+
+// claseParaServicio es el `java.lang.Class` que el intérprete guarda para un literal `X.class`.
+func claseParaServicio(descriptor string) *objetoDalvik {
+	return &objetoDalvik{clase: "Ljava/lang/Class;", campos: map[string]any{
+		"Ljava/lang/Class;.$tipo": descriptor,
+	}}
+}
+
+// cargadorDeServicio pide el stub de ServiceLoader.load con la firma que F-Droid no encuentra en el
+// dex y devuelve el objeto no nulo.
+func cargadorDeServicio(t *testing.T, m *maquinaDalvik, descriptor string) *objetoDalvik {
+	t.Helper()
+	const proto = "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;"
+	v, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "load", proto,
+		[]any{claseParaServicio(descriptor), nil}, nil)
+	if err != nil || !ok {
+		t.Fatalf("ServiceLoader.load(%s): ok=%v err=%v", descriptor, ok, err)
+	}
+	return esperaObjetoDeStub(t, v, "Ljava/util/ServiceLoader;")
+}
+
+// TestServiceLoaderLeeElServicioRealDelApk falsifica que el iterador entrega UNICAMENTE el nombre
+// escrito en META-INF/services del APK, con su comentario y sus líneas vacías ya descartados, y que
+// el aviso dice que se entregan nombres en vez de instancias.
+func TestServiceLoaderLeeElServicioRealDelApk(t *testing.T) {
+	aíslaServicios(t)
+	registraServiciosDelApk(zipConServicio(t, "org.slf4j.spi.SLF4JServiceProvider",
+		"# proveedor declarado en el APK\norg.slf4j.impl.LoggerServiceProvider\n\n"))
+	m := maquinaDeStubs()
+	loader := cargadorDeServicio(t, m, "Lorg/slf4j/spi/SLF4JServiceProvider;")
+	if loader.campos[markerServicioCargador] != "org.slf4j.spi.SLF4JServiceProvider" {
+		t.Errorf("el cargador no quedó ligado a la interfaz: %v", loader.campos)
+	}
+	it, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, loader)
+	if err != nil || !ok {
+		t.Fatalf("ServiceLoader.iterator: ok=%v err=%v", ok, err)
+	}
+	cursor := esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+	if len(cursor.iterando) != 1 {
+		t.Fatalf("el iterador trae %d proveedores y el fichero declaraba uno: %v", len(cursor.iterando), cursor.iterando)
+	}
+	mas, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, cursor)
+	if err != nil || !ok || mas != int32(1) {
+		t.Fatalf("hasNext: v=%v ok=%v err=%v", mas, ok, err)
+	}
+	siguiente, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "next",
+		"()Ljava/lang/Object;", nil, cursor)
+	if err != nil || !ok {
+		t.Fatalf("next: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, siguiente, "org.slf4j.impl.LoggerServiceProvider")
+	mas, _, _ = m.intentaStub([]string{"Ljava/util/Iterator;"}, "hasNext", "()Z", nil, cursor)
+	if mas != int32(0) {
+		t.Errorf("el iterador no se agotó tras next: %v", mas)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "aproximación") {
+		t.Errorf("falta el aviso de aproximación: %s", avisos)
+	}
+}
+
+// TestServiceLoaderSinFicheroDaIteradorVacio cubre las dos llamadas de coil3: una interfaz sin
+// entrada META-INF/services entrega un iterador no nulo y vacío, sin fabricar proveedores.
+func TestServiceLoaderSinFicheroDaIteradorVacio(t *testing.T) {
+	aíslaServicios(t)
+	m := maquinaDeStubs()
+	for _, descriptor := range []string{"Lcoil3/ImageLoader;", "Lcoil3/ImageLoaderFactory;"} {
+		loader := cargadorDeServicio(t, m, descriptor)
+		it, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "iterator",
+			"()Ljava/util/Iterator;", nil, loader)
+		if err != nil || !ok {
+			t.Fatalf("iterator de %s: ok=%v err=%v", descriptor, ok, err)
+		}
+		cursor := esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+		if len(cursor.iterando) != 0 {
+			t.Errorf("%s entregó %d proveedores sin fichero: %v", descriptor, len(cursor.iterando), cursor.iterando)
+		}
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "0 proveedor(es)") {
+		t.Errorf("el aviso no dice que no hay proveedores: %s", avisos)
+	}
+}
+
+// TestServiceLoaderReceptorNuloSigueCortando congela el guardián de `invoca`: aunque el stub devuelva
+// un cargador, un iterator invocado sobre un receptor nulo debe seguir dando el error original.
+func TestServiceLoaderReceptorNuloSigueCortando(t *testing.T) {
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Ljava/util/ServiceLoader;",
+		name:  "iterator",
+		proto: dexProto{shorty: "()Ljava/util/Iterator;", returnType: "Ljava/util/Iterator;"},
+	}}}
+	m := &maquinaDalvik{vistos: map[string]bool{}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "Ljava/util/ServiceLoader;")
+	if err == nil || !strings.Contains(err.Error(), "java.util.ServiceLoader.iterator sobre un objeto nulo") {
+		t.Errorf("el receptor nulo no cortó con el error esperado: %v", err)
+	}
+}
+
+// TestServiceLoaderConStubsApagadosVuelveAlCero es la falsación A/B: con el interruptor apagado el
+// cargador no se modela, el cero llega al iterador y reaparece la frontera de 7272 pasos.
+func TestServiceLoaderConStubsApagadosVuelveAlCero(t *testing.T) {
+	aíslaServicios(t)
+	registraServiciosDelApk(zipConServicio(t, "org.slf4j.spi.SLF4JServiceProvider",
+		"org.slf4j.impl.LoggerServiceProvider\n"))
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+	m := maquinaDeStubs()
+	const proto = "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;"
+	v, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "load", proto,
+		[]any{claseParaServicio("Lorg/slf4j/spi/SLF4JServiceProvider;"), nil}, nil)
+	if err != nil || ok || v != nil {
+		t.Errorf("con los stubs apagados load se resolvió: v=%v ok=%v err=%v", v, ok, err)
+	}
+	d := &dexFile{methods: []dexMethod{{
+		owner: "Ljava/util/ServiceLoader;",
+		name:  "iterator",
+		proto: dexProto{shorty: "()Ljava/util/Iterator;", returnType: "Ljava/util/Iterator;"},
+	}}}
+	_, err = m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "Ljava/util/ServiceLoader;")
+	if err == nil || !strings.Contains(err.Error(), "java.util.ServiceLoader.iterator sobre un objeto nulo") {
+		t.Errorf("sin el stub no reapareció el error original: %v", err)
+	}
+}
+
+// apkServiciosMontada permite correr la falsificación en el hospedador de Node con la APK real
+// montada: el shim no propaga variables de entorno al binario de Go, pero sí sus argumentos.
+var apkServiciosMontada = flag.String("apk-servicios", "", "APK montada en el hospedador para la prueba de servicios")
+
+// aíslaLosServiciosDelPreview limpia el registro global y lo devuelve al salir. El indicador se pone
+// a false a propósito: la llamada de preview.go tiene que ser la que lo active desde el zip.
+func aíslaLosServiciosDelPreview(t *testing.T) {
+	t.Helper()
+	anterior := serviciosDelApk
+	cargados := serviciosDelApkCargados
+	t.Cleanup(func() {
+		serviciosDelApk = anterior
+		serviciosDelApkCargados = cargados
+	})
+	serviciosDelApk = map[string][]string{}
+	serviciosDelApkCargados = false
+}
+
+// apkConServicioParaPreview arma el paquete mínimo que la vista previa necesita: manifiesto escrito
+// por el fork y la entrada META-INF/services con el proveedor que se quiera medir.
+func apkConServicioParaPreview(t *testing.T, proveedor string) []byte {
+	t.Helper()
+	manifiesto, err := escribeAXML(manifiestoDelStudio())
+	if err != nil {
+		t.Fatalf("el manifiesto de la prueba: %v", err)
+	}
+	return zipDeEntradas(t, map[string][]byte{
+		"AndroidManifest.xml": manifiesto,
+		"META-INF/services/org.slf4j.spi.SLF4JServiceProvider": []byte(
+			"# proveedor declarado en el APK\n" + proveedor + "\n\n"),
+	})
+}
+
+// TestServiciosDelApkDisponiblesEnLaPestana falsifica el enganche de preview.go: con una APK señuelo
+// en os.Args, el proveedor que entrega ServiceLoader viene del zip que recibió la vista previa y no
+// del hospedador. Si se retira registraServiciosDeLaAPKEnPreview, el mapa queda vacío y falla.
+func TestServiciosDelApkDisponiblesEnLaPestana(t *testing.T) {
+	aíslaLosServiciosDelPreview(t)
+	datos := apkConServicioParaPreview(t, "org.slf4j.impl.LoggerServiceProvider")
+	if ruta := *apkServiciosMontada; ruta != "" {
+		montada, err := os.ReadFile(ruta)
+		if err != nil {
+			t.Fatalf("la APK montada %q no se pudo leer: %v", ruta, err)
+		}
+		datos = montada
+		t.Logf("APK montada: %s (%d bytes)", ruta, len(datos))
+	}
+	senuelo := filepath.Join(t.TempDir(), "senuelo.apk")
+	if err := os.WriteFile(senuelo, apkConServicioParaPreview(t, "org.fdroid.ProveedorInventado"), 0o600); err != nil {
+		t.Fatalf("el APK señuelo no se pudo escribir: %v", err)
+	}
+	argsPrevios := os.Args
+	os.Args = []string{"apkc", "preview", senuelo}
+	t.Cleanup(func() { os.Args = argsPrevios })
+
+	modelo, err := modeloVistaDeAPKCon(datos, "", false)
+	if err != nil || modelo == nil {
+		t.Fatalf("la vista previa de la APK con servicios falló: modelo=%v err=%v", modelo, err)
+	}
+	proveedores := serviciosDelApk["org.slf4j.spi.SLF4JServiceProvider"]
+	if len(proveedores) != 1 || proveedores[0] != "org.slf4j.impl.LoggerServiceProvider" {
+		t.Fatalf("el zip no aportó el proveedor real (o se leyó el señuelo): %v", proveedores)
+	}
+
+	m := maquinaDeStubs()
+	loader := cargadorDeServicio(t, m, "Lorg/slf4j/spi/SLF4JServiceProvider;")
+	it, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, loader)
+	if err != nil || !ok {
+		t.Fatalf("ServiceLoader.iterator: ok=%v err=%v", ok, err)
+	}
+	cursor := esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+	if len(cursor.iterando) != 1 {
+		t.Fatalf("el iterador trae %d proveedores y el fichero declaraba uno: %v", len(cursor.iterando), cursor.iterando)
+	}
+	siguiente, ok, err := m.intentaStub([]string{"Ljava/util/Iterator;"}, "next",
+		"()Ljava/lang/Object;", nil, cursor)
+	if err != nil || !ok {
+		t.Fatalf("next: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, siguiente, "org.slf4j.impl.LoggerServiceProvider")
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "1 proveedor(es)") ||
+		!strings.Contains(avisos, "aproximación") {
+		t.Errorf("el aviso no dice cuántos proveedores se entregan ni que es una aproximación: %s", avisos)
+	}
+}
+
+// TestPreviewSinFicheroDeServiciosDaIteradorVacio comprueba el otro lado del enganche: una APK sin
+// entrada META-INF/services deja el mapa vacío y el iterador no inventa ningún proveedor.
+func TestPreviewSinFicheroDeServiciosDaIteradorVacio(t *testing.T) {
+	aíslaLosServiciosDelPreview(t)
+	manifiesto, err := escribeAXML(manifiestoDelStudio())
+	if err != nil {
+		t.Fatalf("el manifiesto de la prueba: %v", err)
+	}
+	argsPrevios := os.Args
+	os.Args = []string{"apkc", "preview"}
+	t.Cleanup(func() { os.Args = argsPrevios })
+	modelo, err := modeloVistaDeAPKCon(zipDeEntradas(t, map[string][]byte{
+		"AndroidManifest.xml": manifiesto,
+	}), "", false)
+	if err != nil || modelo == nil {
+		t.Fatalf("la vista previa sin servicios falló: modelo=%v err=%v", modelo, err)
+	}
+	if len(serviciosDelApk) != 0 {
+		t.Fatalf("sin entrada de servicios el registro no está vacío: %v", serviciosDelApk)
+	}
+	m := maquinaDeStubs()
+	loader := cargadorDeServicio(t, m, "Lcoil3/ImageLoader;")
+	it, ok, err := m.intentaStub([]string{"Ljava/util/ServiceLoader;"}, "iterator",
+		"()Ljava/util/Iterator;", nil, loader)
+	if err != nil || !ok {
+		t.Fatalf("iterator sin fichero: ok=%v err=%v", ok, err)
+	}
+	cursor := esperaObjetoDeStub(t, it, "Ljava/util/Iterator;")
+	if len(cursor.iterando) != 0 {
+		t.Errorf("el iterador inventó %d proveedores sin fichero: %v", len(cursor.iterando), cursor.iterando)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "0 proveedor(es)") {
+		t.Errorf("el aviso no dice que no hay proveedores: %s", avisos)
+	}
+}
+
+// tablaDeTemaSplash escribe un color y un estilo con dos atributos reales: uno apunta al color y el
+// otro a un atributo del framework ausente de la tabla. No hay aquí ningún valor inventado.
+func tablaDeTemaSplash(t *testing.T) *tablaRecursos {
+	t.Helper()
+	tb := tablaEscribir{
+		idPaquete:     0x7f,
+		nombrePaquete: "com.prueba.tema",
+		global:        []string{"fondo", "tema"},
+		globalUTF8:    true,
+		nombresTipo:   []string{"color", "style"},
+		claves:        []string{"fondo", "tema"},
+		clavesUTF8:    true,
+		tipos: []tipoEscribir{
+			{id: 1, specFlags: []uint32{0x00000001}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 0, valor: valorEscribir{tipo: tipoColorRGB8, datos: 0xff336699}},
+			}}}},
+			{id: 2, specFlags: []uint32{0x00000001}, bloques: []bloqueEscribir{{entradas: []entradaEscribir{
+				{clave: 1, flags: 0x0001, compleja: true, registros: []registroEscribir{
+					{nombre: 0x7f030015, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010000}},
+					{nombre: 0x7f030013, valor: valorEscribir{tipo: tipoAtributo, datos: 0x01010031}},
+				}},
+			}}}},
+		},
+	}
+	datos, err := escribeTablaRecursos(tb)
+	if err != nil {
+		t.Fatalf("la tabla del tema: %v", err)
+	}
+	tr, err := leeTabla(datos)
+	if err != nil {
+		t.Fatalf("la tabla del tema no se deja leer: %v", err)
+	}
+	return tr
+}
+
+// TestTemaSplash falsifica el primer paso de la frontera de 8980 pasos: `getTheme` tiene que
+// entregar un Theme no nulo enlazado a la actividad ya a la tabla del APK.
+func TestTemaSplash(t *testing.T) {
+	m := maquinaDeStubs()
+	m.tabla = tablaDeTemaSplash(t)
+	actividad := objDe("Lcom/prueba/GodotApp;")
+	m.actividad = actividad
+
+	v, ok, err := m.intentaStub([]string{"Lcom/prueba/GodotApp;", "Landroid/app/Activity;"},
+		"getTheme", "()Landroid/content/res/Resources$Theme;", nil, actividad)
+	if err != nil || !ok || v == nil {
+		t.Fatalf("getTheme: v=%v ok=%v err=%v", v, ok, err)
+	}
+	tema := esperaObjetoDeStub(t, v, "Landroid/content/res/Resources$Theme;")
+	if !esTemaSintetico(tema) || tablaDeTemaSintetico(tema) != m.tabla {
+		t.Fatal("el Theme no está enlazado a la tabla del APK")
+	}
+	if tema.campos["tema.actividad"] != actividad {
+		t.Fatal("el Theme no está enlazado a la actividad")
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "tema-sintetico: Activity.getTheme") {
+		t.Errorf("getTheme no dejó el aviso del tema sintético: %v", m.avisos)
+	}
+}
+
+// TestResolveAttribute comprueba las dos mitades del contrato: un id de la tabla se resuelve
+// escribiendo el TypedValue, y un id del framework ausente de resources.arsc devuelve false sin
+// escribir un color inventado.
+func TestResolveAttribute(t *testing.T) {
+	m := maquinaDeStubs()
+	m.tabla = tablaDeTemaSplash(t)
+	tema := m.temaSintetico(objDe("Lcom/prueba/GodotApp;"))
+	destino := objDe("Landroid/util/TypedValue;")
+	candidatos := []string{"Landroid/content/res/Resources$Theme;"}
+
+	v, ok, err := m.intentaStub(candidatos, "resolveAttribute", "(ILandroid/util/TypedValue;Z)Z",
+		[]any{int32(0x7f030015), destino, int32(1)}, tema)
+	if err != nil || !ok || v != int32(1) {
+		t.Fatalf("resolveAttribute: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if destino.campos["Landroid/util/TypedValue;.resourceId"] != int32(0x7f010000) {
+		t.Errorf("resourceId=%v y se esperaba 0x7f010000", destino.campos["Landroid/util/TypedValue;.resourceId"])
+	}
+	colorEsperado := uint32(0xff336699)
+	if destino.campos["Landroid/util/TypedValue;.data"] != int32(colorEsperado) {
+		t.Errorf("data=%v y se esperaba %#08x", destino.campos["Landroid/util/TypedValue;.data"], colorEsperado)
+	}
+
+	otro := objDe("Landroid/util/TypedValue;")
+	v, ok, err = m.intentaStub(candidatos, "resolveAttribute", "(ILandroid/util/TypedValue;Z)Z",
+		[]any{int32(0x7f030013), otro, int32(1)}, tema)
+	if err != nil || !ok || v != int32(0) {
+		t.Fatalf("un attr del framework debería devolver false: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if len(otro.campos) != 0 {
+		t.Errorf("un id ausente escribió el TypedValue: %v", otro.campos)
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "resuelto desde style") ||
+		!strings.Contains(avisos, "apunta a un id ausente de resources.arsc") {
+		t.Errorf("faltaron los avisos de la tabla: %v", m.avisos)
 	}
 }

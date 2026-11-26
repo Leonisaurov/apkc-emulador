@@ -36,8 +36,12 @@ package main
 // WineDroid (GPL) no se ha traducido ni copiado.
 
 import (
+	"archive/zip"
+	"bytes"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"reflect"
 	"regexp"
 	"sort"
@@ -4592,6 +4596,109 @@ func (m *maquinaDalvik) rechaza(nombre, proto, motivo, retorno string) (any, boo
 	return valorCero(retorno), true, nil
 }
 
+// Servicios reales del APK. El intérprete NO fabrica proveedores: el iterador de ServiceLoader solo
+// puede entregar nombres que estén escritos en una entrada META-INF/services/<interfaz> del zip.
+// El mapa se llena desde las entradas reales del zip de la corrida (registraServiciosDelApk, llamado
+// por preview.go en cuanto abre la APK) y, cuando no hay zip de por medio, se abre perezosamente la
+// APK que el hospedador puso en la línea de órdenes (cargaServiciosDelHost). Sin entrada de servicios
+// el iterador sale vacío, que es la respuesta fiel para una interfaz sin fichero.
+var (
+	serviciosDelApk         = map[string][]string{}
+	serviciosDelApkCargados = false
+)
+
+// nombreBinarioDeDescriptor convierte `Lorg/slf4j/spi/SLF4JServiceProvider;` en el nombre con el que
+// se nombra el fichero de servicios, `org.slf4j.spi.SLF4JServiceProvider`. Los descriptores de arreglo
+// y los primitivos no tienen fichero y se rechazan.
+func nombreBinarioDeDescriptor(descriptor string) string {
+	if len(descriptor) < 3 || descriptor[0] != 'L' || descriptor[len(descriptor)-1] != ';' {
+		return ""
+	}
+	return strings.ReplaceAll(descriptor[1:len(descriptor)-1], "/", ".")
+}
+
+// lineasDeServicio aplica el formato de un fichero META-INF/services: una clase por línea, con
+// comentarios empezando por `#` y espacios recortados. Una línea vacía o comentada no es un
+// proveedor; no se inventa ningún nombre ausente del fichero.
+func lineasDeServicio(contenido string) []string {
+	salida := []string{}
+	for _, linea := range strings.Split(contenido, "\n") {
+		if i := strings.IndexByte(linea, '#'); i >= 0 {
+			linea = linea[:i]
+		}
+		linea = strings.TrimSpace(strings.TrimSuffix(linea, "\r"))
+		if linea != "" {
+			salida = append(salida, linea)
+		}
+	}
+	return salida
+}
+
+// registraServiciosDelApk lee las entradas META-INF/services/<interfaz> de un zip ya abierto y guarda
+// sus nombres. Solo se registran entradas directas del directorio: un nombre con `/` no es una
+// interfaz y se ignora. Los ficheros que no existen no se crean: su lista queda vacía.
+func registraServiciosDelApk(zr *zip.Reader) {
+	if zr == nil {
+		return
+	}
+	for _, f := range zr.File {
+		if !strings.HasPrefix(f.Name, "META-INF/services/") {
+			continue
+		}
+		interfaz := strings.TrimPrefix(f.Name, "META-INF/services/")
+		if interfaz == "" || strings.Contains(interfaz, "/") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		datos, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			continue
+		}
+		serviciosDelApk[interfaz] = lineasDeServicio(string(datos))
+	}
+	serviciosDelApkCargados = true
+}
+
+// registraServiciosDeLaAPKEnPreview es el envoltorio que usa la vista previa con el zip ya abierto.
+// Respeta el indicador de carga: si el hospedador nativo ya trajo los servicios de su APK, no los
+// sustituye por los del zip (en la pestaña no hay os.Args con APK, así que esta es la única vía).
+func registraServiciosDeLaAPKEnPreview(zr *zip.Reader) {
+	if serviciosDelApkCargados {
+		return
+	}
+	registraServiciosDelApk(zr)
+}
+
+// cargaServiciosDelHost abre, una sola vez, la APK que el hospedador pasó al comando nativo. Se
+// recorren los argumentos de detrás hacia delante y se toma el primero que es un zip legible: en
+// `apkc preview … app.apk` esa es la APK de la corrida. Sin una APK accesible el mapa sigue vacío,
+// que es el estado honesto del hospedador sin ficheros.
+func cargaServiciosDelHost() {
+	if serviciosDelApkCargados {
+		return
+	}
+	serviciosDelApkCargados = true
+	for i := len(os.Args) - 1; i >= 0; i-- {
+		if !strings.HasSuffix(strings.ToLower(os.Args[i]), ".apk") {
+			continue
+		}
+		datos, err := os.ReadFile(os.Args[i])
+		if err != nil {
+			continue
+		}
+		zr, err := zip.NewReader(bytes.NewReader(datos), int64(len(datos)))
+		if err != nil {
+			continue
+		}
+		registraServiciosDelApk(zr)
+		return
+	}
+}
+
 // esAlmacenDeEstado dice si un objeto representa un Bundle o un SharedPreferences, que son los dos
 // sitios donde la app guarda estado con clave.
 func esAlmacenDeEstado(obj *objetoDalvik) bool {
@@ -4670,6 +4777,144 @@ func valorDeRecursosSinteticos(obj *objetoDalvik, id any) (valor, bool) {
 		return valor{}, false
 	}
 	return tabla.valorDeId(uint32(n))
+}
+
+// temaSintetico construye el Resources$Theme que devuelve `Activity.getTheme`: no nulo, enlazado a
+// la actividad y a la tabla del APK. El id de tema se toma del que la app puso con `setTheme`; si el
+// tema lo fija el manifiesto —como en Godot— el intérprete no lo recibe y se deja en cero: la
+// resolución busca entonces entre los estilos reales de la tabla y lo dice en su aviso. No se
+// construye ningún tema ni atributo nuevo.
+func (m *maquinaDalvik) temaSintetico(act *objetoDalvik) *objetoDalvik {
+	var id int32
+	if act != nil {
+		id, _ = aInt32(act.campos["tema.id"])
+	}
+	return &objetoDalvik{clase: "Landroid/content/res/Resources$Theme;", campos: map[string]any{
+		"tema.sintetico": true,
+		"tema.tabla":     m.tabla,
+		"tema.actividad": act,
+		"tema.id":        id,
+	}}
+}
+
+func esTemaSintetico(obj *objetoDalvik) bool {
+	return obj != nil && obj.campos["tema.sintetico"] == true
+}
+
+func tablaDeTemaSintetico(obj *objetoDalvik) *tablaRecursos {
+	if !esTemaSintetico(obj) {
+		return nil
+	}
+	t, _ := obj.campos["tema.tabla"].(*tablaRecursos)
+	return t
+}
+
+// valorDeAtributoTema busca el atributo primero en el tema conocido y, si no hay id de tema, en los
+// estilos de la tabla del APK, con la cascada de padres acotada que ya usa el modelo. El segundo
+// valor devuelto es el estilo del que salió, para que el aviso diga de dónde se tomó.
+func valorDeAtributoTema(obj *objetoDalvik, id uint32) (valor, uint32, bool) {
+	tabla := tablaDeTemaSintetico(obj)
+	if tabla == nil {
+		return valor{}, 0, false
+	}
+	ctx := &contextoVista{tabla: tabla}
+	if temaID, _ := aInt32(obj.campos["tema.id"]); temaID > 0 {
+		if v, ok := ctx.valoresDeEstilo(uint32(temaID), 0)[id]; ok {
+			return v, uint32(temaID), true
+		}
+	}
+	// Sin el id del manifiesto se recorren los estilos reales de la tabla, en orden de entrada. Se
+	// acota el número de estilos visitados para que una tabla grande no haga interminable la búsqueda.
+	visitados := 0
+	for _, bl := range tabla.bloques {
+		if bl.nombre != "style" {
+			continue
+		}
+		for i := range bl.entradas {
+			e := bl.entradas[i]
+			if e.ausente || !e.compleja {
+				continue
+			}
+			estiloID := (tabla.idPaquete&0xff)<<24 | uint32(bl.id)<<16 | uint32(i)
+			if v, ok := ctx.valoresDeEstilo(estiloID, 0)[id]; ok {
+				return v, estiloID, true
+			}
+			visitados++
+			if visitados >= 256 {
+				return valor{}, 0, false
+			}
+		}
+	}
+	return valor{}, 0, false
+}
+
+// escribeTypedValueDeTema llena los campos que el dex lee después de `resolveAttribute`: data,
+// resourceId y type. Solo escribe valores que vienen de la tabla; un id ausente no deja campo alguno.
+func escribeTypedValueDeTema(dest *objetoDalvik, recurso, datos, tipo uint32) {
+	if dest == nil {
+		return
+	}
+	if dest.campos == nil {
+		dest.campos = map[string]any{}
+	}
+	dest.campos["Landroid/util/TypedValue;.resourceId"] = int32(recurso)
+	dest.campos["Landroid/util/TypedValue;.data"] = int32(datos)
+	dest.campos["Landroid/util/TypedValue;.type"] = int32(tipo)
+}
+
+// resuelveValorDeTema sigue las referencias dentro de la tabla del APK, sin salir de ella. `?attr/x`
+// apunta a un atributo del framework que no está en resources.arsc: se rechaza sin inventar color.
+func resuelveValorDeTema(tabla *tablaRecursos, v valor, sigueReferencias bool, nivel int) (recurso, datos, tipo uint32, ok bool) {
+	if tabla == nil || nivel >= profundidadMaxima {
+		return 0, 0, 0, false
+	}
+	switch v.tipo {
+	case tipoReferencia:
+		if !sigueReferencias {
+			return v.datos, v.datos, uint32(v.tipo), true
+		}
+		if _, _, presente := tabla.nombreDeId(v.datos); !presente {
+			return 0, 0, 0, false
+		}
+		recurso = v.datos
+		if enlace, hay := tabla.valorDeId(v.datos); hay {
+			if _, d, t, bien := resuelveValorDeTema(tabla, enlace, true, nivel+1); bien {
+				return recurso, d, t, true
+			}
+		}
+		return recurso, v.datos, uint32(v.tipo), true
+	case tipoAtributo:
+		// un `?attr/…` del framework no está en la tabla de la app: no se fabrica su valor.
+		return 0, 0, 0, false
+	default:
+		return 0, v.datos, uint32(v.tipo), true
+	}
+}
+
+// resolveAttribute modela la lectura de un atributo del tema contra la tabla del APK. Devuelve false
+// cuando el id o su destino no están en resources.arsc, con aviso y sin escribir el TypedValue.
+func (m *maquinaDalvik) resolveAttributeDeTema(tema *objetoDalvik, id any, dest *objetoDalvik, sigue bool) (any, bool, error) {
+	tabla := tablaDeTemaSintetico(tema)
+	n, err := aInt32(id)
+	if err != nil || tabla == nil {
+		m.avisa("tema-sintetico: resolveAttribute(%v) sin tabla del APK; devuelve false", id)
+		return int32(0), true, nil
+	}
+	idAttr := uint32(n)
+	v, estilo, hay := valorDeAtributoTema(tema, idAttr)
+	if !hay {
+		m.avisa("tema-sintetico: attr %#08x no está en los estilos de resources.arsc; devuelve false", idAttr)
+		return int32(0), true, nil
+	}
+	recurso, datos, tipo, bien := resuelveValorDeTema(tabla, v, sigue, 0)
+	if !bien {
+		m.avisa("tema-sintetico: attr %#08x apunta a un id ausente de resources.arsc; devuelve false", idAttr)
+		return int32(0), true, nil
+	}
+	escribeTypedValueDeTema(dest, recurso, datos, tipo)
+	m.avisa("tema-sintetico: attr %#08x resuelto desde style %#08x de resources.arsc (aproximación)",
+		idAttr, estilo)
+	return int32(1), true, nil
 }
 
 // claveEnDex dice si un literal aparece en algún pool de cadenas del programa cargado. Se usa para
@@ -4969,8 +5214,9 @@ func (m *maquinaDalvik) hiloPrincipalSintetico() *objetoDalvik {
 // para que las llamadas posteriores se atiendan como inertes sin enumerar cada método de la API.
 // No llevan contenido: solo identifican la familia del objeto y permiten no repetir el aviso.
 const (
-	markerInerteNativo = "emulador.inerteNativo"
-	markerInerteWeb    = "emulador.inerteWeb"
+	markerInerteNativo     = "emulador.inerteNativo"
+	markerInerteWeb        = "emulador.inerteWeb"
+	markerServicioCargador = "emulador.serviceLoader"
 )
 
 // stubsFrameworkActivos es un interruptor de prueba: a false simula el emulador anterior a estos
@@ -5439,9 +5685,32 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "setTheme":
 		// el tema lo elige el manifiesto o la configuración; en el modelo no hay estilos que
-		// aplicar, así que se acepta el id sin cambiar nada ni publicar un aviso.
+		// aplicar, pero el id se guarda en la actividad para que el Theme sintético sepa qué
+		// estilo consultar primero. Si el tema viene del manifiesto, este método no se llama.
 		if len(vals) == 1 && (esContexto() || es("Landroid/content/Context;")) {
+			if obj != nil {
+				if obj.campos == nil {
+					obj.campos = map[string]any{}
+				}
+				obj.campos["tema.id"] = vals[0]
+			}
 			return nil, true, nil
+		}
+	case "getTheme":
+		// AndroidX pide el tema de la actividad antes de leer los atributos del splash: sin él el
+		// receptor de resolveAttribute llegaba nulo y la ejecución cortaba en 8980 pasos. El tema
+		// es sintético y está enlazado a la tabla del APK; no hay motor de estilos detrás.
+		if len(vals) == 0 && (esContexto() || es("Landroid/app/Activity;") ||
+			es("Landroid/content/ContextThemeWrapper;")) {
+			m.avisa("tema-sintetico: Activity.getTheme entrega un tema enlazado a la tabla del APK (aproximación)")
+			return m.temaSintetico(obj), true, nil
+		}
+	case "resolveAttribute":
+		// se atiende solo sobre el Theme sintético: los atributos se leen de los estilos que ya
+		// trae resources.arsc, con la cascada acotada. Un id ausente devuelve false sin valor.
+		if proto == "(ILandroid/util/TypedValue;Z)Z" && len(vals) >= 3 && esTemaSintetico(obj) {
+			dest, _ := vals[1].(*objetoDalvik)
+			return m.resolveAttributeDeTema(obj, vals[0], dest, boolDe(vals[2]))
 		}
 	case "getSystem":
 		// los Resources del sistema: el intérprete no tiene gestor de recursos, pero la app
@@ -6452,6 +6721,18 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "iterator":
 		if len(vals) == 0 {
+			// El iterador de ServiceLoader recorre SOLO los nombres que el cargador leyó de una
+			// entrada real del APK. Sin entrada no se inventa nada: se devuelve el iterador vacío
+			// tipado, que es la respuesta fiel de una interfaz sin fichero de servicios. El receptor
+			// nulo ya lo corta `invoca` antes de llegar aquí, así que no se fabrica uno.
+			if obj != nil && obj.campos[markerServicioCargador] != nil {
+				proveedores, _ := obj.campos["servicios.proveedores"].([]string)
+				cursor := &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{}}
+				for _, proveedor := range proveedores {
+					cursor.iterando = append(cursor.iterando, cadenaObjeto(proveedor))
+				}
+				return cursor, true, nil
+			}
 			if esConjunto() {
 				return &objetoDalvik{clase: "Ljava/util/Iterator;", campos: map[string]any{},
 					iterando: obj.conjunto}, true, nil
@@ -7612,6 +7893,28 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			return cadenaObjeto(""), true, nil
 		}
 	case "loadLibrary", "load":
+		// `ServiceLoader.load(Class, ClassLoader)` no está en el dex ni en los stubs: devolvía el
+		// cero de `Ljava/util/ServiceLoader;` y el `iterator()` siguiente cortaba en el guardián de
+		// receptor nulo (F-Droid, 7272 pasos). Se devuelve un cargador sintético NO NULO ligado al
+		// nombre binario de la interfaz. Su iterador solo entrega los nombres leídos del fichero
+		// META-INF/services/<interfaz> del APK; sin fichero entrega un iterador vacío tipado, que es
+		// lo que hacen las dos llamadas de coil3. No se fabrica ningún proveedor ni se ejecuta su
+		// código: es una aproximación y se avisa como tal.
+		if len(vals) >= 1 && nombre == "load" && es("Ljava/util/ServiceLoader;") && stubsFrameworkActivos &&
+			proto == "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;" {
+			descriptor := claseDeLiteral(vals[0])
+			interfaz := nombreBinarioDeDescriptor(descriptor)
+			cargaServiciosDelHost()
+			proveedores := append([]string(nil), serviciosDelApk[interfaz]...)
+			loader := &objetoDalvik{clase: "Ljava/util/ServiceLoader;", campos: map[string]any{
+				markerServicioCargador:  interfaz,
+				"servicios.interfaz":    interfaz,
+				"servicios.proveedores": proveedores,
+			}}
+			m.avisa("ServiceLoader.load(%s): %d proveedor(es) leídos de META-INF/services; se entregan nombres, no instancias (aproximación)",
+				interfaz, len(proveedores))
+			return loader, true, nil
+		}
 		// §4 R9: la carga de una biblioteca nativa se ACEPTA sin cargar nada. Aquí no hay dlopen,
 		// no se abre un fichero .so y no se ejecuta código nativo; solo se registra el aviso. Los
 		// métodos nativos de esa biblioteca caen después en el aviso genérico, que es honesto.

@@ -1126,6 +1126,10 @@ func modeloVistaDeAPKConOpciones(datos []byte, o opcionesPreview) (*modeloVista,
 	if err != nil {
 		return nil, fmt.Errorf("el apk no es un zip: %w", err)
 	}
+	// ServiceLoader solo puede entregar los nombres escritos en META-INF/services de la APK. En la
+	// pestaña no hay os.Args con la APK, así que se registran aquí las entradas del zip ya abierto,
+	// antes de ejecutar el dex; el hospedador nativo conserva su fallback en cargaServiciosDelHost.
+	registraServiciosDeLaAPKEnPreview(zr)
 	manifiestoBytes, err := entradaDeZip(zr, "AndroidManifest.xml")
 	if err != nil {
 		return nil, fmt.Errorf("el AndroidManifest.xml: %w", err)
