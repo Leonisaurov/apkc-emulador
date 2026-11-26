@@ -7175,11 +7175,22 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		// ejecuta el getter del framework. Sin el campo el stub no casa y el cero llega al
 		// `getSavedStateProvider` siguiente, que corta con receptor nulo.
 		if stubsFrameworkActivos && len(vals) == 0 && obj != nil &&
-			proto == "()Landroidx/savedstate/SavedStateRegistry;" &&
-			es("Landroidx/savedstate/SavedStateRegistryOwner;", "Landroidx/activity/ComponentActivity;") {
-			if registry := registryDelOwnerSavedState(obj); registry != nil {
-				m.avisa("SavedStateRegistryOwner.getSavedStateRegistry: se devuelve el SavedStateRegistry que el dex construyó en el controlador (aproximación)")
-				return registry, true, nil
+			proto == "()Landroidx/savedstate/SavedStateRegistry;" {
+			// Godot llama al getter con `FragmentActivity` como dueño del ref, y esa clase no
+			// está en la cadena que el dex trae: sin este caso caía al cero y el
+			// `registerSavedStateProvider` siguiente cortaba con receptor nulo. El controlador
+			// sigue siendo el de la actividad, así que se comparte el mismo registry.
+			if es("Landroidx/fragment/app/FragmentActivity;") {
+				if registry := registryDelOwnerSavedState(obj); registry != nil {
+					m.avisa("FragmentActivity.getSavedStateRegistry: se devuelve el SavedStateRegistry que el dex construyó en el controlador de la actividad (aproximación)")
+					return registry, true, nil
+				}
+			}
+			if es("Landroidx/savedstate/SavedStateRegistryOwner;", "Landroidx/activity/ComponentActivity;") {
+				if registry := registryDelOwnerSavedState(obj); registry != nil {
+					m.avisa("SavedStateRegistryOwner.getSavedStateRegistry: se devuelve el SavedStateRegistry que el dex construyó en el controlador (aproximación)")
+					return registry, true, nil
+				}
 			}
 		}
 	case "getLifecycle":

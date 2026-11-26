@@ -2845,3 +2845,112 @@ func TestGetSavedStateRegistryConStubsApagados(t *testing.T) {
 		t.Fatalf("con los stubs apagados getSavedStateRegistry se resolvió: v=%v ok=%v err=%v", v, ok, err)
 	}
 }
+
+// cadenaFragmentSavedState ejecuta el par de llamadas que el `FragmentActivity.init` de Godot hace
+// en el dex: el getter con `FragmentActivity` como dueño del ref y el
+// `registerSavedStateProvider` sobre lo que devolvió. El dex es mínimo y no tiene cuerpos, así que
+// la resolución pasa por `intentaStub`, igual que en la APK real.
+func cadenaFragmentSavedState(receptor any) (*maquinaDalvik, any, error) {
+	d := &dexFile{methods: []dexMethod{
+		{owner: "Landroidx/fragment/app/FragmentActivity;", name: "getSavedStateRegistry",
+			proto: dexProto{shorty: "LSavedStateRegistry;", returnType: "Landroidx/savedstate/SavedStateRegistry;"}},
+		{owner: "Landroidx/savedstate/SavedStateRegistry;", name: "registerSavedStateProvider",
+			proto: dexProto{shorty: "VLL", returnType: "V",
+				params: []string{"Ljava/lang/String;", "Landroidx/savedstate/SavedStateRegistry$SavedStateProvider;"}}},
+	}}
+	m := nuevaMaquina(&programaDalvik{dex: d, clases: map[string]*claseDalvik{}}, nil)
+	regs := []any{receptor, nil, cadenaObjeto("clave"),
+		objDe("Landroidx/savedstate/SavedStateRegistry$SavedStateProvider;")}
+	registry, err := m.invoca(0x6e, d, 0, []int{0}, regs, "Lorg/godotengine/godot/GodotActivity;")
+	if err != nil {
+		return m, registry, err
+	}
+	regs[1] = registry
+	_, err = m.invoca(0x6e, d, 1, []int{1, 2, 3}, regs, "Lorg/godotengine/godot/GodotActivity;")
+	return m, registry, err
+}
+
+// actividadConControladorDeSavedState monta la actividad con el controlador que el propio dex crea;
+// es la única fuente del registry, sin objetos fabricados por el stub.
+func actividadConControladorDeSavedState() (*objetoDalvik, *objetoDalvik) {
+	actividad := objDe("Lorg/godotengine/godot/GodotActivity;")
+	registry := objDe("Landroidx/savedstate/SavedStateRegistry;")
+	controlador := objDe("Landroidx/savedstate/SavedStateRegistryController;")
+	controlador.campos["Landroidx/savedstate/SavedStateRegistryController;.savedStateRegistry"] = registry
+	actividad.campos["Landroidx/activity/ComponentActivity;.mSavedStateRegistryController"] = controlador
+	return actividad, registry
+}
+
+// TestFragmentSavedStateDevuelveElRegistryDelControlador falsifica el caso de Godot: el getter
+// declarado en FragmentActivity entrega la MISMA referencia que el controlador de la actividad
+// guardó, avisa de la aproximación y el `registerSavedStateProvider` siguiente no corta.
+func TestFragmentSavedStateDevuelveElRegistryDelControlador(t *testing.T) {
+	actividad, registry := actividadConControladorDeSavedState()
+	m := maquinaDeStubs()
+	v, ok, err := m.intentaStub([]string{"Landroidx/fragment/app/FragmentActivity;"},
+		"getSavedStateRegistry", "()Landroidx/savedstate/SavedStateRegistry;", nil, actividad)
+	if err != nil || !ok || v != registry {
+		t.Fatalf("FragmentActivity.getSavedStateRegistry: v=%v ok=%v err=%v", v, ok, err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos, "FragmentActivity.getSavedStateRegistry") ||
+		!strings.Contains(avisos, "aproximación") {
+		t.Errorf("falta el aviso de aproximación de FragmentActivity: %s", avisos)
+	}
+
+	m, obtenido, err := cadenaFragmentSavedState(actividad)
+	if err != nil {
+		t.Fatalf("la cadena de Godot cortó con el registry del controlador: %v", err)
+	}
+	if obtenido != registry {
+		t.Errorf("la cadena devolvió %v y se esperaba el registry del controlador", obtenido)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); strings.Contains(avisos,
+		"FragmentActivity.getSavedStateRegistry()Landroidx/savedstate/SavedStateRegistry; no está en el dex ni en los stubs") {
+		t.Errorf("sigue el aviso del cero de antes: %s", avisos)
+	}
+}
+
+// TestFragmentSavedStateSinControladorSigueCortando impide que el stub invente un registry: sin el
+// controlador que escribe el dex, el cero llega al `registerSavedStateProvider` y corta igual.
+func TestFragmentSavedStateSinControladorSigueCortando(t *testing.T) {
+	actividad := objDe("Lorg/godotengine/godot/GodotActivity;")
+	m, registry, err := cadenaFragmentSavedState(actividad)
+	if registry != nil {
+		t.Fatalf("sin controlador se devolvió %v y se esperaba el cero", registry)
+	}
+	if err == nil || !strings.Contains(err.Error(),
+		"SavedStateRegistry.registerSavedStateProvider sobre un objeto nulo") {
+		t.Fatalf("sin controlador no reapareció la frontera original: %v", err)
+	}
+	if avisos := strings.Join(m.avisos, "\n"); !strings.Contains(avisos,
+		"FragmentActivity.getSavedStateRegistry()Landroidx/savedstate/SavedStateRegistry; no está en el dex ni en los stubs") {
+		t.Errorf("el cero no se anunció como antes: %s", avisos)
+	}
+}
+
+// TestFragmentSavedStateConStubsApagadosReapareceElError falsifica el caso A con el interruptor de
+// previewstubsframework_test.go:232: sin el stub, aunque la actividad tenga controlador, reaparece
+// la frontera de 8843 pasos; con él la misma cadena sigue.
+func TestFragmentSavedStateConStubsApagadosReapareceElError(t *testing.T) {
+	actividad, registry := actividadConControladorDeSavedState()
+	stubsFrameworkActivos = false
+	defer func() { stubsFrameworkActivos = true }()
+
+	_, obtenido, err := cadenaFragmentSavedState(actividad)
+	if obtenido != nil {
+		t.Fatalf("con los stubs apagados se devolvió %v y se esperaba el cero", obtenido)
+	}
+	if err == nil || !strings.Contains(err.Error(),
+		"SavedStateRegistry.registerSavedStateProvider sobre un objeto nulo") {
+		t.Fatalf("con los stubs apagados no reapareció el error original: %v", err)
+	}
+
+	stubsFrameworkActivos = true
+	_, obtenido, err = cadenaFragmentSavedState(actividad)
+	if err != nil {
+		t.Fatalf("con los stubs encendidos la cadena cortó: %v", err)
+	}
+	if obtenido != registry {
+		t.Fatalf("con los stubs encendidos se devolvió %v y se esperaba el registry", obtenido)
+	}
+}
