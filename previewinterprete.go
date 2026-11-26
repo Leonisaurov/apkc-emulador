@@ -1505,17 +1505,38 @@ func (m *maquinaDalvik) anotaConsola(origen, texto string) {
 
 // textoDeId resuelve un id de recurso de tipo cadena contra la tabla: es lo que el framework hace
 // con `@string/x`. El segundo valor dice si el id era de verdad una cadena de este paquete; con
-// otro tipo (o sin tabla) no hay texto que devolver.
+// otro tipo (o sin tabla) no hay texto que devolver. Si la entrada es TYPE_REFERENCE se sigue por
+// la misma tabla, como hace Resources.getString: solo se devuelve texto cuando está escrito en el
+// resources.arsc, nunca un nombre inventado ni una cadena vacía.
 func (m *maquinaDalvik) textoDeId(v any) (string, bool) {
 	id, ok := v.(int32)
 	if !ok || m.tabla == nil {
 		return "", false
 	}
-	enlace, ok := m.tabla.valorDeId(uint32(id))
-	if !ok || enlace.tipo != tipoCadena || int(enlace.datos) >= len(m.tabla.global.cadenas) {
+	return m.textoDeReferencia(uint32(id), map[uint32]bool{}, 0)
+}
+
+// textoDeReferencia desreferencia una entrada TYPE_REFERENCE hasta un TYPE_STRING del pool global
+// de la tabla. Los ids ya vistos cortan un ciclo y la profundidad acota una cadena demasiado larga;
+// en los dos casos no hay cadena que devolver y el llamador conserva su error.
+func (m *maquinaDalvik) textoDeReferencia(id uint32, vistos map[uint32]bool, profundidad int) (string, bool) {
+	if m.tabla == nil || profundidad >= profundidadMaxima || vistos[id] {
 		return "", false
 	}
-	return m.tabla.global.cadenas[enlace.datos], true
+	vistos[id] = true
+	enlace, ok := m.tabla.valorDeId(id)
+	if !ok {
+		return "", false
+	}
+	switch enlace.tipo {
+	case tipoCadena:
+		if int(enlace.datos) < len(m.tabla.global.cadenas) {
+			return m.tabla.global.cadenas[enlace.datos], true
+		}
+	case tipoReferencia:
+		return m.textoDeReferencia(enlace.datos, vistos, profundidad+1)
+	}
+	return "", false
 }
 
 // textoDe es cómo un stub imprime un valor: lo que haría `String.valueOf`.

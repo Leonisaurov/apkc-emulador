@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -2239,5 +2240,119 @@ func TestArraycopyCopiaYRango(t *testing.T) {
 	if _, _, err := m.intentaStub([]string{"Ljava/lang/System;"}, "arraycopy", proto,
 		[]any{origen, int32(-1), destino, int32(0), int32(2)}, nil); err == nil {
 		t.Error("se aceptó un índice de origen negativo")
+	}
+}
+
+// tablaDeReferenciasDePrueba escribe un resources.arsc con un solo tipo `string` y las entradas
+// que se le pasen. El texto «cadena final» vive en el pool global, no en el nombre del recurso.
+func tablaDeReferenciasDePrueba(t *testing.T, entradas []entradaEscribir) *tablaRecursos {
+	t.Helper()
+	claves := make([]string, len(entradas))
+	banderas := make([]uint32, len(entradas))
+	for i := range entradas {
+		claves[i] = fmt.Sprintf("clave%d", i)
+		banderas[i] = 0x0004
+	}
+	tb := tablaEscribir{
+		idPaquete:     0x7f,
+		nombrePaquete: "com.hola.referencias",
+		global:        []string{"cadena final", "intermedia"},
+		globalUTF8:    true,
+		nombresTipo:   []string{"string"},
+		nombresUTF8:   false,
+		claves:        claves,
+		clavesUTF8:    true,
+		tipos: []tipoEscribir{{
+			id:        1,
+			specFlags: banderas,
+			bloques:   []bloqueEscribir{{entradas: entradas}},
+		}},
+	}
+	datos, err := escribeTablaRecursos(tb)
+	if err != nil {
+		t.Fatalf("la tabla de la sonda: %v", err)
+	}
+	tr, err := leeTabla(datos)
+	if err != nil {
+		t.Fatalf("la tabla escrita no se deja leer: %v", err)
+	}
+	return tr
+}
+
+// TestTextoDeIdSigueUnaReferencia: un `default_theme_value` que apunta a otra cadena se resuelve
+// leyendo la misma tabla, sin inventar texto ni devolver el nombre del recurso.
+func TestTextoDeIdSigueUnaReferencia(t *testing.T) {
+	tr := tablaDeReferenciasDePrueba(t, []entradaEscribir{
+		{clave: 0, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010001}},
+		{clave: 1, valor: valorEscribir{tipo: tipoCadena, datos: 0}},
+	})
+	actividad := &objetoDalvik{clase: "Lcom/hola/referencias/MainActivity;", campos: map[string]any{}}
+	m := &maquinaDalvik{tabla: tr, actividad: actividad}
+	texto, ok := m.textoDeId(int32(0x7f010000))
+	if !ok || texto != "cadena final" {
+		t.Errorf("textoDeId dio %q (ok=%v), y la tabla guarda «cadena final» en el destino", texto, ok)
+	}
+	valor, ok, err := m.intentaStub([]string{"Lcom/hola/referencias/MainActivity;"}, "getString",
+		"(I)Ljava/lang/String;", []any{int32(0x7f010000)}, actividad)
+	if err != nil || !ok {
+		t.Fatalf("getString con un receptor que no es la actividad falló: ok=%v err=%v", ok, err)
+	}
+	if cadena, esCadena := valor.(*objetoDalvik); !esCadena || cadena.texto != "cadena final" {
+		t.Errorf("getString devolvió %#v", valor)
+	}
+}
+
+// TestReferenciaEnDosNiveles: la desreferencia no se queda en el primer salto; sigue hasta la
+// cadena escrita en el pool global.
+func TestReferenciaEnDosNiveles(t *testing.T) {
+	tr := tablaDeReferenciasDePrueba(t, []entradaEscribir{
+		{clave: 0, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010001}},
+		{clave: 1, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010002}},
+		{clave: 2, valor: valorEscribir{tipo: tipoCadena, datos: 1}},
+	})
+	m := &maquinaDalvik{tabla: tr}
+	if texto, ok := m.textoDeId(int32(0x7f010000)); !ok || texto != "intermedia" {
+		t.Errorf("textoDeId dio %q (ok=%v), y se esperaba «intermedia»", texto, ok)
+	}
+}
+
+// TestReferenciaCicloNoInventaCadena: un ciclo entre dos ids corta sin texto. La rama de getString
+// conserva su error, en vez de devolver una cadena vacía como si la tabla hubiera resuelto el id.
+func TestReferenciaCicloNoInventaCadena(t *testing.T) {
+	tr := tablaDeReferenciasDePrueba(t, []entradaEscribir{
+		{clave: 0, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010001}},
+		{clave: 1, valor: valorEscribir{tipo: tipoReferencia, datos: 0x7f010000}},
+	})
+	m := &maquinaDalvik{tabla: tr, actividad: &objetoDalvik{
+		clase: "Lcom/hola/referencias/MainActivity;", campos: map[string]any{}}}
+	if texto, ok := m.textoDeId(int32(0x7f010000)); ok || texto != "" {
+		t.Errorf("un ciclo devolvió %q (ok=%v), y no hay cadena en la tabla", texto, ok)
+	}
+	_, ok, err := m.intentaStub([]string{"Lcom/hola/referencias/MainActivity;"}, "getString",
+		"(I)Ljava/lang/String;", []any{int32(0x7f010000)}, m.actividad)
+	if err == nil || !ok || !strings.Contains(err.Error(), "la tabla no resuelve ese id como una cadena") {
+		t.Errorf("getString ante un ciclo dio ok=%v err=%v", ok, err)
+	}
+}
+
+// TestReferenciaIdInexistenteConservaElError: el id que frenó a NewPipe sigue sin resolverse si la
+// tabla no lo contiene; el mensaje literal es el que había antes del cambio.
+func TestReferenciaIdInexistenteConservaElError(t *testing.T) {
+	tr := tablaDeReferenciasDePrueba(t, []entradaEscribir{
+		{clave: 0, valor: valorEscribir{tipo: tipoCadena, datos: 0}},
+	})
+	const idNewPipe int32 = 0x7f1300e9
+	m := &maquinaDalvik{tabla: tr, actividad: &objetoDalvik{
+		clase: "Lcom/hola/referencias/MainActivity;", campos: map[string]any{}}}
+	if texto, ok := m.textoDeId(idNewPipe); ok || texto != "" {
+		t.Errorf("un id ausente devolvió %q (ok=%v)", texto, ok)
+	}
+	_, ok, err := m.intentaStub([]string{"Lcom/hola/referencias/MainActivity;"}, "getString",
+		"(I)Ljava/lang/String;", []any{idNewPipe}, m.actividad)
+	if err == nil || !ok {
+		t.Fatalf("getString con un id ausente no dio el error esperado: ok=%v err=%v", ok, err)
+	}
+	if quiero := "getString(2131951849): la tabla no resuelve ese id como una cadena"; err.Error() != quiero {
+		t.Errorf("error=%q, se esperaba %q", err.Error(), quiero)
 	}
 }
