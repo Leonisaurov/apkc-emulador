@@ -6512,6 +6512,44 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 			}
 			return int32(-1), true, nil
 		}
+	case "lastIndexOf":
+		// `String.lastIndexOf(I)` cuenta unidades de 16 bits y devuelve la última igual al código,
+		// o -1 si no aparece. El gestor recorta la extensión del fichero con él: devolver el cero
+		// le hacía ver «eeme.txt» donde está «txt». El receptor es la cadena real del intérprete,
+		// leída con `cadenaDe`, no un índice supuesto.
+		if len(vals) == 1 && es("Ljava/lang/String;", "Ljava/lang/CharSequence;") {
+			s, ok := cadenaDe(receptor)
+			if !ok {
+				return nil, true, fmt.Errorf("lastIndexOf sobre un receptor que no es una cadena")
+			}
+			codigo, err := aInt32(vals[0])
+			if err != nil {
+				return nil, true, err
+			}
+			unidades := unidadesDeCadena(s)
+			if codigo < 0 || codigo > 0x10ffff {
+				return int32(-1), true, nil
+			}
+			if codigo < 0x10000 {
+				for i := len(unidades) - 1; i >= 0; i-- {
+					if unidades[i] == uint16(codigo) {
+						return int32(i), true, nil
+					}
+				}
+				return int32(-1), true, nil
+			}
+			// un punto de código suplementario se busca como el JDK: el par de sustitutos y la
+			// posición de la unidad alta, aunque el código dado no esté en la cadena.
+			resto := uint32(codigo) - 0x10000
+			alta := uint16(0xd800 + (resto >> 10))
+			baja := uint16(0xdc00 + (resto & 0x3ff))
+			for i := len(unidades) - 2; i >= 0; i-- {
+				if unidades[i] == alta && unidades[i+1] == baja {
+					return int32(i), true, nil
+				}
+			}
+			return int32(-1), true, nil
+		}
 	case "getString":
 		// `Resources.getString(id)` lee la tabla enlazada al objeto sintético; un id que no esté en
 		// ella devuelve el cero con aviso, en vez de inventar un texto.

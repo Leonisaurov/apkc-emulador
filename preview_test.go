@@ -871,6 +871,65 @@ func TestListFilesSplitDelMimeSinPerderLaFila(t *testing.T) {
 	}
 }
 
+// TestLastIndexOfCuentaLaUltimaUnidad cierra el eslabón que el gestor dejó abierto en §376: sin
+// `lastIndexOf(I)` el cero del stub hacía que la extensión de leeme.txt se leyera como «eeme.txt».
+// La cadena llega como objeto del intérprete (`cadenaObjeto`), así que el índice se cuenta sobre su
+// contenido real y no sobre un valor supuesto.
+func TestLastIndexOfCuentaLaUltimaUnidad(t *testing.T) {
+	m := nuevaMaquina(&programaDalvik{}, nil)
+	casos := []struct {
+		cadena   string
+		codigo   int32
+		esperado int32
+	}{
+		{"leeme.txt", int32('.'), 5},
+		{"a.b.c", int32('.'), 3},
+		{"abc", int32('z'), -1},
+		{"abc", int32('c'), 2},
+		{"", int32('a'), -1},
+		{"\U0001f600", 0x1f600, 0},
+		{"\U0001f600", 0xde00, 1},
+		{"\U0001f600", -1, -1},
+	}
+	for _, caso := range casos {
+		v, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "lastIndexOf", "(I)I",
+			[]any{caso.codigo}, cadenaObjeto(caso.cadena))
+		if err != nil || !ok {
+			t.Fatalf("lastIndexOf(%d) sobre %q: ok=%v err=%v", caso.codigo, caso.cadena, ok, err)
+		}
+		obtenido, esEntero := v.(int32)
+		if !esEntero || obtenido != caso.esperado {
+			t.Errorf("lastIndexOf(%d) sobre %q dio %v (%T) y se esperaba %d",
+				caso.codigo, caso.cadena, v, v, caso.esperado)
+		}
+	}
+	// la cadena del gestor entrega «txt» al consultar el MIME: el punto está en la unidad 5,
+	// no en la 0, y el trozo siguiente alimenta `getMimeTypeFromExtension`.
+	extension, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "lastIndexOf", "(I)I",
+		[]any{int32('.')}, cadenaObjeto("leeme.txt"))
+	if err != nil || !ok || extension != int32(5) {
+		t.Fatalf("la extensión de leeme.txt debe empezar en 5; dio %v, ok=%v, err=%v", extension, ok, err)
+	}
+	punto := extension.(int32)
+	nombre, ok, err := m.intentaStub([]string{"Ljava/lang/String;"}, "substring", "(I)Ljava/lang/String;",
+		[]any{punto + 1}, cadenaObjeto("leeme.txt"))
+	if err != nil || !ok {
+		t.Fatalf("substring(%d): ok=%v err=%v", punto+1, ok, err)
+	}
+	if obtenido := textoDe(nombre); obtenido != "txt" {
+		t.Fatalf("la extensión leída debe ser txt; dio %q", obtenido)
+	}
+	mime, ok, err := m.intentaStub([]string{"Landroid/webkit/MimeTypeMap;"}, "getMimeTypeFromExtension",
+		"(Ljava/lang/String;)Ljava/lang/String;", []any{nombre},
+		&objetoDalvik{clase: "Landroid/webkit/MimeTypeMap;", campos: map[string]any{}})
+	if err != nil || !ok {
+		t.Fatalf("getMimeTypeFromExtension(txt): ok=%v err=%v", ok, err)
+	}
+	if obtenido := textoDe(mime); obtenido != "text/plain" {
+		t.Errorf("la extensión txt debe dar text/plain; dio %q", obtenido)
+	}
+}
+
 // maquinaContenedorConOyente arma un contenedor con dos botones añadidos por código, sin id, y un
 // único OnClickListener registrado sobre el segundo. El cuerpo del onClick escribe una cadena fija en
 // la vista que recibe, para poder comprobar qué hijo se llevó el clic sin inventar un modelo.
