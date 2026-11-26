@@ -2210,3 +2210,100 @@ func TestCallbacksDeServiceConnectionInertes(t *testing.T) {
 		t.Errorf("faltan los avisos de los callbacks: %v", m.avisos)
 	}
 }
+
+// TestLifecycleSubstringRotoSoloEnElDexDanado congela la discriminación que evita la regresión:
+// el desvío al stub sólo se activa cuando el method_id de `String.substring(I)` trae el nombre
+// corrupto. Con el nombre íntegro el cuerpo de Lifecycling se ejecuta como antes.
+func TestLifecycleSubstringRotoSoloEnElDexDanado(t *testing.T) {
+	m := &maquinaDalvik{}
+	proto := dexProto{shorty: "(I)Ljava/lang/String;", returnType: "Ljava/lang/String;", params: []string{"I"}}
+	bien := &dexFile{methods: []dexMethod{{owner: "Ljava/lang/String;", name: "substring", proto: proto}}}
+	if m.substringRoto(bien) {
+		t.Error("un method_id íntegro no debe activar el desvío al stub")
+	}
+	roto := &dexFile{methods: []dexMethod{{owner: "Ljava/lang/String;",
+		name: ".initPrototypeId(int id) did not initialize id=", proto: proto}}}
+	if !m.substringRoto(roto) {
+		t.Error("el method_id corrupto de NewPipe debe activar el desvío al stub")
+	}
+	if m.substringRoto(nil) {
+		t.Error("sin dex no hay method_id corrupto")
+	}
+}
+
+// TestLifecycleObserverSinteticoDeLaLambdaNoEsNulo comprueba el extremo que destapó la frontera de NewPipe:
+// la lambda sintética `ComponentActivity$$ExternalSyntheticLambda3` del propio dex entrega un
+// `Class` no nulo, y su nombre canónico es el descriptor convertido a puntos, no una cadena vacía.
+func TestLifecycleObserverSinteticoDeLaLambdaNoEsNulo(t *testing.T) {
+	m := maquinaDeStubs()
+	observador := objDe("Landroidx/activity/ComponentActivity$$ExternalSyntheticLambda3;")
+	valor, ok, err := m.intentaStub([]string{"Ljava/lang/Object;"}, "getClass",
+		"()Ljava/lang/Class;", nil, observador)
+	if err != nil || !ok {
+		t.Fatalf("getClass del observador sintético: ok=%v err=%v", ok, err)
+	}
+	clase := esperaObjetoDeStub(t, valor, "Ljava/lang/Class;")
+	if clase.campos["Ljava/lang/Class;.$tipo"] != observador.clase {
+		t.Errorf("el Class no guardó el descriptor del observador: %v", clase.campos)
+	}
+	nombre, ok, err := m.intentaStub([]string{"Ljava/lang/Class;"}, "getCanonicalName",
+		"()Ljava/lang/String;", nil, clase)
+	if err != nil || !ok {
+		t.Fatalf("getCanonicalName del observador: ok=%v err=%v", ok, err)
+	}
+	esperaCadenaDeStub(t, nombre, "androidx.activity.ComponentActivity$$ExternalSyntheticLambda3")
+}
+
+// TestReceptorNuloSigueCortandoCongela el guardián de `invoca`: aunque el observador se sintetice,
+// un `invoke-virtual` con el receptor nulo debe seguir devolviendo el error de siempre y no
+// rellenarse con un objeto inventado.
+func TestLifecycleReceptorNuloSigueCortando(t *testing.T) {
+	d := &dexFile{methods: []dexMethod{{
+		owner:  "Ljava/lang/Object;",
+		name:   "getClass",
+		proto:  dexProto{shorty: "()Ljava/lang/Class;", returnType: "Ljava/lang/Class;"},
+	}}}
+	m := &maquinaDalvik{vistos: map[string]bool{}}
+	_, err := m.invoca(0x6e, d, 0, []int{0}, []any{nil}, "Landroidx/lifecycle/Lifecycling;")
+	if err == nil || !strings.Contains(err.Error(), "java.lang.Object.getClass sobre un objeto nulo") {
+		t.Errorf("el receptor nulo no cortó con el error esperado: %v", err)
+	}
+}
+
+// TestGetObserverConstructorTypeConsistente comprueba que el entero que devuelve el dex depende
+// sólo del tipo sintético del observador: una lambda sin adaptador generado da 1 (reflexión), un
+// adaptador generado da 2, y la decisión se anota como aproximación en vez de fingir ejecución.
+func TestLifecycleGetObserverConstructorTypeConsistente(t *testing.T) {
+	m := maquinaDeStubs()
+	lambda := objDe("Ljava/lang/Class;")
+	lambda.campos["Ljava/lang/Class;.$tipo"] = "Landroidx/activity/ComponentActivity$$ExternalSyntheticLambda3;"
+	adapter := objDe("Ljava/lang/Class;")
+	adapter.campos["Ljava/lang/Class;.$tipo"] = "Landroidx/activity/ComponentActivity_LifecycleAdapter;"
+
+	for _, caso := range []struct {
+		clase  *objetoDalvik
+		espera int32
+		tipo   string
+	}{
+		{lambda, 1, "LifecycleObserver por reflexión"},
+		{adapter, 2, "GeneratedAdapter"},
+	} {
+		for vez := 0; vez < 2; vez++ {
+			v, ok, err := m.intentaStub([]string{"Landroidx/lifecycle/Lifecycling;"},
+				"getObserverConstructorType", "(Ljava/lang/Class;)I", []any{caso.clase}, nil)
+			if err != nil || !ok {
+				t.Fatalf("getObserverConstructorType: ok=%v err=%v", ok, err)
+			}
+			if v != caso.espera {
+				t.Errorf("devolvió %v y se esperaba %d para %s", v, caso.espera, caso.tipo)
+			}
+		}
+	}
+	avisos := strings.Join(m.avisos, "\n")
+	if !strings.Contains(avisos, "sin ejecutar el cuerpo del dex (aproximación)") {
+		t.Errorf("falta el aviso de aproximación: %s", avisos)
+	}
+	if !strings.Contains(avisos, "LifecycleObserver por reflexión") || !strings.Contains(avisos, "GeneratedAdapter") {
+		t.Errorf("el aviso no distingue el tipo sintético: %s", avisos)
+	}
+}

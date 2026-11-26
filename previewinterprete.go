@@ -4304,6 +4304,23 @@ func (m *maquinaDalvik) escribeCampo(d *dexFile, idx uint32, receptor any, v any
 
 // --- llamadas -------------------------------------------------------------------------------
 
+// substringRoto dice si el method_id de `String.substring(I)` del dex trae un nombre que no es
+// `substring`. En el dex de NewPipe se lee `.initPrototypeId(int id) did not initialize id=`; el
+// intérprete no halla el stub, devuelve el cero de `Ljava/lang/String;` y el `getClass` siguiente
+// corta. En los otros cuatro APK el nombre está bien y el cuerpo de Lifecycling corre sin tocarlo.
+func (m *maquinaDalvik) substringRoto(d *dexFile) bool {
+	if d == nil {
+		return false
+	}
+	for _, met := range d.methods {
+		if met.owner == "Ljava/lang/String;" && met.proto.returnType == "Ljava/lang/String;" &&
+			len(met.proto.params) == 1 && met.proto.params[0] == "I" {
+			return met.name != "substring"
+		}
+	}
+	return false
+}
+
 // invoca resuelve una instrucción invoke: primero las clases del propio dex, y si el método no está
 // ahí, los stubs de framework. `op` es el opcode del invoke (0x6e..0x72) y `palabras` los registros
 // que llevan los argumentos, contados en palabras.
@@ -4354,21 +4371,32 @@ func (m *maquinaDalvik) invoca(op byte, d *dexFile, idx uint32, palabras []int, 
 		}
 		return v, nil
 	}
-	if esEstatico {
-		if met := m.buscaMetodo(ref.owner, ref.name, proto); met != nil {
-			return en(ref.owner, met, vals, tipos)
-		}
-	} else if op == 0x6f || op == 0x70 {
-		if met := m.buscaMetodo(ref.owner, ref.name, proto); met != nil {
-			args := append([]any{receptor}, vals...)
-			argTipos := append([]string{ref.owner}, tipos...)
-			return en(ref.owner, met, args, argTipos)
-		}
-	} else if obj, ok := receptor.(*objetoDalvik); ok {
-		if met := m.buscaMetodo(obj.clase, ref.name, proto); met != nil {
-			args := append([]any{obj}, vals...)
-			argTipos := append([]string{obj.clase}, tipos...)
-			return en(obj.clase, met, args, argTipos)
+	// `Lifecycling.getObserverConstructorType` trae cuerpo en el dex de NewPipe, pero ese cuerpo
+	// deriva el nombre del adaptador con un `String.substring(I)` cuyo method_id tiene el nombre
+	// corrupto (el aviso `.initPrototypeId...` de la línea base). El cero de `Ljava/lang/String;`
+	// llega nulo al `getClass` siguiente y corta la ejecución en el paso 508. Solo en ese dex se
+	// atiende la llamada en el stub con el tipo sintético; en los demás el cuerpo corre como hasta
+	// ahora, para no adelantar el error de F-Droid ni el de Libre Memory Game.
+	fuerzaStub := ref.owner == "Landroidx/lifecycle/Lifecycling;" &&
+		ref.name == "getObserverConstructorType" && proto == "(Ljava/lang/Class;)I" &&
+		m.substringRoto(d)
+	if !fuerzaStub {
+		if esEstatico {
+			if met := m.buscaMetodo(ref.owner, ref.name, proto); met != nil {
+				return en(ref.owner, met, vals, tipos)
+			}
+		} else if op == 0x6f || op == 0x70 {
+			if met := m.buscaMetodo(ref.owner, ref.name, proto); met != nil {
+				args := append([]any{receptor}, vals...)
+				argTipos := append([]string{ref.owner}, tipos...)
+				return en(ref.owner, met, args, argTipos)
+			}
+		} else if obj, ok := receptor.(*objetoDalvik); ok {
+			if met := m.buscaMetodo(obj.clase, ref.name, proto); met != nil {
+				args := append([]any{obj}, vals...)
+				argTipos := append([]string{obj.clase}, tipos...)
+				return en(obj.clase, met, args, argTipos)
+			}
 		}
 	}
 
@@ -6760,13 +6788,26 @@ func (m *maquinaDalvik) intentaStub(candidatos []string, nombre, proto string, v
 		}
 	case "getObserverConstructorType":
 		// `Lifecycling.getObserverConstructorType` decide cómo se notifica un observador de
-		// lifecycle: 1 es el constructor por reflexión en AndroidX. Hoy este stub NO intercepta
-		// el cuerpo del invoke de NewPipe: el método está en el dex y se ejecuta antes de llegar
-		// aquí, así que la medición sigue dando el mismo «getClass sobre un objeto nulo» de la
-		// línea base. La frontera sigue abierta; esto solo responde cuando la llamada no tiene
-		// cuerpo en el dex (por ejemplo, en F-Droid).
+		// lifecycle: 1 es el constructor por reflexión, 2 el adaptador generado. El cuerpo del dex
+		// de NewPipe no se puede recorrer porque su `String.substring(I)` cae en un method_id con
+		// el nombre corrupto y entrega un String nulo al `getClass` siguiente (medido con dexdump
+		// y con el guardián instrumentado en la copia materializada). Aquí se deriva el tipo
+		// sintético del observador a partir del nombre canónico de su Class, sin inventar un
+		// adaptador que no está en el dex: si el propio
+		// observador ya es un `..._LifecycleAdapter` devuelve 2, y en cualquier otro caso devuelve
+		// 1, que es lo que el cuerpo calcularía para la lambda sintética de ComponentActivity.
 		if len(vals) == 1 && es("Landroidx/lifecycle/Lifecycling;") {
-			return int32(1), true, nil
+			tipo := claseDeLiteral(vals[0])
+			nombre := strings.TrimSuffix(strings.TrimPrefix(tipo, "L"), ";")
+			nombre = strings.ReplaceAll(nombre, "/", ".")
+			generado := strings.HasSuffix(nombre, "_LifecycleAdapter")
+			resultado := int32(1)
+			if generado {
+				resultado = int32(2)
+			}
+			m.avisa("Lifecycling.getObserverConstructorType: observador %s modelado como %s sin ejecutar el cuerpo del dex (aproximación)",
+				nombre, map[bool]string{true: "GeneratedAdapter", false: "LifecycleObserver por reflexión"}[generado])
+			return resultado, true, nil
 		}
 	case "getPackage":
 		// el Package de una clase: lleva el nombre del paquete del descriptor, para que el
